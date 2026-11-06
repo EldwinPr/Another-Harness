@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Chat database and per-run turn logs (saved chats, and API keys saved with /provider add)
+/logs/
+
+# Local profiles hold API keys (only the .example templates are tracked)
+/profiles/*.profile
+
+# Files the model writes while chatting (workspace/ is the chat's working directory)
+/workspace/*
+!/workspace/README.md
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+[package]
+name = "runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+# Two binaries exist (runner, hello); this says which one a bare `cargo run` starts.
+default-run = "runner"
+
+[dependencies]
+kernel = { path = "../kernel" }
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true

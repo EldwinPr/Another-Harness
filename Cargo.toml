@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["kernel", "runner"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+# Exact pins: determinism work does not take silent upgrades (see testing.md).
+[workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["raw_value"] }
+ureq = { version = "=3.5.1" }
+# SQLite is compiled from the bundled C source (needs a C compiler), so every machine
+# runs the same SQLite version. sha2 hashes requests and prompts for the store.
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+sha2 = { version = "=0.11.1" }
