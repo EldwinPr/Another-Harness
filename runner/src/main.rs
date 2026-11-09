@@ -13,8 +13,8 @@
 //! cd src && HARNESS_BASE_URL=http://localhost:20128/v1 HARNESS_MODEL=<model> cargo run -p runner
 //! ```
 //!
-//! `HARNESS_LOG_DIR` overrides where the log and the database go (default: `logs` under the
-//! directory you started in), and `HARNESS_PROFILE_DIR` names the folder of profile files that
+//! `HARNESS_LOG_DIR` overrides where the log and the database go (default: the program's folder
+//! in your user data folder, `~/.local/share/aharness` on Linux; never the project you start it in), and `HARNESS_PROVIDER_DIR` names the folder of provider files that
 //! `/provider` lists next to the providers saved in the database.
 //!
 //! Chats are saved in SQLite at `<log dir>/harness.db` (decision 08). The JSONL turn
@@ -29,23 +29,23 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use runner::agent::{Agent, MAX_CALLS_PER_MESSAGE, StoreContext};
-use runner::config::{self, Options, Settings};
+use runner::config::{self, ApiStyle, Options, Settings};
 use runner::provider::{HttpProvider, NoProvider, Provider, router_host};
 use runner::providers::Catalog;
 use runner::repl::{self, Terminal, TerminalApprover};
 use runner::store::Store;
 use runner::style::Style;
-use runner::tools::{Bash, DEFAULT_TIMEOUT, Mode, ReadFile, Tool, file_tools, shared_mode};
+use runner::tools::{Mode, Tool, shared_mode};
 use runner::turn_log::TurnLog;
 
 /// How long to wait for the router to answer one call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The name to show for a provider given through the environment (default: the router's host).
-const ENV_PROFILE: &str = "HARNESS_PROFILE";
+const ENV_PROVIDER: &str = "HARNESS_PROVIDER";
 
-/// The folder of profile files `/provider` lists (`chat.sh` passes an absolute path).
-const ENV_PROFILE_DIR: &str = "HARNESS_PROFILE_DIR";
+/// The folder of provider files `/provider` lists (`chat.sh` passes an absolute path).
+const ENV_PROVIDER_DIR: &str = "HARNESS_PROVIDER_DIR";
 
 /// The database file, inside the log directory.
 const DB_FILE: &str = "harness.db";
@@ -59,7 +59,31 @@ fn main() -> ExitCode {
         }
     };
     let env = |name: &str| std::env::var(name).ok();
-    let log_dir = config::log_dir_from_lookup(env);
+    if let Some(why) = config::renamed_variable(env) {
+        eprintln!("{why}");
+        return ExitCode::from(2);
+    }
+    let log_dir = match config::log_dir_from_lookup(env) {
+        Ok(dir) => dir,
+        Err(why) => {
+            eprintln!("error: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `--serve` shows the lists in a browser and starts no chat (issue 28).
+    if let Some(port) = options.serve {
+        let db_path = log_dir.join(DB_FILE);
+        let project = std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        return match runner::web::serve(&db_path, port, &project) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("error: {why}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // Only when the environment names a provider does it have to name a whole one.
     let from_env = if config::names_a_provider(env) {
         match Settings::from_env() {
@@ -114,30 +138,31 @@ fn start(
     let approval = shared_mode(Mode::Manual);
     term.borrow_mut().set_root(cwd.clone());
     let cancel = runner::cancel::Cancel::new();
-    let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFile::new(&cwd))];
-    tools.extend(file_tools(
+    let shells = runner::tools::ShellTasks::new();
+    let tools: Vec<Box<dyn Tool>> = runner::tools::chat_tools(
         &cwd,
+        &db_path,
         Rc::clone(&approval),
         Rc::new(TerminalApprover(Rc::clone(&term))),
-    ));
-    tools.push(Box::new(
-        Bash::new(
-            &cwd,
-            DEFAULT_TIMEOUT,
-            Box::new(TerminalApprover(Rc::clone(&term))),
-        )
-        .with_approval(Rc::clone(&approval))
-        .with_cancel(cancel.clone()),
-    ));
+        cancel.clone(),
+        shells.clone(),
+    );
     let build = |def: &runner::providers::ProviderDef| -> Box<dyn Provider> {
-        Box::new(HttpProvider::new(
-            &def.base_url,
-            def.api_key.as_deref(),
-            REQUEST_TIMEOUT,
-        ))
+        match def.api {
+            ApiStyle::OpenAi => Box::new(HttpProvider::new(
+                &def.base_url,
+                def.api_key.as_deref(),
+                REQUEST_TIMEOUT,
+            )),
+            ApiStyle::Anthropic => Box::new(runner::anthropic::AnthropicProvider::new(
+                &def.base_url,
+                def.api_key.as_deref(),
+                REQUEST_TIMEOUT,
+            )),
+        }
     };
     let catalog = Catalog {
-        profile_dir: std::env::var(ENV_PROFILE_DIR)
+        provider_dir: std::env::var(ENV_PROVIDER_DIR)
             .ok()
             .filter(|dir| !dir.trim().is_empty())
             .map(std::path::PathBuf::from),
@@ -150,7 +175,7 @@ fn start(
     // provider used last time, or on none, and one is chosen inside the chat.
     let mut agent = match &from_env {
         Some(settings) => {
-            let name = std::env::var(ENV_PROFILE)
+            let name = std::env::var(ENV_PROVIDER)
                 .ok()
                 .filter(|name| !name.trim().is_empty())
                 .or_else(|| router_host(&settings.base_url))
@@ -163,6 +188,7 @@ fn start(
                     model: settings.model.clone(),
                     api_key: settings.api_key.clone(),
                     router: settings.router.clone(),
+                    api: settings.api,
                 }),
                 tools,
                 log,
@@ -175,18 +201,23 @@ fn start(
     .with_catalog(catalog)
     .with_approval(approval)
     .with_cancel(cancel)
+    .with_shells(shells)
+    .with_subagents({
+        let (cwd, db_path) = (cwd.clone(), db_path.clone());
+        std::sync::Arc::new(move |kit, cancel| runner::subagent::tools(&cwd, &db_path, cancel, kit))
+    })
     .with_store(store, store_context);
     agent.load_approval_mode();
 
     let mut notes = String::new();
-    // Profile files are copied into the database once, so the menus can edit them.
-    match agent.import_profiles() {
+    // Provider files are copied into the database once, so the menus can edit them.
+    match agent.import_provider_files() {
         Ok(0) => {}
         Ok(n) => notes.push_str(&format!(
-            "copied {n} profile file{} into the database\n",
+            "copied {n} provider file{} into the database\n",
             if n == 1 { "" } else { "s" }
         )),
-        Err(why) => notes.push_str(&format!("could not import the profile files: {why}\n")),
+        Err(why) => notes.push_str(&format!("could not import the provider files: {why}\n")),
     }
     if from_env.is_none()
         && let Some(note) = agent.use_remembered_provider()

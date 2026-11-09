@@ -14,17 +14,19 @@ use kernel::ToolSpec;
 use serde::Deserialize;
 
 use super::truncate::OutputCapture;
-use super::{Approver, Mode, SharedMode, Tool, always_for, is_free, shared_mode};
+use super::{Approver, Mode, SharedMode, Tool, always_for, is_free, is_looking, shared_mode};
 use crate::cancel::Cancel;
 
 /// How long a command may run before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run with bash -c"}},"required":["command"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run with bash -c"},"background":{"type":"boolean","description":"Start it and return at once (a server, a long build); see the task tool. It has no time limit"}},"required":["command"]}"#;
 
 #[derive(Deserialize)]
 struct Args {
     command: String,
+    #[serde(default)]
+    background: bool,
 }
 
 pub struct Bash {
@@ -39,6 +41,10 @@ pub struct Bash {
     approval: SharedMode,
     /// Set when the user cancels the turn: a running command is killed (issue 18).
     cancel: Cancel,
+    /// A subagent's `bash` (issue 33): only looking commands run, nothing is ever asked.
+    looking_only: bool,
+    /// Where `background: true` commands go (issue 42). None: they are refused.
+    shells: Option<super::ShellTasks>,
 }
 
 impl Bash {
@@ -56,7 +62,22 @@ impl Bash {
             approver,
             approval: shared_mode(Mode::Manual),
             cancel: Cancel::new(),
+            looking_only: false,
+            shells: None,
         }
+    }
+
+    /// Lets `background: true` start commands in this list.
+    pub fn with_shells(mut self, shells: super::ShellTasks) -> Self {
+        self.shells = Some(shells);
+        self
+    }
+
+    /// Runs only the looking commands that need no question (and not `mkdir`); any other command
+    /// is refused without asking anyone. For a subagent, which has nobody to ask.
+    pub fn looking_only(mut self) -> Self {
+        self.looking_only = true;
+        self
     }
 
     /// Watches this flag while a command runs; when it is set the command's group is killed.
@@ -157,7 +178,7 @@ impl Bash {
 
 /// Sends SIGKILL to a whole process group. Errors are ignored: the group may
 /// already be gone, which is the goal.
-fn kill_group(group: u32) {
+pub(super) fn kill_group(group: u32) {
     let _ = Command::new("bash")
         .arg("-c")
         .arg(format!("kill -KILL -- -{group}"))
@@ -177,6 +198,19 @@ impl Tool for Bash {
             Ok(args) => args,
             Err(e) => return format!("error: invalid arguments: {e}"),
         };
+        if self.approval.planning() && !is_looking(&args.command) {
+            return "plan mode is on, so only looking commands (ls, cat, grep, find, git status ...) run; put the change in your plan instead".to_owned();
+        }
+        if args.background && (self.looking_only || self.shells.is_none()) {
+            return "error: this bash cannot run commands in the background".to_owned();
+        }
+        if self.looking_only {
+            return if is_looking(&args.command) {
+                self.execute(&args.command)
+            } else {
+                "error: a subagent can only look (ls, cat, head, tail, wc, grep, find, git status ...): this command was not run".to_owned()
+            };
+        }
         // Looking commands (`ls`, `cd`, ...) run without a question; see `commands.rs`.
         if !is_free(&args.command)
             && !self.approval.confirm(
@@ -187,7 +221,19 @@ impl Tool for Bash {
                 None,
             )
         {
-            return "denied by user: the command was not run".to_owned();
+            return self
+                .approval
+                .denial("denied by user: the command was not run");
+        }
+        if args.background
+            && let Some(shells) = &self.shells
+        {
+            return match shells.start(&args.command, &self.cwd) {
+                Ok(n) => format!(
+                    "started in the background as task {n}: task(action=output, id={n}) shows its output, task(action=stop, id={n}) stops it"
+                ),
+                Err(why) => why,
+            };
         }
         self.execute(&args.command)
     }
@@ -217,6 +263,23 @@ mod tests {
 
     fn run(tool: &Bash, command: &str) -> String {
         tool.run(&serde_json::json!({ "command": command }).to_string())
+    }
+
+    #[test]
+    fn plan_mode_runs_only_looking_commands_and_never_asks() {
+        let dir = Scratch::new("bash-plan");
+        let tool = bash(dir.path(), DEFAULT_TIMEOUT, true).with_approval({
+            let approval = shared_mode(Mode::Auto);
+            approval.set_planning(true);
+            approval
+        });
+        assert!(run(&tool, "touch x").starts_with("plan mode is on, so only looking commands"));
+        assert!(run(&tool, "mkdir d").starts_with("plan mode is on"));
+        assert!(!dir.path().join("x").exists() && !dir.path().join("d").exists());
+        assert_eq!(
+            run(&tool, "pwd"),
+            format!("{}\n[exit code: 0]", dir.path().display())
+        );
     }
 
     #[test]

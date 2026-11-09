@@ -11,6 +11,7 @@ use kernel::{Message, ToolCall};
 
 use crate::agent::{Agent, Observer, Outcome};
 use crate::cancel::{Cancel, asks_to_cancel};
+use crate::config::ApiStyle;
 use crate::menu::{DEFAULT_WIDTH, Key, MenuItem, MenuState, Step, parse_key};
 use crate::provider::router_host;
 use crate::providers::ProviderDef;
@@ -34,8 +35,33 @@ const SHOWN_PREVIEW_CHARS: usize = 40;
 /// How many model ids `/models` prints before saying how many more there are.
 const SHOWN_MODELS: usize = 30;
 
+/// Words that run a command listed under another name; Tab offers them too.
+pub(crate) const ALIASES: &[&str] = &["/quit"];
+
+/// What `/init` sends to the model in place of the command. It names no file path with an at-sign,
+/// so nothing in it is taken for an attachment.
+const INIT_MESSAGE: &str = "Draft context for this project from its own files. Check the context tool first so you do not repeat an entry that is already saved. Read the README (or the nearest thing to one), the build and package files and how the folders are laid out; read_file does it, and bash only to list files. Then propose up to 5 entries with context_propose, kind guide, each about one thing a newcomer needs: how to build and test, where the main code lives, conventions the files state, what the files say must not be done. The quote is the file the text comes from, written as From README.md: and a short excerpt, because these come from the project and not from my words. Propose nothing you did not read in a file. Propose a glossary word with glossary_propose only for a term the files define. When you are done say in one or two lines what you proposed.";
+
+/// The first words of the commands, once each, for the completion list of the input box: the
+/// listed commands in their order, then the aliases.
+pub fn command_words() -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for (usage, _) in COMMANDS {
+        let word = usage.split_whitespace().next().unwrap_or(usage);
+        if !words.iter().any(|w| w == word) {
+            words.push(word.to_owned());
+        }
+    }
+    for alias in ALIASES {
+        if !words.iter().any(|w| w == alias) {
+            words.push((*alias).to_owned());
+        }
+    }
+    words
+}
+
 /// The chat commands, as `/help` lists them: the command, then what it does.
-const COMMANDS: &[(&str, &str)] = &[
+pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show this list"),
     (
         "/model",
@@ -62,16 +88,16 @@ const COMMANDS: &[(&str, &str)] = &[
         "switch to a provider (its model and pinning come with it)",
     ),
     (
-        "/provider add <name> <base_url> <model>",
+        "/provider add <name> <base_url> <model> [openai|anthropic]",
         "save a new provider, ask for its API key, switch to it",
     ),
     (
         "/provider remove <name>",
-        "delete a saved provider (profile files stay)",
+        "delete a saved provider (provider files stay)",
     ),
     (
         "/prompts",
-        "the system prompts: switch them on or off (a checklist in a terminal)",
+        "the system prompts of the selected profile: put them in or out (a checklist in a terminal; /profile has the rest)",
     ),
     (
         "/prompts config",
@@ -88,6 +114,46 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/prompts show",
         "print the system prompt a new chat would start with",
+    ),
+    (
+        "/profile",
+        "the starting setups of a chat (system prompts, skills, personality): pick one for new chats, edit, copy, delete (a menu in a terminal)",
+    ),
+    (
+        "/profile <list|show|use|add|edit|copy|rename|delete> ...",
+        "the same by typing (also without a terminal); use applies to the next chat",
+    ),
+    (
+        "/glossary",
+        "the words and definitions you keep (a menu in a terminal); the model can look them up and propose changes, which you confirm",
+    ),
+    (
+        "/glossary <show|add|edit|delete> <term>",
+        "the same by typing; add and edit read the definition as lines ended by a lone . or in your editor",
+    ),
+    (
+        "/glossary <import|export> <file>",
+        "read the word/definition tables of a markdown file, or write them to a new file (below the working directory)",
+    ),
+    (
+        "/context",
+        "the rules, decisions and shapes you have said about this project (a menu in a terminal); the model can fetch one by name and propose new ones, which you confirm",
+    ),
+    (
+        "/context <show|add|edit|delete> <name>",
+        "the same by typing; add and edit read the text as lines ended by a lone . or in your editor",
+    ),
+    (
+        "/context preload <name> on|off",
+        "put an entry in the start of every subagent (shapes are on by default)",
+    ),
+    (
+        "/tools [name]",
+        "list the tools the model has, and what a subagent gets; with a name, show that tool in full",
+    ),
+    (
+        "/web [port]",
+        "show and edit the prompts, skills, personalities, glossary and context entries, and see the tools, in a browser at http://127.0.0.1:8787/ (port optional); runs on a thread until /web stop or the chat ends",
     ),
     (
         "/skills",
@@ -122,6 +188,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "show the line under the input box: model, approval mode, tokens and context",
     ),
     (
+        "/init",
+        "have the model read this project (README, build files, layout) and propose context entries and glossary words for it; you confirm each one",
+    ),
+    (
         "/compact [auto [tokens|off]]",
         "have the model summarise this chat and continue in a new chat that starts with the summary (the old chat stays saved); it also happens before a message when the last request was 80,000 prompt tokens or more: /compact auto shows the limit, /compact auto <tokens> or off changes it",
     ),
@@ -136,6 +206,26 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/sessions",
         "list the saved chats (a menu in a terminal: resume or delete one)",
+    ),
+    (
+        "/subagent [profile] <task>",
+        "start a subagent in the background and keep chatting; its answer is added to the chat at your next message. It changes files only when /approve is auto",
+    ),
+    (
+        "/subagents [list|show N|stop N]",
+        "the subagents of this run: what they are doing, their calls and answers, or stop one",
+    ),
+    (
+        "/plan [on|off]",
+        "plan mode: the model can only look and must answer with a plan; nothing is changed. When it has answered you choose to build it here, build it with a subagent, or discuss it",
+    ),
+    (
+        "/calls [all|short]",
+        "short (the default) shows one line for each tool call and its result only when it failed; while the model has a list of steps, it shows the steps instead of the calls. all shows every call and result",
+    ),
+    (
+        "/tasks [show ID|stop ID]",
+        "everything running in the background: commands the model started (s1, s2) and subagents (a1, a2); show gives the latest output, stop ends one",
     ),
     ("/exit", "quit (also /quit; Ctrl-D works too)"),
 ];
@@ -184,6 +274,144 @@ fn result_line(style: Style, result: &str, width: usize) -> String {
     }
 }
 
+/// What runs in the background, as a copy that stays current: the commands the model started and
+/// the subagents. It lists them for under the box (issue 42).
+#[derive(Clone)]
+pub struct TaskView {
+    pub(crate) shells: crate::tools::ShellTasks,
+    pub(crate) runs: Vec<crate::jobs::RunView>,
+}
+
+/// The most rows the list under the box takes.
+const TASK_ROWS: usize = 4;
+
+impl TaskView {
+    /// One line for each task that is running, such as `● s1  npm run dev · 1m 05s`, at most
+    /// [`TASK_ROWS`] and then how many more. Empty when nothing runs.
+    pub fn lines(&self, width: usize) -> Vec<String> {
+        let room = width.saturating_sub(6).max(20);
+        let mut rows: Vec<String> = Vec::new();
+        for info in self.shells.list() {
+            if info.status != crate::tools::ShellStatus::Running {
+                continue;
+            }
+            let command = info
+                .command
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let tail = format!(" · {}", crate::tools::clock(info.elapsed));
+            let head = format!("● s{}  ", info.n);
+            let space = room.saturating_sub(head.chars().count() + tail.chars().count());
+            rows.push(format!(
+                "{head}{}{tail}",
+                crate::toolview::cut(&command, space.max(8))
+            ));
+        }
+        for run in &self.runs {
+            let (running, calls, seconds) = run.progress();
+            if !running {
+                continue;
+            }
+            let task = run.task.lines().next().unwrap_or("").trim();
+            let tail = format!(
+                " · {calls} call{} · {}",
+                if calls == 1 { "" } else { "s" },
+                crate::tools::clock(std::time::Duration::from_secs(seconds))
+            );
+            let head = format!("● a{}  {}: ", run.n, run.profile);
+            let space = room.saturating_sub(head.chars().count() + tail.chars().count());
+            rows.push(format!(
+                "{head}{}{tail}",
+                crate::toolview::cut(task, space.max(8))
+            ));
+        }
+        if rows.len() > TASK_ROWS {
+            let more = rows.len() - TASK_ROWS + 1;
+            rows.truncate(TASK_ROWS - 1);
+            rows.push(format!("… {more} more (/tasks)"));
+        }
+        rows
+    }
+}
+
+/// The checklist as lines to draw over the working box: a header with how far it has got, then each
+/// step. At most `max` rows; the rest are counted.
+fn steps_block(style: Style, steps: &[crate::tools::Step], max: usize) -> Vec<String> {
+    use crate::tools::StepStatus;
+    if steps.is_empty() {
+        return Vec::new();
+    }
+    let done = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Done)
+        .count();
+    let mut lines = vec![style.dim(&format!(" steps {done}/{}", steps.len()))];
+    let room = max.saturating_sub(1);
+    let shown = if steps.len() > room {
+        room.saturating_sub(1)
+    } else {
+        steps.len()
+    };
+    // When it does not all fit, the finished steps give way first.
+    let first_open = steps
+        .iter()
+        .position(|s| s.status != StepStatus::Done)
+        .unwrap_or(0);
+    let from = if steps.len() > shown {
+        first_open.min(steps.len() - shown)
+    } else {
+        0
+    };
+    for step in &steps[from..from + shown] {
+        lines.push(match step.status {
+            StepStatus::Done => style.green(&format!("  ✓ {}", step.text)),
+            StepStatus::Doing => style.bold(&format!("  ▸ {}", step.text)),
+            StepStatus::Todo => style.dim(&format!("  ○ {}", step.text)),
+        });
+    }
+    let hidden = steps.len() - shown;
+    if hidden > 0 {
+        lines.push(style.dim(&format!("  … {hidden} more")));
+    }
+    lines
+}
+
+/// The checklist as it changes: all of it when the steps are new or reworded, else only the steps
+/// whose state changed, with how far the list has got.
+fn steps_text(style: Style, before: &[crate::tools::Step], now: &[crate::tools::Step]) -> String {
+    use crate::tools::StepStatus;
+    let line = |step: &crate::tools::Step| match step.status {
+        StepStatus::Done => style.green(&format!("  ✓ {}", step.text)),
+        StepStatus::Doing => style.bold(&format!("  ▸ {}", step.text)),
+        StepStatus::Todo => style.dim(&format!("  ○ {}", step.text)),
+    };
+    let same_texts =
+        before.len() == now.len() && before.iter().zip(now).all(|(a, b)| a.text == b.text);
+    let done = now.iter().filter(|s| s.status == StepStatus::Done).count();
+    let mut text = String::new();
+    if same_texts {
+        for (old, new) in before.iter().zip(now) {
+            if old.status != new.status {
+                text.push_str(&format!("{}\n", line(new)));
+            }
+        }
+        if text.is_empty() {
+            return text;
+        }
+        text.push_str(&format!(
+            "{}\n",
+            style.dim(&format!("  {done}/{} done", now.len()))
+        ));
+    } else {
+        text.push_str(&format!("{}\n", style.dim("steps:")));
+        for step in now {
+            text.push_str(&format!("{}\n", line(step)));
+        }
+    }
+    text
+}
+
 pub const PROMPT: &str = "> ";
 
 /// One input and one output, shared by the REPL, the observer and the approver
@@ -207,8 +435,18 @@ pub struct Terminal<R, W> {
     history: Vec<String>,
     /// The tool calls of this run, for `/expand` (issue 17).
     tools: Vec<crate::toolview::ToolRecord>,
+    /// The checklist the model set with `steps` in the message being answered (issue 42).
+    steps: Vec<crate::tools::Step>,
+    /// `/calls all`: every call and every result on screen, as before issue 42.
+    calls_all: bool,
+    /// The call line of the call in progress was not printed (a list of steps is showing).
+    call_hidden: bool,
     /// The box kept at the bottom while the model works (issue 17).
     sticky: Option<Sticky>,
+    /// What runs in the background, listed under the working box (issue 42).
+    tasks: Option<TaskView>,
+    /// The steps are drawn over the working box (not printed as they change).
+    steps_above: bool,
     /// A cancelled message, put back in the box at the next prompt to be edited and sent again.
     restore: Option<String>,
     /// The flag Esc and Ctrl-C set while the model works (issue 18); `None` until the REPL gives it.
@@ -277,6 +515,11 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
             col: 0,
             history: Vec::new(),
             tools: Vec::new(),
+            steps: Vec::new(),
+            tasks: None,
+            steps_above: false,
+            calls_all: false,
+            call_hidden: false,
             sticky: None,
             restore: None,
             cancel: None,
@@ -345,19 +588,71 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
     }
 
     /// Draws the working box where the cursor is (a fresh row) and leaves the cursor below it.
+    /// The steps the model set are over it, and what runs in the background under it.
     fn draw_sticky(&mut self) {
-        let Some(sticky) = &mut self.sticky else {
-            return;
+        let size = terminal_size();
+        let mut info = match &self.sticky {
+            Some(sticky) => sticky.info.clone(),
+            None => return,
+        };
+        if let Some(view) = &self.tasks {
+            for line in view.lines(size.1) {
+                info.push('\n');
+                info.push_str(&line);
+            }
+        }
+        let above = if self.steps_above {
+            steps_block(self.style, &self.steps, size.0.saturating_sub(12).max(3))
+        } else {
+            Vec::new()
         };
         let (shown, rows) =
-            crate::inputbox::static_box(self.style, terminal_size(), "working…", &sticky.info);
-        sticky.rows = rows;
-        sticky.visible = true;
+            crate::inputbox::static_box(self.style, size, "working…", &info, &above);
+        if let Some(sticky) = &mut self.sticky {
+            sticky.rows = rows;
+            sticky.visible = true;
+        }
         let _ = self.output.write_all(shown.as_bytes());
         let _ = self.output.flush();
     }
 
+    /// Draws the working box again (the steps or the tasks changed).
+    fn refresh_sticky(&mut self) {
+        let Some(rows) = self.sticky.as_ref().filter(|s| s.visible).map(|s| s.rows) else {
+            return;
+        };
+        let _ = self
+            .output
+            .write_all(crate::inputbox::erase(rows).as_bytes());
+        self.draw_sticky();
+    }
+
+    /// Gives the list of what runs in the background, shown under the working box.
+    pub fn set_tasks(&mut self, view: TaskView) {
+        self.tasks = Some(view);
+    }
+
+    /// The model's steps are over the working box: true while it is drawn.
+    fn pin_steps(&self) -> bool {
+        self.sticky.is_some() && self.steps_above
+    }
+
+    /// The work is ending: the steps that were over the box are printed once, as they stand.
+    fn unpin_steps(&mut self) {
+        if self.pin_steps() && !self.steps.is_empty() {
+            let text = steps_text(self.style, &[], &self.steps);
+            self.steps_above = false;
+            self.say(&text);
+        }
+        self.steps_above = false;
+    }
+
     /// Sets the folder `@file` works in (the program's working directory unless told otherwise).
+    /// The working directory: files named in a command must be below it.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     pub fn set_root(&mut self, root: std::path::PathBuf) {
         self.root = root;
     }
@@ -379,6 +674,7 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
             return;
         }
         let info = info(Some(terminal_size().1.saturating_sub(3)));
+        self.steps_above = true;
         self.sticky = Some(Sticky {
             info,
             rows: 0,
@@ -434,20 +730,26 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
 
     /// Draws the main prompt and reads the next line. At a real terminal the line is typed inside
     /// a box with `info` under it (issue 17); otherwise it follows a plain `> `.
-    pub fn read_prompt(&mut self, info: impl Fn(Option<usize>) -> String) -> Option<String> {
+    pub fn read_prompt(
+        &mut self,
+        info: impl Fn(Option<usize>) -> String,
+        wake: impl Fn() -> bool,
+    ) -> Prompted {
         let raw = if self.menu_stty {
-            RawMode::enter()
+            // Reads give up after a fifth of a second with nothing typed, so the prompt can notice
+            // that a subagent finished.
+            RawMode::enter_with(0, 2)
         } else {
             None
         };
         let Some(raw) = raw else {
             let accent = self.style.accent(PROMPT);
             self.say(&accent);
-            return self.read_command();
+            return self.read_command().map_or(Prompted::Eof, Prompted::Line);
         };
         let root = self.root.clone();
         let restored = self.restore.take().unwrap_or_default();
-        let (line, row) = crate::inputbox::read_boxed_from(
+        let (line, row, woke) = crate::inputbox::read_boxed_waking(
             &restored,
             &mut self.input,
             &mut self.output,
@@ -456,6 +758,7 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
             &self.history.clone(),
             &info,
             &mut || crate::attach::files_under(&root),
+            Some(&wake),
         );
         drop(raw);
         // The box goes; what was sent stays in the scrollback as a line of its own, in cyan.
@@ -464,6 +767,13 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
             .write_all(crate::inputbox::erase(row).as_bytes());
         let _ = self.output.flush();
         self.col = 0;
+        if let Some(typed) = woke {
+            // The text typed so far comes back in the next box.
+            if !typed.is_empty() {
+                self.restore = Some(typed);
+            }
+            return Prompted::Wake;
+        }
         if let Some(sent) = &line
             && !sent.trim().is_empty()
         {
@@ -476,7 +786,7 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
         {
             self.history.push(line.clone());
         }
-        line
+        line.map_or(Prompted::Eof, Prompted::Line)
     }
 
     /// Keeps what is typed while the model works off the screen (a real terminal only).
@@ -556,6 +866,15 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
 /// How many rows of a menu show at once.
 const MENU_ROWS: usize = 12;
 
+/// What the main prompt gave back.
+pub enum Prompted {
+    Line(String),
+    /// The end of input.
+    Eof,
+    /// A subagent finished while nothing was being sent.
+    Wake,
+}
+
 /// The terminal in raw mode (single keys, no echo) until this is dropped, which puts it back as
 /// it was, also when a panic unwinds. Ctrl-C arrives as a key (`-isig`) so it cannot kill the
 /// program with the terminal left raw.
@@ -570,6 +889,11 @@ impl RawMode {
 
     /// `min` is how many bytes a read waits for: 1 waits for a key, 0 returns at once.
     fn enter_with_min(min: u8) -> Option<Self> {
+        Self::enter_with(min, 0)
+    }
+
+    /// `time` is the wait of a read in tenths of a second when `min` is 0.
+    fn enter_with(min: u8, time: u8) -> Option<Self> {
         let output = std::process::Command::new("stty")
             .arg("-g")
             .stdin(std::process::Stdio::inherit())
@@ -588,7 +912,7 @@ impl RawMode {
                 "min",
                 &min.to_string(),
                 "time",
-                "0",
+                &time.to_string(),
             ])
             .stdin(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::null())
@@ -1011,6 +1335,27 @@ impl<R: BufRead, W: Write> Observer for PrintObserver<R, W> {
             arguments: call.arguments.clone(),
             result: None,
         });
+        term.call_hidden = false;
+        if call.name == "steps"
+            && let Ok(now) = crate::tools::parse_steps(&call.arguments)
+        {
+            term.call_hidden = true;
+            if term.pin_steps() {
+                // Over the working box, not in the scrollback.
+                term.steps = now;
+                term.refresh_sticky();
+                return;
+            }
+            let text = steps_text(style, &term.steps, &now);
+            term.steps = now;
+            term.say(&text);
+            return;
+        }
+        // While a list of steps is unfinished its calls are not shown, unless one fails.
+        if !term.calls_all && crate::tools::unfinished(&term.steps) {
+            term.call_hidden = true;
+            return;
+        }
         let line = tool_line(
             style,
             Some(term.tools.len()),
@@ -1021,14 +1366,30 @@ impl<R: BufRead, W: Write> Observer for PrintObserver<R, W> {
         term.say(&line);
     }
 
-    fn tool_result(&mut self, _call: &ToolCall, result: &str) {
+    fn tool_result(&mut self, call: &ToolCall, result: &str) {
         let mut term = self.0.borrow_mut();
         let style = term.style();
         if let Some(record) = term.tools.last_mut() {
             record.result = Some(result.to_owned());
         }
-        let line = result_line(style, result, term.line_width());
-        term.say(&line);
+        let failed = crate::toolview::failed(result);
+        // A call that went well is one line (the call). Its result is shown when it failed, or
+        // with `/calls all`.
+        if !failed && !term.calls_all {
+            return;
+        }
+        let mut text = String::new();
+        if term.call_hidden {
+            text.push_str(&tool_line(
+                style,
+                Some(term.tools.len()),
+                &call.name,
+                &call.arguments,
+                term.line_width(),
+            ));
+        }
+        text.push_str(&result_line(style, result, term.line_width()));
+        term.say(&text);
     }
 
     fn warning(&mut self, text: &str) {
@@ -1038,6 +1399,33 @@ impl<R: BufRead, W: Write> Observer for PrintObserver<R, W> {
             style.yellow(&format!("[warning: {text}]"))
         ));
     }
+
+    /// A background subagent finished, or its answer was added to the chat.
+    fn subagent_note(&mut self, text: &str) {
+        let mut term = self.0.borrow_mut();
+        let style = term.style();
+        term.say(&format!("{}\n", style.dim(text)));
+    }
+}
+
+/// A message the program added with the answers of subagents (`jobs::delivery_text`): one short
+/// line for each answer, so a replay does not print their whole text as if the owner had typed it.
+fn delivery_lines(content: &str) -> Option<Vec<String>> {
+    const MARK: &str = ". This text is from a subagent, not from the user:";
+    if !content.starts_with("Subagent #") {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for part in content.split("\n\n---\n\n") {
+        let (header, body) = part.split_once("\n\n").unwrap_or((part, ""));
+        let header = header.strip_suffix(MARK)?;
+        lines.push(format!(
+            "[{}: answer added to the chat, {} characters]",
+            header.replacen("Subagent", "subagent", 1),
+            body.chars().count()
+        ));
+    }
+    Some(lines)
 }
 
 /// A saved "active instructions" message as one line: which personality and skills it holds.
@@ -1109,6 +1497,12 @@ pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Messag
                     style.dim(&format!("[summary of an earlier chat: {chars} characters]"))
                 ));
             }
+            Message::User(content) if delivery_lines(content).is_some() => {
+                for line in delivery_lines(content).unwrap_or_default() {
+                    text.push_str(&format!("{}\n", style.dim(&line)));
+                }
+            }
+            Message::User(content) if content == crate::agent::WAKE_TEXT => {}
             Message::User(content) => {
                 text.push_str(&format!("{}{content}\n", style.accent(PROMPT)));
             }
@@ -1120,7 +1514,10 @@ pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Messag
                 if tool_calls.is_empty()
                     && let Some(content) = content
                 {
-                    text.push_str(&format!("{content}\n"));
+                    text.push_str(&format!(
+                        "{}\n",
+                        crate::markdown::render(style, content, width)
+                    ));
                 }
                 for call in tool_calls {
                     text.push_str(&tool_line(style, None, &call.name, &call.arguments, width));
@@ -1138,7 +1535,9 @@ fn compact_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>,
     let style = term.borrow().style();
     let mut words = rest.split_whitespace();
     match (words.next(), words.next(), words.next()) {
-        (None, ..) => run_compact(agent, term, true),
+        (None, ..) => {
+            run_compact(agent, term, true);
+        }
         (Some("auto"), None, _) => {
             let said = match agent.auto_compact_at() {
                 Some(limit) => format!(
@@ -1185,7 +1584,8 @@ fn compact_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>,
 }
 
 /// Runs one compaction with the working box up and says what happened. `Esc` cancels it.
-fn run_compact<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, asked: bool) {
+/// Returns `true` when the user cancelled it.
+fn run_compact<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, asked: bool) -> bool {
     let style = term.borrow().style();
     term.borrow_mut()
         .begin_working(|width| info_text(agent, width));
@@ -1194,20 +1594,27 @@ fn run_compact<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, ask
     drop(quiet);
     term.borrow_mut().end_working();
     match done {
-        Ok(report) => say_line(
-            term,
-            &style.green(&format!(
-                "[compacted: {} messages became a summary of {} characters; the earlier chat is saved]",
-                report.messages, report.summary_chars
-            )),
-        ),
+        Ok(report) => {
+            say_line(
+                term,
+                &style.green(&format!(
+                    "[compacted: {} messages became a summary of {} characters; the earlier chat is saved]",
+                    report.messages, report.summary_chars
+                )),
+            );
+            false
+        }
         Err(why) => {
+            let cancelled = why == "cancelled";
             let note = if asked {
                 format!("[not compacted: {why}]")
+            } else if cancelled {
+                format!("[not compacted: {why}; the message was not sent]")
             } else {
                 format!("[not compacted: {why}; sending the message as it is]")
             };
             say_line(term, &style.yellow(&note));
+            cancelled
         }
     }
 }
@@ -1403,16 +1810,324 @@ fn model_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, a
 /// The info line under the input box (also `/info`): model, provider, approval mode, tokens.
 fn info_text(agent: &Agent, width: Option<usize>) -> String {
     let mode = agent.approval_mode();
+    let approve = if agent.planning() {
+        format!("{} · plan mode", mode.name())
+    } else {
+        mode.name().to_owned()
+    };
     crate::usage::info_line(
         &crate::usage::Info {
             model: agent.ready().then(|| agent.model()),
             provider: &agent.target().name,
-            approve: mode.name(),
+            approve: &approve,
             always: agent.always_labels().len(),
+            subagents: agent.running_subagents(),
+            shells: agent.shells().running(),
             usage: agent.usage(),
         },
         width,
     )
+}
+
+/// What is under the input box: the info line, then what runs in the background (issue 42).
+fn box_text(agent: &Agent, width: Option<usize>) -> String {
+    let mut text = info_text(agent, width);
+    for line in agent.task_view().lines(width.map_or(80, |w| w + 3)) {
+        text.push('\n');
+        text.push_str(&line);
+    }
+    text
+}
+
+/// Before leaving: running subagents stop with the program, so the owner is asked first. True when
+/// there is nothing running, the answer is yes, or the input has ended (no one to ask).
+fn quit_confirmed<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> bool {
+    let subagents = agent.running_subagents();
+    let commands = agent.shells().running();
+    if subagents + commands == 0 {
+        return true;
+    }
+    let style = term.borrow().style();
+    let mut parts = Vec::new();
+    if subagents > 0 {
+        parts.push(format!(
+            "{subagents} subagent{}",
+            if subagents == 1 { "" } else { "s" }
+        ));
+    }
+    if commands > 0 {
+        parts.push(format!(
+            "{commands} background command{}",
+            if commands == 1 { "" } else { "s" }
+        ));
+    }
+    let what = parts.join(" and ");
+    let total = subagents + commands;
+    let ask = format!("{what} still running; quitting stops {total}. Quit anyway? [y/N] ");
+    term.borrow_mut().say(&style.yellow(&ask));
+    // Input that has ended cannot answer, and asking again would never stop: that quits.
+    let yes = term
+        .borrow_mut()
+        .read_line()
+        .is_none_or(|a| matches!(a.trim().to_lowercase().as_str(), "y" | "yes"));
+    if !yes {
+        say_line(term, &style.dim("not quitting; /tasks shows them"));
+    }
+    yes
+}
+
+/// `/subagent [profile] <task>` (issue 35): starts a subagent on a thread and returns at once.
+fn subagent_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, rest: &str) {
+    let style = term.borrow().style();
+    match agent.start_subagent(rest) {
+        Ok(run) => {
+            let kind = if run.coder {
+                "coder: it may change files"
+            } else {
+                "reader: it only looks"
+            };
+            say_line(
+                term,
+                &style.green(&format!(
+                    "subagent #{} started ({}, {kind}); you can keep chatting, its answer is added at your next message after it finishes (/subagents shows progress)",
+                    run.n, run.profile
+                )),
+            );
+        }
+        Err(why) => say_line(term, &style.yellow(&why)),
+    }
+}
+
+/// `/subagents [list | show N | stop N]`.
+fn subagents_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, rest: &str) {
+    let style = term.borrow().style();
+    let (sub, arg) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(a, b)| (a, b.trim()));
+    let number = || arg.trim_start_matches('#').parse::<u32>().ok();
+    match sub {
+        "" | "list" if arg.is_empty() => {
+            let runs = agent.subagent_runs();
+            if runs.is_empty() {
+                say_line(
+                    term,
+                    &style.dim("no subagents started in this run (/subagent <task>)"),
+                );
+                return;
+            }
+            let width = term.borrow().line_width();
+            for run in &runs {
+                let kind = if run.coder { "coder" } else { "reader" };
+                let head = format!(
+                    "#{} {} ({kind}) {} · {} call{} · {}s · ",
+                    run.n,
+                    run.profile,
+                    run.status.name(),
+                    run.calls,
+                    if run.calls == 1 { "" } else { "s" },
+                    run.seconds
+                );
+                let room = width.saturating_sub(head.chars().count()).max(20);
+                let task: String = run
+                    .task
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(room)
+                    .collect();
+                say_line(term, &format!("{}{task}", style.bold(&head)));
+            }
+        }
+        "show" => {
+            let Some(n) = number() else {
+                say_line(term, &style.yellow("usage: /subagents show <number>"));
+                return;
+            };
+            let Some(run) = agent.subagent_runs().into_iter().find(|r| r.n == n) else {
+                say_line(
+                    term,
+                    &style.yellow(&format!("there is no subagent #{n} (see /subagents)")),
+                );
+                return;
+            };
+            let kind = if run.coder { "coder" } else { "reader" };
+            say_line(
+                term,
+                &style.bold(&format!(
+                    "#{} {} ({kind}) {} · {} calls · {}s",
+                    run.n,
+                    run.profile,
+                    run.status.name(),
+                    run.calls,
+                    run.seconds
+                )),
+            );
+            say_line(term, &format!("task: {}", run.task));
+            if !run.recent.is_empty() {
+                say_line(term, &style.dim("latest calls:"));
+                for line in &run.recent {
+                    say_line(term, &style.dim(&format!("  ↳ {line}")));
+                }
+            }
+            if let Some(result) = &run.result {
+                say_line(term, "answer:");
+                let width = term.borrow().line_width();
+                say_line(term, &crate::markdown::render(style, result, width));
+            }
+        }
+        "stop" => {
+            let Some(n) = number() else {
+                say_line(term, &style.yellow("usage: /subagents stop <number>"));
+                return;
+            };
+            match agent.stop_subagent(n) {
+                Ok(()) => say_line(
+                    term,
+                    &style.green(&format!(
+                        "stopping subagent #{n}; its answer is not added to the chat"
+                    )),
+                ),
+                Err(why) => say_line(term, &style.yellow(&why)),
+            }
+        }
+        _ => say_line(
+            term,
+            &style.yellow("usage: /subagents [list | show <number> | stop <number>]"),
+        ),
+    }
+}
+
+/// `/calls [all | short]`: how much of each tool call is shown (issue 42).
+fn calls_command<R: BufRead, W: Write>(term: &Shared<R, W>, rest: &str) {
+    let style = term.borrow().style();
+    match rest.trim() {
+        "" => {
+            let now = if term.borrow().calls_all {
+                "all"
+            } else {
+                "short"
+            };
+            say_line(
+                term,
+                &format!("tool calls are shown: {now} (/calls all, /calls short)"),
+            );
+        }
+        "all" | "short" => {
+            let all = rest.trim() == "all";
+            term.borrow_mut().calls_all = all;
+            say_line(
+                term,
+                &style.green(if all {
+                    "every tool call and result is shown"
+                } else {
+                    "one line for each call; a result only when it failed; steps instead of calls"
+                }),
+            );
+        }
+        _ => say_line(term, &style.yellow("usage: /calls [all | short]")),
+    }
+}
+
+/// `s2` or `a1` (a bare number is also taken, as a command first and then a subagent).
+fn task_id(word: &str) -> Option<(char, u32)> {
+    let word = word.trim().trim_start_matches('#');
+    let (kind, digits) = match word.chars().next()? {
+        c @ ('s' | 'a') => (c, &word[1..]),
+        _ => ('?', word),
+    };
+    digits.parse().ok().map(|n| (kind, n))
+}
+
+/// `/tasks [show ID | stop ID]`: the background commands and subagents in one list (issue 42).
+fn tasks_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, rest: &str) {
+    let style = term.borrow().style();
+    let (sub, arg) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(a, b)| (a, b.trim()));
+    let usage = || {
+        say_line(
+            term,
+            &style.yellow("usage: /tasks [show <id> | stop <id>]   (ids: s1 for a command, a1 for a subagent)"),
+        );
+    };
+    match sub {
+        "" | "list" if arg.is_empty() => {
+            let shells = agent.shells().list();
+            let runs = agent.subagent_runs();
+            if shells.is_empty() && runs.is_empty() {
+                return say_line(
+                    term,
+                    &style.dim("nothing has run in the background in this run"),
+                );
+            }
+            let width = term.borrow().line_width();
+            for info in &shells {
+                let line = info.line();
+                say_line(term, &cut_line(&line, width));
+            }
+            for run in &runs {
+                let head = format!(
+                    "a{}  {}  {}  {}: ",
+                    run.n,
+                    run.status.name(),
+                    crate::tools::clock(std::time::Duration::from_secs(run.seconds)),
+                    run.profile
+                );
+                let room = width.saturating_sub(head.chars().count()).max(20);
+                let task: String = run
+                    .task
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(room)
+                    .collect();
+                say_line(term, &format!("{head}{task}"));
+            }
+        }
+        "show" | "stop" => match task_id(arg) {
+            Some(('a', n)) => subagents_command(agent, term, &format!("{sub} {n}")),
+            Some(('s', n)) => shell_task(agent, term, sub == "stop", n),
+            Some((_, n)) => {
+                // A bare number: the command of that number if there is one, else the subagent.
+                if agent.shells().list().iter().any(|t| t.n == n) {
+                    shell_task(agent, term, sub == "stop", n);
+                } else {
+                    subagents_command(agent, term, &format!("{sub} {n}"));
+                }
+            }
+            None => usage(),
+        },
+        _ => usage(),
+    }
+}
+
+fn cut_line(line: &str, width: usize) -> String {
+    crate::toolview::cut(line, width.max(20))
+}
+
+fn shell_task<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, stop: bool, n: u32) {
+    let style = term.borrow().style();
+    if stop {
+        match agent.shells().stop(n) {
+            Ok(()) => say_line(term, &style.green(&format!("stopping s{n}"))),
+            Err(why) => say_line(term, &style.yellow(&why)),
+        }
+        return;
+    }
+    match agent.shells().output(n, 6000) {
+        Ok((info, text)) => {
+            say_line(term, &style.bold(&info.line()));
+            let text = if text.trim().is_empty() {
+                style.dim("(no output yet)")
+            } else {
+                text.trim_end().to_owned()
+            };
+            say_line(term, &text);
+        }
+        Err(why) => say_line(term, &style.yellow(&why)),
+    }
 }
 
 /// `/expand [N|list]`: the full text of a tool call of this run.
@@ -1673,19 +2388,30 @@ fn show_providers<R: BufRead, W: Write>(agent: &Agent, term: &Shared<R, W>) {
     term.borrow_mut().say(&text);
 }
 
-/// `/provider add <name> <base_url> <model>`: asks for the key, saves, switches.
+/// `/provider add <name> <base_url> <model> [openai|anthropic]`: asks for the key, saves, switches.
 fn add_provider_command<R: BufRead, W: Write>(
     agent: &mut Agent,
     term: &Shared<R, W>,
     arguments: &[&str],
 ) {
     let style = term.borrow().style();
-    let [name, base_url, model] = arguments else {
-        say_line(
-            term,
-            &style.yellow("usage: /provider add <name> <base_url> <model>"),
-        );
-        return;
+    let (name, base_url, model, api) = match arguments {
+        [name, base_url, model] => (name, base_url, model, Ok(ApiStyle::OpenAi)),
+        [name, base_url, model, api] => (name, base_url, model, ApiStyle::parse(api)),
+        _ => {
+            say_line(
+                term,
+                &style.yellow("usage: /provider add <name> <base_url> <model> [openai|anthropic]"),
+            );
+            return;
+        }
+    };
+    let api = match api {
+        Ok(api) => api,
+        Err(why) => {
+            say_line(term, &style.red(&format!("[error: {why}]")));
+            return;
+        }
     };
     // Check everything that can be checked before asking for a key.
     if let Err(why) = crate::providers::check_name(name)
@@ -1721,6 +2447,7 @@ fn add_provider_command<R: BufRead, W: Write>(
         model: (*model).to_owned(),
         api_key: (!key.is_empty()).then(|| key.to_owned()),
         router: kernel::RouterOptions::default(),
+        api,
     };
     if let Err(why) = agent.add_provider(def) {
         say_line(term, &style.red(&format!("[error: {why}]")));
@@ -1797,22 +2524,55 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
     let mut observer = PrintObserver(Rc::clone(term));
     let style = term.borrow().style();
     term.borrow_mut().set_cancel(agent.cancel_handle());
+    // The `/web` server, if it was started: it stops when this function returns (issue 29).
+    let mut web: Option<crate::web::Web> = None;
+    // A message the program sends by itself because of a choice the owner made (after a plan).
+    let mut queued: Option<String> = None;
     loop {
         // Each borrow ends at the semicolon, before `agent.send` runs: the
         // approver and observer borrow the terminal again while it works.
-        let Some(line) = term
-            .borrow_mut()
-            .read_prompt(|width| info_text(agent, width))
-        else {
-            term.borrow_mut().say("\n");
-            return Ok(());
-        };
-        let line = line.trim();
+        let typed: String;
+        let woke_up = queued.is_none() && agent.wake_ready();
+        if let Some(text) = queued.take() {
+            // The owner chose "build" after a plan: the message is not typed.
+            typed = text;
+        } else if woke_up {
+            // A subagent finished: the model gets its answer and goes on without waiting for the
+            // owner to type (issue 35).
+            agent.note_wake();
+            say_line(
+                term,
+                &style.dim("[a subagent finished: its answer goes to the model]"),
+            );
+            typed = crate::agent::WAKE_TEXT.to_owned();
+        } else {
+            let read = term
+                .borrow_mut()
+                .read_prompt(|width| box_text(agent, width), || agent.wake_ready());
+            match read {
+                Prompted::Wake => continue,
+                Prompted::Eof => {
+                    term.borrow_mut().say("\n");
+                    if quit_confirmed(agent, term) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Prompted::Line(line) => {
+                    agent.reset_wakes();
+                    typed = line;
+                }
+            }
+        }
+        let line = typed.trim();
         if line.is_empty() {
             continue;
         }
         if line == "/exit" || line == "/quit" {
-            return Ok(());
+            if quit_confirmed(agent, term) {
+                return Ok(());
+            }
+            continue;
         }
         if line == "/sessions" {
             if term.borrow().menus_enabled() {
@@ -1858,12 +2618,52 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                 say_line(term, &info_text(agent, None));
                 continue;
             }
+            "/subagent" => {
+                subagent_command(agent, term, rest);
+                continue;
+            }
+            "/subagents" => {
+                subagents_command(agent, term, rest);
+                continue;
+            }
+            "/tasks" => {
+                tasks_command(agent, term, rest);
+                continue;
+            }
+            "/calls" => {
+                calls_command(term, rest);
+                continue;
+            }
+            "/plan" => {
+                plan_command(agent, term, rest);
+                continue;
+            }
             "/prompts" => {
                 crate::prompts_ui::command(agent, term, rest);
                 continue;
             }
             "/skills" => {
                 crate::skills_ui::skills_command(agent, term, rest);
+                continue;
+            }
+            "/profile" => {
+                crate::profiles_ui::command(agent, term, rest);
+                continue;
+            }
+            "/context" => {
+                crate::context_ui::command(agent, term, rest);
+                continue;
+            }
+            "/tools" => {
+                crate::tools_ui::command(agent, term, rest);
+                continue;
+            }
+            "/glossary" => {
+                crate::glossary_ui::command(agent, term, rest);
+                continue;
+            }
+            "/web" => {
+                crate::web_ui::command(agent, term, rest, &mut web);
                 continue;
             }
             "/personality" => {
@@ -1895,9 +2695,12 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
             }
             _ => {}
         }
+        // `/init` is a message to the model that the program writes.
+        let is_init = word == "/init" && rest.is_empty();
+        let line = if is_init { INIT_MESSAGE } else { line };
         // A command that is misspelled or has arguments it does not take is not a message: sending
         // it would cost a model call for nothing.
-        if looks_like_command(word) {
+        if !is_init && looks_like_command(word) {
             let known = COMMANDS
                 .iter()
                 .filter_map(|(command, _)| command.split_whitespace().next())
@@ -1937,15 +2740,34 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                     crate::usage::thousands(used)
                 )),
             );
-            run_compact(agent, term, false);
+            if run_compact(agent, term, false) {
+                // Esc while compacting: the message is not sent. At the box its text comes back.
+                if term.borrow().menu_stty && !woke_up {
+                    term.borrow_mut().restore = Some(line.to_owned());
+                }
+                continue;
+            }
         }
+        term.borrow_mut().steps.clear();
+        term.borrow_mut().set_tasks(agent.task_view());
         term.borrow_mut()
             .begin_working(|width| info_text(agent, width));
         let quiet = term.borrow().quiet();
         let sent = agent.send(&attachment.message, &mut observer);
         drop(quiet);
+        if woke_up && matches!(sent, Outcome::Failed(_) | Outcome::Cancelled) {
+            // A message the owner did not type is not tried again and again.
+            agent.stop_wakes();
+        }
+        let plan_text = match &sent {
+            Outcome::Answer(text) if agent.planning() && !woke_up => Some(text.clone()),
+            _ => None,
+        };
         let report = match sent {
-            Outcome::Answer(text) => format!("{text}\n"),
+            Outcome::Answer(text) => {
+                let width = term.borrow().line_width();
+                format!("{}\n", crate::markdown::render(style, &text, width))
+            }
             Outcome::CapReached { calls } => format!(
                 "{}\n",
                 style.yellow(&format!(
@@ -1962,6 +2784,7 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
             Outcome::Cancelled => {
                 // At the box the typed text comes back in it; a plain prompt cannot show it.
                 let boxed = term.borrow().menu_stty;
+                let boxed = boxed && !woke_up;
                 if boxed {
                     term.borrow_mut().restore = Some(line.to_owned());
                 }
@@ -1978,8 +2801,99 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                 )
             }
         };
+        term.borrow_mut().unpin_steps();
         term.borrow_mut().say(&report);
         term.borrow_mut().end_working();
+        if let Some(plan) = plan_text {
+            queued = after_plan(agent, term, &plan);
+        }
+    }
+}
+
+/// What to do with a plan the model just wrote (issue 42). Returns the message to send next, if
+/// the owner chose to build it here.
+fn after_plan<R: BufRead, W: Write>(
+    agent: &mut Agent,
+    term: &Shared<R, W>,
+    plan: &str,
+) -> Option<String> {
+    let style = term.borrow().style();
+    let choice = if term.borrow().menus_enabled() {
+        let items = [
+            MenuItem::new("Build").with_detail("leave plan mode and do the plan here"),
+            MenuItem::new("Build with agent")
+                .with_detail("a subagent does it in the background (needs /approve auto)"),
+            MenuItem::new("Discuss").with_detail("stay in plan mode and talk it over"),
+        ];
+        term.borrow_mut()
+            .pick("The plan is ready. What next?", &items)
+            .unwrap_or(2)
+    } else {
+        term.borrow_mut().say(&style.bold(
+            "The plan is ready: [b]uild it here, build with an [a]gent, or [d]iscuss it? [b/a/D] ",
+        ));
+        match term
+            .borrow_mut()
+            .read_line()
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase()
+            .as_str()
+        {
+            "b" | "build" => 0,
+            "a" | "agent" => 1,
+            _ => 2,
+        }
+    };
+    match choice {
+        0 => {
+            agent.set_planning(false);
+            say_line(term, &style.green("plan mode is off: building"));
+            Some("Carry out the plan you just wrote, step by step.".to_owned())
+        }
+        1 => {
+            if agent.approval_mode() != Mode::Auto {
+                say_line(
+                    term,
+                    &style.yellow(
+                        "a subagent changes files only in /approve auto; still in plan mode (/approve auto, then ask again, or choose Build)",
+                    ),
+                );
+                return None;
+            }
+            agent.set_planning(false);
+            say_line(term, &style.green("plan mode is off"));
+            subagent_command(agent, term, &format!("Carry out this plan:\n\n{plan}"));
+            None
+        }
+        _ => {
+            say_line(
+                term,
+                &style.dim("still in plan mode: type to discuss, /plan off to leave"),
+            );
+            None
+        }
+    }
+}
+
+/// `/plan [on | off]`.
+fn plan_command<R: BufRead, W: Write>(agent: &Agent, term: &Shared<R, W>, rest: &str) {
+    let style = term.borrow().style();
+    match rest.trim() {
+        "" | "on" => {
+            agent.set_planning(true);
+            say_line(
+                term,
+                &style.green(
+                    "plan mode is on: the model can only look and answer with a plan (/plan off leaves it)",
+                ),
+            );
+        }
+        "off" => {
+            agent.set_planning(false);
+            say_line(term, &style.green("plan mode is off"));
+        }
+        _ => say_line(term, &style.yellow("usage: /plan [on | off]")),
     }
 }
 
@@ -2008,7 +2922,7 @@ mod tests {
     struct Rig {
         agent: Agent,
         term: TestTerm,
-        requests: Rc<RefCell<Vec<Vec<u8>>>>,
+        requests: crate::agent::Shared<Vec<Vec<u8>>>,
     }
 
     fn rig(
@@ -2052,6 +2966,7 @@ mod tests {
             )
             .with_approval(Rc::clone(&approval)),
         ));
+        tools.push(Box::new(crate::tools::StepsTool::new()));
         let log = TurnLog::create(&dir.path().join("logs")).unwrap();
         let agent = Agent::new("m", Box::new(provider), tools, log)
             .with_target("test", "http://x/v1")
@@ -2195,6 +3110,33 @@ mod tests {
     }
 
     #[test]
+    fn esc_during_automatic_compaction_does_not_send_the_message() {
+        let dir = Scratch::new("repl-compact-esc");
+        let slot = crate::agent::Shared::new(None);
+        let provider = ScriptedProvider::new(vec![
+            ScriptedProvider::with_usage(
+                ScriptedProvider::text("one"),
+                r#"{"prompt_tokens":90000}"#,
+            ),
+            ScriptedProvider::text("Summary text."),
+            ScriptedProvider::text("two"),
+        ])
+        .cancelling_at(2, slot.clone());
+        let mut r = rig_with_provider(&dir, "first\nsecond\n/exit\n", provider, Style::plain());
+        *slot.borrow_mut() = Some(r.agent.cancel_handle());
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("[not compacted: cancelled; the message was not sent]"),
+            "{out}"
+        );
+        assert!(!out.contains("sending the message as it is"), "{out}");
+        // "first" and the summary request were sent; "second" was not.
+        assert_eq!(r.requests.borrow().len(), 2);
+        assert!(!out.contains("two"), "{out}");
+    }
+
+    #[test]
     fn a_saved_summary_is_replayed_as_one_line() {
         let dir = Scratch::new("repl-summary-line");
         let r = rig(&dir, "", vec![]);
@@ -2236,7 +3178,10 @@ mod tests {
 
         let out = screen(&r.term);
         assert!(out.contains("▸ #1 bash echo hi && touch hi.txt\n"), "{out}");
-        assert!(out.contains("  ✓ hi\n"), "{out}");
+        assert!(
+            !out.contains("  ✓ hi\n"),
+            "a result that went well is not shown: {out}"
+        );
         assert!(
             out.contains("run this command?\n  echo hi && touch hi.txt\n[y/N] "),
             "{out}"
@@ -2829,7 +3774,6 @@ mod tests {
             coloured.contains("\x1b[2m▸ #1 bash echo hi && touch hi.txt\x1b[0m"),
             "{coloured}"
         );
-        assert!(coloured.contains("\x1b[2m  ✓ hi\x1b[0m"), "{coloured}");
         assert!(
             coloured.contains("\x1b[1mrun this command?\x1b[0m"),
             "{coloured}"
@@ -2900,6 +3844,24 @@ mod tests {
     }
 
     #[test]
+    fn init_sends_the_prepared_message_and_takes_no_arguments() {
+        let dir = Scratch::new("repl-init");
+        let mut r = rig(
+            &dir,
+            "/init\n/init now\n/exit\n",
+            vec![ScriptedProvider::text("proposed nothing")],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("/init does not take that"), "{out}");
+        let requests = r.requests.borrow();
+        assert_eq!(requests.len(), 1, "only the bare /init reaches the model");
+        let sent = String::from_utf8_lossy(&requests[0]);
+        assert!(sent.contains("Draft context for this project"), "{sent}");
+        assert!(sent.contains("context_propose"), "{sent}");
+    }
+
+    #[test]
     fn approve_shows_and_sets_the_mode_by_typing() {
         let dir = Scratch::new("repl-approve-typed");
         let mut r = rig(
@@ -2915,7 +3877,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "approval mode is now auto: file changes run without asking; bash still asks"
+                "approval mode is now auto: file changes, glossary words and context entries are saved without asking; bash still asks"
             ),
             "{out}"
         );
@@ -3212,6 +4174,105 @@ mod tests {
     }
 
     #[test]
+    fn steps_are_over_the_working_box_and_tasks_under_it_and_the_steps_are_printed_once_at_the_end()
+    {
+        let dir = Scratch::new("repl-pinned");
+        let shells = crate::tools::ShellTasks::new();
+        shells.start("sleep 30", dir.path()).unwrap();
+        let term = blank_term();
+        term.borrow_mut().enable_menus(true);
+        term.borrow_mut().set_tasks(TaskView {
+            shells: shells.clone(),
+            runs: Vec::new(),
+        });
+        term.borrow_mut().begin_working(|_| "the info".to_owned());
+        let mut observer = PrintObserver(Rc::clone(&term));
+        let first =
+            r#"{"steps":[{"text":"read","status":"doing"},{"text":"write","status":"todo"}]}"#;
+        observer.tool_call(&call("steps", first));
+        let shown = screen(&term);
+        // The checklist is the first thing of the drawing, then the box, the info, the task.
+        let drawn = shown.rsplit("\x1b[J").next().unwrap();
+        let rows: Vec<&str> = drawn.split("\r\n").collect();
+        assert_eq!(rows[0], " steps 0/2");
+        assert_eq!(rows[1], "  ▸ read");
+        assert_eq!(rows[2], "  ○ write");
+        assert!(rows[3].starts_with('╭'), "{rows:?}");
+        assert_eq!(rows[6], " the info");
+        assert!(rows[7].starts_with(" ● s1  sleep 30 · "), "{rows:?}");
+        let second =
+            r#"{"steps":[{"text":"read","status":"done"},{"text":"write","status":"doing"}]}"#;
+        observer.tool_call(&call("steps", second));
+        let drawn = screen(&term);
+        let drawn = drawn.rsplit("\x1b[J").next().unwrap().to_owned();
+        assert!(
+            drawn.starts_with(" steps 1/2\r\n  ✓ read\r\n  ▸ write\r\n"),
+            "{drawn:?}"
+        );
+        // Nothing of the steps went to the scrollback while the work went on.
+        assert!(!screen(&term).contains("steps:\n"));
+        term.borrow_mut().unpin_steps();
+        term.borrow_mut().say("the answer\n");
+        term.borrow_mut().end_working();
+        let out = screen(&term);
+        assert_eq!(out.matches("  ✓ read\n").count(), 1, "{out:?}");
+        assert!(out.contains("the answer\n"));
+        shells.stop_all();
+    }
+
+    #[test]
+    fn the_task_list_names_each_running_task_and_counts_the_rest() {
+        let dir = Scratch::new("repl-task-lines");
+        let shells = crate::tools::ShellTasks::new();
+        let view = |shells: &crate::tools::ShellTasks| TaskView {
+            shells: shells.clone(),
+            runs: Vec::new(),
+        };
+        assert!(view(&shells).lines(80).is_empty());
+        for _ in 0..5 {
+            shells.start("sleep 30", dir.path()).unwrap();
+        }
+        let lines = view(&shells).lines(80);
+        assert_eq!(lines.len(), TASK_ROWS);
+        assert!(lines[0].starts_with("● s1  sleep 30 · "), "{lines:?}");
+        assert_eq!(lines[TASK_ROWS - 1], "… 2 more (/tasks)");
+        shells.stop_all();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            view(&shells).lines(80).is_empty(),
+            "an ended task is not listed"
+        );
+    }
+
+    #[test]
+    fn a_long_checklist_is_cut_with_the_finished_steps_giving_way() {
+        use crate::tools::{Step, StepStatus};
+        let step = |text: &str, status| Step {
+            text: text.to_owned(),
+            status,
+        };
+        let steps: Vec<Step> = (0..8)
+            .map(|i| {
+                step(
+                    &format!("s{i}"),
+                    if i < 5 {
+                        StepStatus::Done
+                    } else {
+                        StepStatus::Todo
+                    },
+                )
+            })
+            .collect();
+        let lines = steps_block(Style::plain(), &steps, 6);
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(lines[0], " steps 5/8");
+        assert_eq!(lines[1], "  ✓ s4");
+        assert_eq!(lines[4], "  ○ s7");
+        assert_eq!(lines[5], "  … 4 more");
+        assert!(steps_block(Style::plain(), &[], 6).is_empty());
+    }
+
+    #[test]
     fn without_a_real_terminal_no_box_is_kept() {
         let term = blank_term();
         term.borrow_mut().begin_working(|_| "info".to_owned());
@@ -3239,7 +4300,7 @@ mod tests {
         let out = screen(&r.term);
         // The call itself is one collapsed line; the content is not on screen until expanded.
         assert!(out.contains("▸ #1 create_file a.txt · 11 bytes\n"), "{out}");
-        assert!(out.contains("  ✓ created a.txt (11 bytes)\n"), "{out}");
+        assert!(!out.contains("  ✓ created a.txt (11 bytes)\n"), "{out}");
         let full = "#1 create_file\npath: a.txt\ncontent (11 bytes):\nhello\nworld\nresult:\ncreated a.txt (11 bytes)\n";
         assert_eq!(out.matches(full).count(), 2, "{out}");
         assert!(out.contains("#1 create_file a.txt · 11 bytes\n"), "{out}");
@@ -3466,7 +4527,7 @@ mod tests {
         assert!(screen(&r.term).contains("status 404"));
     }
 
-    type Built = Rc<RefCell<Vec<(String, Rc<RefCell<Vec<Vec<u8>>>>)>>>;
+    type Built = Rc<RefCell<Vec<(String, crate::agent::Shared<Vec<Vec<u8>>>)>>>;
 
     /// An agent that saves into the scratch folder and can switch among scripted providers:
     /// each provider built answers "from <name>".
@@ -3480,7 +4541,7 @@ mod tests {
         let built: Built = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&built);
         let catalog = crate::providers::Catalog {
-            profile_dir: Some(dir.path().join("profiles")),
+            provider_dir: Some(dir.path().join("providers")),
             build: Box::new(move |def| {
                 let provider = ScriptedProvider::new(vec![ScriptedProvider::text(&format!(
                     "from {}",
@@ -3495,21 +4556,21 @@ mod tests {
         (r, built)
     }
 
-    fn profile(dir: &Scratch, name: &str, text: &str) {
-        let profiles = dir.path().join("profiles");
-        std::fs::create_dir_all(&profiles).unwrap();
-        std::fs::write(profiles.join(format!("{name}.profile")), text).unwrap();
+    fn provider_file(dir: &Scratch, name: &str, text: &str) {
+        let folder = dir.path().join("providers");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(format!("{name}.provider")), text).unwrap();
     }
 
     #[test]
     fn providers_are_listed_switched_added_and_removed() {
         let dir = Scratch::new("repl-providers");
-        profile(
+        provider_file(
             &dir,
             "other",
             "HARNESS_BASE_URL=http://other:9/v1\nHARNESS_MODEL=other-model\n",
         );
-        profile(&dir, "broken", "HARNESS_MODEL=m\n");
+        provider_file(&dir, "broken", "HARNESS_MODEL=m\n");
         let typed = "/provider\n/provider add mine http://mine.example/v1 mine-model\nSECRET-KEY-777\n\
                      /provider\n/provider other\n/provider remove mine\n/provider remove other\n\
                      /provider nope\n/provider broken\nhello\n/exit\n";
@@ -3517,8 +4578,8 @@ mod tests {
         run(&mut r.agent, &r.term).unwrap();
         let out = screen(&r.term);
 
-        // The first list: both profiles, the broken one explained, nothing saved yet.
-        assert!(out.contains("providers:\n  broken  profile  cannot be used: HARNESS_BASE_URL is missing\n  other   profile  other:9  other-model\n"), "{out}");
+        // The first list: both provider files, the broken one explained, nothing saved yet.
+        assert!(out.contains("providers:\n  broken  file     cannot be used: HARNESS_BASE_URL is missing\n  other   file     other:9  other-model\n"), "{out}");
         // Adding asks for the key on its own prompt, says where the input shows, saves, switches.
         assert!(
             out.contains("API key for mine, Enter for none (visible): "),
@@ -3530,14 +4591,14 @@ mod tests {
             out.contains("  mine    saved    mine.example  mine-model  (in use)\n"),
             "{out}"
         );
-        // Switching to a profile, removing, and the failure messages.
+        // Switching to a provider file, removing, and the failure messages.
         assert!(
             out.contains("now using other (other:9) with model other-model"),
             "{out}"
         );
         assert!(out.contains("removed provider mine"), "{out}");
         assert!(
-            out.contains("[error: other is a profile file; delete the file to remove it]"),
+            out.contains("[error: other is a provider file; delete the file to remove it]"),
             "{out}"
         );
         assert!(
@@ -3578,6 +4639,22 @@ mod tests {
         let free = saved.iter().find(|p| p.name == "free").unwrap();
         assert_eq!(free.api_key, None, "an empty answer means no key");
         assert!(!screen(&r.term).contains("SECRET-KEY"));
+    }
+
+    #[test]
+    fn a_provider_is_added_with_the_api_it_speaks() {
+        let dir = Scratch::new("repl-provider-api");
+        let typed = "/provider add claude https://api.anthropic.com/v1 claude-sonnet-5-5 anthropic\nKEY\n/provider add plain http://p/v1 m openai\n\n/provider add odd http://o/v1 m gemini\n/exit\n";
+        let (mut r, _) = switching_rig(&dir, typed, Style::plain());
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("openai or anthropic"), "{out}");
+        let store = Store::open(&dir.path().join("harness.db")).unwrap();
+        let saved = store.list_providers().unwrap();
+        let api = |name: &str| saved.iter().find(|p| p.name == name).map(|p| p.api);
+        assert_eq!(api("claude"), Some(crate::config::ApiStyle::Anthropic));
+        assert_eq!(api("plain"), Some(crate::config::ApiStyle::OpenAi));
+        assert_eq!(api("odd"), None, "a bad api saves nothing");
     }
 
     #[test]
@@ -3630,7 +4707,7 @@ mod tests {
         let script = "/help\n/model\n/model other\n/models\n/provider\n/provider add mine http://mine/v1 mm\nk\n/provider\n/provider nope\n/exit\n";
         let run_with = |style: Style, tag: &str| {
             let dir = Scratch::new(tag);
-            profile(
+            provider_file(
                 &dir,
                 "other",
                 "HARNESS_BASE_URL=http://other/v1\nHARNESS_MODEL=om\n",
@@ -3640,7 +4717,7 @@ mod tests {
             let store = Store::open(&dir.path().join("harness.db")).unwrap();
             r.agent = r.agent.with_store(store, StoreContext { cwd: "/w".into() });
             r.agent = r.agent.with_catalog(crate::providers::Catalog {
-                profile_dir: Some(dir.path().join("profiles")),
+                provider_dir: Some(dir.path().join("providers")),
                 build: Box::new(|_| Box::new(ScriptedProvider::new(vec![]))),
             });
             run(&mut r.agent, &r.term).unwrap();
@@ -3675,5 +4752,450 @@ mod tests {
         let out = screen(&term);
         assert_eq!(out.matches("no provider selected").count(), 4, "{out}");
         assert!(out.contains("[error: no provider selected"), "{out}");
+    }
+    #[test]
+    fn a_replay_shows_a_subagent_answer_as_one_line_not_as_typed_text() {
+        let delivery = crate::jobs::delivery_text(&[crate::jobs::Delivery {
+            n: 3,
+            profile: "reviewer".to_owned(),
+            coder: false,
+            status: crate::jobs::Status::Done,
+            text: "**A - CONFLICT.** and more".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        }]);
+        let lines = delivery_lines(&delivery).unwrap();
+        assert_eq!(
+            lines,
+            ["[subagent #3 (reviewer, reader) finished: answer added to the chat, 26 characters]"]
+        );
+        assert!(delivery_lines("Subagent #3 is a fine name").is_none());
+        assert!(delivery_lines("hello").is_none());
+    }
+
+    // ---- short calls and steps (issue 42) ----
+
+    fn steps_call(
+        id: &str,
+        list: &str,
+    ) -> Result<crate::provider::Reply, Box<crate::provider::ProviderError>> {
+        ScriptedProvider::tool_call(id, "steps", list)
+    }
+
+    #[test]
+    fn calls_all_shows_the_results_again_and_calls_with_no_argument_says_which() {
+        let dir = Scratch::new("repl-calls-all");
+        let mut r = rig(
+            &dir,
+            "/calls\n/calls all\n/calls\nmake it\ny\n/calls short\n/calls what\n/exit\n",
+            vec![
+                ScriptedProvider::tool_call(
+                    "c1",
+                    "create_file",
+                    r#"{"path":"a.txt","content":"x"}"#,
+                ),
+                ScriptedProvider::text("done"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("tool calls are shown: short"), "{out}");
+        assert!(out.contains("every tool call and result is shown"), "{out}");
+        assert!(out.contains("tool calls are shown: all"), "{out}");
+        assert!(out.contains("  ✓ created a.txt (1 bytes)\n"), "{out}");
+        assert!(out.contains("one line for each call"), "{out}");
+        assert!(out.contains("usage: /calls [all | short]"), "{out}");
+    }
+
+    #[test]
+    fn while_steps_are_unfinished_calls_are_hidden_but_a_failure_shows_itself() {
+        let dir = Scratch::new("repl-steps");
+        std::fs::write(dir.path().join("a.txt"), "text").unwrap();
+        let first =
+            r#"{"steps":[{"text":"read","status":"doing"},{"text":"write","status":"todo"}]}"#;
+        let second =
+            r#"{"steps":[{"text":"read","status":"done"},{"text":"write","status":"doing"}]}"#;
+        let last =
+            r#"{"steps":[{"text":"read","status":"done"},{"text":"write","status":"done"}]}"#;
+        let mut r = rig(
+            &dir,
+            "go\ngo again\n/exit\n",
+            vec![
+                steps_call("s1", first),
+                ScriptedProvider::tool_call("c1", "read_file", r#"{"path":"a.txt"}"#),
+                ScriptedProvider::tool_call("c2", "read_file", r#"{"path":"missing.txt"}"#),
+                steps_call("s2", second),
+                steps_call("s3", last),
+                ScriptedProvider::tool_call("c3", "read_file", r#"{"path":"a.txt"}"#),
+                ScriptedProvider::text("done"),
+                ScriptedProvider::text("again"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("steps:\n  ▸ read\n  ○ write\n"), "{out}");
+        assert!(
+            !out.contains("▸ #2 read_file a.txt"),
+            "a call is hidden while the steps are unfinished: {out}"
+        );
+        assert!(
+            out.contains("▸ #3 read_file missing.txt"),
+            "a failure shows its call: {out}"
+        );
+        assert!(out.contains("  ✗ error:"), "{out}");
+        assert!(out.contains("  ✓ read\n  ▸ write\n  1/2 done\n"), "{out}");
+        assert!(out.contains("  ✓ write\n  2/2 done\n"), "{out}");
+        assert!(
+            out.contains("▸ #6 read_file a.txt"),
+            "with every step done the calls show again: {out}"
+        );
+    }
+
+    // ---- plan mode (issue 42) ----
+
+    #[test]
+    fn plan_mode_refuses_changes_adds_its_text_and_build_leaves_it_and_goes_on() {
+        let dir = Scratch::new("repl-plan-build");
+        let mut r = rig(
+            &dir,
+            "/plan\nadd a file\nb\n/exit\n",
+            vec![
+                ScriptedProvider::tool_call(
+                    "c1",
+                    "create_file",
+                    r#"{"path":"a.txt","content":"x"}"#,
+                ),
+                ScriptedProvider::tool_call("c2", "bash", r#"{"command":"touch b.txt"}"#),
+                ScriptedProvider::text("1. create a.txt"),
+                ScriptedProvider::text("built"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("plan mode is on: the model can only look"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "plan mode is on, so nothing was changed; put the change in your plan instead"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("only looking commands"), "{out}");
+        assert!(!dir.path().join("a.txt").exists() && !dir.path().join("b.txt").exists());
+        assert!(out.contains("The plan is ready"), "{out}");
+        assert!(out.contains("plan mode is off: building"), "{out}");
+        assert!(!r.agent.planning());
+        let requests = r.requests.borrow();
+        let text = |i: usize| String::from_utf8_lossy(&requests[i]).into_owned();
+        assert!(
+            text(0).contains("Plan mode is on."),
+            "the plan text rides along"
+        );
+        assert!(text(2).contains("Plan mode is on."));
+        assert!(
+            !text(3).contains("Plan mode is on."),
+            "it is gone once plan mode is off"
+        );
+        assert!(text(3).contains("Carry out the plan you just wrote"));
+    }
+
+    #[test]
+    fn discussing_keeps_plan_mode_and_an_agent_needs_auto_mode() {
+        let dir = Scratch::new("repl-plan-discuss");
+        let mut r = rig(
+            &dir,
+            "/plan\none\n\ntwo\na\n/plan what\n/plan off\n/info\n/exit\n",
+            vec![
+                ScriptedProvider::text("plan one"),
+                ScriptedProvider::text("plan two"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("still in plan mode: type to discuss"), "{out}");
+        assert!(
+            out.contains("a subagent changes files only in /approve auto"),
+            "{out}"
+        );
+        assert!(out.contains("usage: /plan [on | off]"), "{out}");
+        assert!(out.contains("plan mode is off\n"), "{out}");
+        assert!(!r.agent.planning());
+        assert_eq!(r.requests.borrow().len(), 2);
+    }
+
+    #[test]
+    fn the_info_line_says_when_plan_mode_is_on() {
+        let dir = Scratch::new("repl-plan-info");
+        let r = rig(&dir, "", vec![]);
+        assert!(!info_text(&r.agent, None).contains("plan mode"));
+        r.agent.set_planning(true);
+        assert!(info_text(&r.agent, None).contains("approve: manual · plan mode"));
+    }
+
+    // ---- /tasks (issue 42) ----
+
+    #[test]
+    fn tasks_lists_shows_and_stops_background_commands_and_quitting_asks() {
+        let dir = Scratch::new("repl-tasks-run");
+        let mut r = rig(
+            &dir,
+            "/tasks\n/tasks show s1\n/tasks stop s1\n/tasks show s9\n/tasks stop\n/tasks show 1\n/exit\nn\n/tasks stop s2\n/exit\n",
+            vec![],
+        );
+        assert_eq!(r.agent.shells().running(), 0);
+        let first = r.agent.shells().start("echo up", dir.path()).unwrap();
+        assert_eq!(first, 1);
+        let second = r.agent.shells().start("sleep 30", dir.path()).unwrap();
+        assert_eq!(second, 2);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("s2  running"), "{out}");
+        assert!(out.contains("up\n"), "{out}");
+        assert!(out.contains("s1 is not running"), "{out}");
+        assert!(out.contains("there is no task s9"), "{out}");
+        assert!(
+            out.contains("usage: /tasks [show <id> | stop <id>]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("1 background command still running; quitting stops 1"),
+            "{out}"
+        );
+        assert!(out.contains("not quitting; /tasks shows them"), "{out}");
+    }
+
+    #[test]
+    fn tasks_says_so_when_nothing_ran() {
+        let dir = Scratch::new("repl-tasks-none");
+        let mut r = rig(&dir, "/tasks\n/exit\n", vec![]);
+        run(&mut r.agent, &r.term).unwrap();
+        assert!(screen(&r.term).contains("nothing has run in the background"));
+    }
+
+    // ---- /subagent and /subagents (issue 35) ----
+
+    /// An agent that can start subagents and a terminal that types `typed`.
+    fn background_rig(
+        dir: &Scratch,
+        typed: &str,
+        split: crate::agent::background_tests::Split,
+    ) -> (Agent, TestTerm) {
+        let agent = crate::agent::background_tests::background_agent(dir, split);
+        let term = Terminal::shared(Cursor::new(typed.as_bytes().to_vec()), Vec::new());
+        (agent, term)
+    }
+
+    #[test]
+    fn the_commands_start_list_show_and_stop_a_run_and_quitting_asks() {
+        use crate::agent::background_tests::Split;
+        let dir = Scratch::new("repl-subagents");
+        let (split, h) = Split::new(vec![], vec![ScriptedProvider::text("the plan")]);
+        let (mut agent, term) = background_rig(
+            &dir,
+            "/subagents\n/subagent\n/subagent planner look into x\nsecond line\n/subagents\n/subagents show 1\n/subagents show 7\n/subagents stop x\n/exit\nn\n/subagents stop 1\n/exit\ny\n",
+            split,
+        );
+        run(&mut agent, &term).unwrap();
+        let out = screen(&term);
+        assert!(out.contains("no subagents started in this run"), "{out}");
+        assert!(out.contains("usage: /subagent [profile] <task>"), "{out}");
+        assert!(
+            out.contains("subagent #1 started (planner, reader: it only looks)"),
+            "{out}"
+        );
+        assert!(out.contains("#1 planner (reader) running"), "{out}");
+        assert!(out.contains("task: look into x"), "{out}");
+        assert!(out.contains("there is no subagent #7"), "{out}");
+        assert!(out.contains("usage: /subagents stop <number>"), "{out}");
+        assert!(
+            out.contains("1 subagent still running; quitting stops 1. Quit anyway?"),
+            "{out}"
+        );
+        assert!(out.contains("not quitting"), "{out}");
+        assert!(
+            out.contains("stopping subagent #1; its answer is not added to the chat"),
+            "{out}"
+        );
+        drop(h);
+    }
+
+    #[test]
+    fn the_end_of_input_asks_once_and_quits() {
+        use crate::agent::background_tests::Split;
+        let dir = Scratch::new("repl-subagents-eof");
+        let (split, h) = Split::new(vec![], vec![ScriptedProvider::text("the plan")]);
+        let (mut agent, term) = background_rig(&dir, "/subagent planner look\n", split);
+        run(&mut agent, &term).unwrap();
+        let out = screen(&term);
+        assert_eq!(
+            out.matches("still running; quitting stops 1").count(),
+            1,
+            "{out}"
+        );
+        drop(h);
+    }
+
+    #[test]
+    fn the_info_line_counts_the_runs_that_are_going() {
+        use crate::agent::background_tests::Split;
+        let dir = Scratch::new("repl-subagents-info");
+        let (split, h) = Split::new(vec![], vec![ScriptedProvider::text("the plan")]);
+        let (mut agent, _term) = background_rig(&dir, "", split);
+        assert!(!info_text(&agent, None).contains("subagents"));
+        agent.start_subagent("planner look").unwrap();
+        assert!(info_text(&agent, None).ends_with("subagents: 1 running"));
+        drop(h);
+    }
+
+    #[test]
+    fn a_finished_subagent_wakes_the_model_without_the_owner_typing() {
+        use crate::agent::background_tests::{Split, wait_for};
+        let dir = Scratch::new("repl-wake");
+        let (split, h) = Split::new(
+            vec![ScriptedProvider::text("Noted the plan.")],
+            vec![ScriptedProvider::text("the plan")],
+        );
+        let (mut agent, term) = background_rig(&dir, "/exit\n", split);
+        agent.start_subagent("planner plan it").unwrap();
+        h.release();
+        wait_for(&agent, 1, crate::jobs::Status::Done);
+        run(&mut agent, &term).unwrap();
+        let out = screen(&term);
+        assert!(
+            out.contains("[a subagent finished: its answer goes to the model]"),
+            "{out}"
+        );
+        assert!(out.contains("Noted the plan."), "{out}");
+        let seen = h.main_seen.borrow();
+        assert_eq!(seen.len(), 1, "one message, sent once");
+        let text = String::from_utf8_lossy(&seen[0]).into_owned();
+        assert!(
+            text.contains("Subagent #1 (planner, reader) finished."),
+            "{text}"
+        );
+        assert!(text.contains("the plan"), "{text}");
+        assert!(
+            text.contains("A subagent you started has finished"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_woken_message_that_fails_is_not_tried_again() {
+        use crate::agent::background_tests::{Split, wait_for};
+        let dir = Scratch::new("repl-wake-fail");
+        let (split, h) = Split::new(
+            vec![
+                ScriptedProvider::failure("boom"),
+                ScriptedProvider::text("never asked for"),
+            ],
+            vec![ScriptedProvider::text("the plan")],
+        );
+        let (mut agent, term) = background_rig(&dir, "/exit\n", split);
+        agent.start_subagent("planner plan it").unwrap();
+        h.release();
+        wait_for(&agent, 1, crate::jobs::Status::Done);
+        run(&mut agent, &term).unwrap();
+        assert_eq!(h.main_seen.borrow().len(), 1);
+    }
+
+    #[test]
+    fn automatic_messages_are_capped_until_the_owner_types() {
+        use crate::agent::background_tests::{Split, wait_for};
+        let dir = Scratch::new("repl-wake-count");
+        let (split, h) = Split::new(vec![], vec![ScriptedProvider::text("the plan")]);
+        let (mut agent, _term) = background_rig(&dir, "", split);
+        agent.start_subagent("planner plan it").unwrap();
+        h.release();
+        wait_for(&agent, 1, crate::jobs::Status::Done);
+        assert!(agent.wake_ready());
+        for _ in 0..crate::agent::MAX_AUTO_WAKES {
+            agent.note_wake();
+        }
+        assert!(!agent.wake_ready());
+        agent.reset_wakes();
+        assert!(agent.wake_ready());
+        agent.stop_wakes();
+        assert!(!agent.wake_ready());
+    }
+    #[test]
+    fn context_entries_are_added_listed_shown_switched_and_deleted_by_typing() {
+        let dir = Scratch::new("repl-context");
+        let mut r = rig_stored(
+            &dir,
+            "/context\n/context add stay-small\nrule\nKeep every change small.\n.\nsmall changes please\n\n\n/context\n/context show STAY-SMALL\n/context preload stay-small on\n/context\n/context add stay-small\n/context delete stay-small\ny\n/context show stay-small\n/context bogus\n/exit\n",
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("no context entries here yet"), "{out}");
+        assert!(out.contains("added stay-small"), "{out}");
+        assert!(
+            out.contains("stay-small  rule · here · ~6 tokens  Keep every change small."),
+            "{out}"
+        );
+        assert!(
+            out.contains("stay-small (rule) · this project · preload off"),
+            "{out}"
+        );
+        assert!(
+            out.contains("the owner said: small changes please"),
+            "{out}"
+        );
+        assert!(
+            out.contains("stay-small will be in every subagent's start"),
+            "{out}"
+        );
+        assert!(out.contains("rule · here · ~6 tokens preload"), "{out}");
+        assert!(out.contains("'stay-small' is here already"), "{out}");
+        assert!(out.contains("deleted stay-small"), "{out}");
+        assert!(out.contains("there is no entry 'stay-small' here"), "{out}");
+        assert!(out.contains("usage: /context [list"), "{out}");
+        // The entry belongs to this project's folder.
+        let store = Store::open(&dir.path().join("harness.db")).unwrap();
+        assert!(store.list_all_context().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_context_menu_adds_an_entry_switches_its_preload_and_deletes_it() {
+        let dir = Scratch::new("repl-context-menu");
+        // Enter on "+ add new", then the questions; Enter on the entry, down + Enter on "preload on";
+        // Enter on the entry again, down twice + Enter on "delete" and "y"; Esc leaves the menu.
+        let mut r = rig_stored(
+            &dir,
+            "/context\n\rkeep-small\ndecision\nPrefer small steps.\n.\n\n\n\n\r\x1b[B\r\r\x1b[B\x1b[B\ry\n\x1b/exit\n",
+            vec![],
+        );
+        r.term.borrow_mut().enable_menus(false);
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("added keep-small"), "{out}");
+        assert!(out.contains("context, 1 entries"), "{out}");
+        assert!(
+            out.contains("keep-small will be in every subagent's start"),
+            "{out}"
+        );
+        assert!(out.contains("deleted keep-small"), "{out}");
+        let store = Store::open(&dir.path().join("harness.db")).unwrap();
+        assert!(store.list_all_context().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tools_lists_what_the_model_has_and_shows_one_in_full() {
+        let dir = Scratch::new("repl-tools");
+        let mut r = rig_stored(
+            &dir,
+            "/tools\n/tools READ_FILE\n/tools nope\n/exit\n",
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("tools the model has"), "{out}");
+        assert!(out.contains("read_file(path)"), "{out}");
+        assert!(out.contains("/tools <name> shows one in full"), "{out}");
+        assert!(out.contains("there is no tool 'nope'"), "{out}");
     }
 }

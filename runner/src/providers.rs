@@ -1,7 +1,7 @@
 //! Providers you can switch to from inside the chat (issue 10).
 //!
 //! A provider is a base URL, a model, an optional API key and optional provider pinning. They
-//! come from two places: profile files (`src/profiles/<name>.profile`, read by this program
+//! come from two places: provider files (`src/providers/<name>.provider`, read by this program
 //! only) and the `providers` table of the database (added with `/provider add`).
 //! Both are listed by `/provider`; a name belongs to one of them only.
 //!
@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 
 use kernel::RouterOptions;
 
-use crate::config::{ENV_BASE_URL, ENV_MODEL, Settings};
+use crate::config::{ApiStyle, ENV_BASE_URL, ENV_MODEL, Settings};
 use crate::provider::Provider;
 
 /// Longest provider name accepted.
 pub const MAX_NAME_CHARS: usize = 40;
 
-/// What a profile file is called: `<name>.profile`.
-const PROFILE_SUFFIX: &str = ".profile";
+/// What a provider file is called: `<name>.provider`.
+const PROVIDER_SUFFIX: &str = ".provider";
 
 /// One provider to switch to.
 #[derive(Clone)]
@@ -30,25 +30,27 @@ pub struct ProviderDef {
     /// Never printed or logged.
     pub api_key: Option<String>,
     pub router: RouterOptions,
+    /// Which API it speaks: chat completions or Anthropic's Messages.
+    pub api: ApiStyle,
 }
 
 /// Where a provider is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    Profile,
+    File,
     Saved,
 }
 
 impl Source {
     pub fn label(self) -> &'static str {
         match self {
-            Source::Profile => "profile",
+            Source::File => "file",
             Source::Saved => "saved",
         }
     }
 }
 
-/// One line of the provider list: a usable provider, or why a profile file could not be read.
+/// One line of the provider list: a usable provider, or why a provider file could not be read.
 pub struct Listed {
     pub name: String,
     pub source: Source,
@@ -113,11 +115,11 @@ pub fn check_model(model: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads the text of a profile file. Only plain `KEY=VALUE` lines are understood (the same
+/// Reads the text of a provider file. Only plain `KEY=VALUE` lines are understood (the same
 /// lines; the shell never sources these files): comments and blank lines are skipped, a trailing ` # comment` on an
 /// unquoted value is dropped, and one pair of surrounding quotes is removed. A value that the
 /// shell would expand (`$` or a backtick) is refused rather than guessed at.
-pub fn parse_profile(name: &str, text: &str) -> Result<ProviderDef, String> {
+pub fn parse_provider_file(name: &str, text: &str) -> Result<ProviderDef, String> {
     let mut values: HashMap<String, String> = HashMap::new();
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -156,6 +158,7 @@ pub fn parse_profile(name: &str, text: &str) -> Result<ProviderDef, String> {
         model: settings.model,
         api_key: settings.api_key,
         router: settings.router,
+        api: settings.api,
     })
 }
 
@@ -175,9 +178,9 @@ fn unquote(value: &str) -> String {
     }
 }
 
-/// The profile files in `dir`, by name. A file that cannot be read is listed with the reason.
+/// The provider files in `dir`, by name. A file that cannot be read is listed with the reason.
 /// A missing directory gives an empty list.
-pub fn read_profiles(dir: &Path) -> Vec<Listed> {
+pub fn read_provider_files(dir: &Path) -> Vec<Listed> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -185,14 +188,14 @@ pub fn read_profiles(dir: &Path) -> Vec<Listed> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let file = entry.file_name().to_string_lossy().into_owned();
-            let name = file.strip_suffix(PROFILE_SUFFIX)?.to_owned();
+            let name = file.strip_suffix(PROVIDER_SUFFIX)?.to_owned();
             check_name(&name).ok()?;
             let def = std::fs::read_to_string(entry.path())
                 .map_err(|e| format!("cannot read the file: {e}"))
-                .and_then(|text| parse_profile(&name, &text));
+                .and_then(|text| parse_provider_file(&name, &text));
             Some(Listed {
                 name,
-                source: Source::Profile,
+                source: Source::File,
                 def,
             })
         })
@@ -207,7 +210,7 @@ pub type BuildProvider = Box<dyn Fn(&ProviderDef) -> Box<dyn Provider>>;
 /// Where the program can find providers, and how to turn one into something that answers
 /// requests. The second part is a function so tests can answer with a scripted provider.
 pub struct Catalog {
-    pub profile_dir: Option<PathBuf>,
+    pub provider_dir: Option<PathBuf>,
     pub build: BuildProvider,
 }
 
@@ -216,8 +219,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_plain_profile_is_read() {
-        let def = parse_profile(
+    fn a_plain_provider_file_is_read() {
+        let def = parse_provider_file(
             "or",
             "# a comment\n\nHARNESS_BASE_URL=https://openrouter.ai/api/v1\nHARNESS_MODEL=deepseek/x\nHARNESS_API_KEY=sk-test\n",
         )
@@ -231,7 +234,7 @@ mod tests {
 
     #[test]
     fn quotes_export_and_trailing_comments_are_understood() {
-        let def = parse_profile(
+        let def = parse_provider_file(
             "q",
             "export HARNESS_BASE_URL=\"http://localhost:1/v1\"\nHARNESS_MODEL='m' \nHARNESS_API_KEY=abc # not part of it\n",
         )
@@ -243,7 +246,7 @@ mod tests {
 
     #[test]
     fn pinning_is_read_like_the_launch_settings_read_it() {
-        let def = parse_profile(
+        let def = parse_provider_file(
             "p",
             "HARNESS_BASE_URL=http://h/v1\nHARNESS_MODEL=m\nHARNESS_PROVIDER_ORDER=relace/fp4, other\nHARNESS_ALLOW_FALLBACKS=false\nHARNESS_SESSION_ID=harness-test\n",
         )
@@ -251,7 +254,7 @@ mod tests {
         assert_eq!(def.router.provider_order, ["relace/fp4", "other"]);
         assert_eq!(def.router.allow_fallbacks, Some(false));
         assert_eq!(def.router.session_id.as_deref(), Some("harness-test"));
-        let bad = parse_profile(
+        let bad = parse_provider_file(
             "p",
             "HARNESS_BASE_URL=http://h/v1\nHARNESS_MODEL=m\nHARNESS_ALLOW_FALLBACKS=maybe\n",
         );
@@ -259,17 +262,30 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_that_cannot_be_understood_says_why() {
-        let missing = parse_profile("x", "HARNESS_MODEL=m\n");
+    fn a_provider_file_names_its_api_and_chat_completions_is_the_default() {
+        let base = "HARNESS_BASE_URL=http://h/v1\nHARNESS_MODEL=m\n";
+        assert_eq!(
+            parse_provider_file("p", base).unwrap().api,
+            ApiStyle::OpenAi
+        );
+        let claude = parse_provider_file("p", &format!("{base}HARNESS_API=anthropic\n")).unwrap();
+        assert_eq!(claude.api, ApiStyle::Anthropic);
+        let bad = parse_provider_file("p", &format!("{base}HARNESS_API=gemini\n"));
+        assert!(bad.err().unwrap().contains("openai or anthropic"));
+    }
+
+    #[test]
+    fn a_provider_file_that_cannot_be_understood_says_why() {
+        let missing = parse_provider_file("x", "HARNESS_MODEL=m\n");
         assert_eq!(missing.err().unwrap(), "HARNESS_BASE_URL is missing");
-        let shell = parse_profile(
+        let shell = parse_provider_file(
             "x",
             "HARNESS_BASE_URL=http://h/v1\nHARNESS_MODEL=m\nHARNESS_API_KEY=$KEY\n",
         );
         assert!(shell.err().unwrap().contains("shell expansion"));
-        let junk = parse_profile("x", "HARNESS_BASE_URL=http://h/v1\nnot a pair\n");
+        let junk = parse_provider_file("x", "HARNESS_BASE_URL=http://h/v1\nnot a pair\n");
         assert_eq!(junk.err().unwrap(), "line 2 is not KEY=VALUE");
-        let url = parse_profile("x", "HARNESS_BASE_URL=ftp://h\nHARNESS_MODEL=m\n");
+        let url = parse_provider_file("x", "HARNESS_BASE_URL=ftp://h\nHARNESS_MODEL=m\n");
         assert!(url.err().unwrap().contains("http://"));
     }
 
@@ -314,24 +330,24 @@ mod tests {
     }
 
     #[test]
-    fn profile_files_are_listed_by_name_with_unreadable_ones_marked() {
-        let dir = crate::tools::testutil::Scratch::new("profiles");
+    fn provider_files_are_listed_by_name_with_unreadable_ones_marked() {
+        let dir = crate::tools::testutil::Scratch::new("providers");
         let write = |file: &str, text: &str| std::fs::write(dir.path().join(file), text).unwrap();
         write(
-            "b.profile",
+            "b.provider",
             "HARNESS_BASE_URL=http://b/v1\nHARNESS_MODEL=mb\n",
         );
         write(
-            "a.profile",
+            "a.provider",
             "HARNESS_BASE_URL=http://a/v1\nHARNESS_MODEL=ma\n",
         );
-        write("broken.profile", "HARNESS_MODEL=m\n");
+        write("broken.provider", "HARNESS_MODEL=m\n");
         write(
-            "a.profile.example",
+            "a.provider.example",
             "HARNESS_BASE_URL=http://x/v1\nHARNESS_MODEL=mx\n",
         );
         write("notes.txt", "ignored");
-        let listed = read_profiles(dir.path());
+        let listed = read_provider_files(dir.path());
         let names: Vec<&str> = listed.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "broken"]);
         assert!(listed[0].def.is_ok() && listed[1].def.is_ok());
@@ -339,7 +355,7 @@ mod tests {
             listed[2].def.as_ref().err().map(String::as_str),
             Some("HARNESS_BASE_URL is missing")
         );
-        assert!(listed.iter().all(|l| l.source == Source::Profile));
-        assert!(read_profiles(&dir.path().join("missing")).is_empty());
+        assert!(listed.iter().all(|l| l.source == Source::File));
+        assert!(read_provider_files(&dir.path().join("missing")).is_empty());
     }
 }

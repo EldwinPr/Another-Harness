@@ -40,8 +40,13 @@ fn chat_rows<R: BufRead, W: Write>(
             } else {
                 ""
             };
+            let profile = chat
+                .profile
+                .as_deref()
+                .map(|p| format!("  [{p}]"))
+                .unwrap_or_default();
             MenuItem::new(format!("{:>3}", chat.id)).with_detail(format!(
-                "{}  {:>3} messages  {}  {}{marker}",
+                "{}  {:>3} messages  {}{profile}  {}{marker}",
                 utc_label(u64::try_from(chat.updated_at).unwrap_or(0)),
                 chat.message_count,
                 chat.model,
@@ -156,16 +161,14 @@ mod tests {
     use crate::style::Style;
     use crate::tools::testutil::Scratch;
     use crate::turn_log::TurnLog;
-    use std::cell::RefCell;
     use std::io::Cursor;
-    use std::rc::Rc;
 
     const DOWN: &str = "\x1b[B";
     const ENTER: &str = "\r";
     const ESC: &str = "\x1b";
 
     type TestTerm = Shared<Cursor<Vec<u8>>, Vec<u8>>;
-    type Requests = Rc<RefCell<Vec<Vec<u8>>>>;
+    type Requests = crate::agent::Shared<Vec<Vec<u8>>>;
 
     fn screen(term: &TestTerm) -> String {
         String::from_utf8(term.borrow().output().clone()).unwrap()
@@ -214,6 +217,19 @@ mod tests {
     fn chats(dir: &Scratch) -> Vec<i64> {
         let (agent, _term, _) = rig(dir, "", &[]);
         agent.sessions(50).unwrap().iter().map(|c| c.id).collect()
+    }
+
+    #[test]
+    fn the_chat_list_names_the_profile_a_chat_began_under() {
+        let dir = Scratch::new("sessions-profile");
+        // As the program starts a chat: the system prompt comes from the selected profile.
+        let (mut first, _term, _) = rig(&dir, "", &["ok"]);
+        first.load_prompt().unwrap();
+        first.send("first question", &mut NoObserver);
+        let (mut agent, term, _) = rig(&dir, "\x1b", &[]);
+        sessions_menu(&mut agent, &term);
+        let out = screen(&term);
+        assert!(out.contains("  [default]  "), "{out}");
     }
 
     #[test]

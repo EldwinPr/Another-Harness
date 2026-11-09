@@ -17,6 +17,7 @@
 use std::io::{BufRead, Write};
 
 use crate::agent::Agent;
+use crate::config::ApiStyle;
 use crate::menu::MenuItem;
 use crate::provider::{CHOOSE_A_PROVIDER, router_host};
 use crate::providers::{self, Listed, ProviderDef, Source};
@@ -30,7 +31,13 @@ fn host_of(def: &ProviderDef) -> String {
 /// What a provider row shows after its name: where it points and its model.
 fn provider_detail(agent: &Agent, listed: &Listed) -> String {
     let mut detail = match &listed.def {
-        Ok(def) => format!("{}  {}", host_of(def), def.model),
+        Ok(def) if def.api == ApiStyle::OpenAi => format!("{}  {}", host_of(def), def.model),
+        Ok(def) => format!(
+            "{}  {}  ({} API)",
+            host_of(def),
+            def.model,
+            def.api.as_str()
+        ),
         Err(why) => format!("cannot be used: {why}"),
     };
     if listed.name == agent.target().name {
@@ -139,11 +146,11 @@ pub fn provider_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W
         if entry.def.is_err() {
             error(
                 term,
-                &format!("{name} cannot be used until its profile file is fixed"),
+                &format!("{name} cannot be used until its provider file is fixed"),
             );
             continue;
         }
-        // A saved provider's stored models; a profile file or an empty list switches at once.
+        // A saved provider's stored models; a provider file or an empty list switches at once.
         let models = if entry.source == Source::Saved {
             stored_models(agent, term, &name).unwrap_or_default()
         } else {
@@ -204,17 +211,17 @@ pub fn model_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) 
 
 /// `/provider config`: the provider manager.
 pub fn config_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
-    // Copy profile files into the database first, so everything listed can be edited.
-    match agent.import_profiles() {
+    // Copy provider files into the database first, so everything listed can be edited.
+    match agent.import_provider_files() {
         Ok(0) => {}
         Ok(n) => done(
             term,
             &format!(
-                "copied {n} profile file{} into the database",
+                "copied {n} provider file{} into the database",
                 if n == 1 { "" } else { "s" }
             ),
         ),
-        Err(why) => error(term, &format!("could not import the profile files: {why}")),
+        Err(why) => error(term, &format!("could not import the provider files: {why}")),
     }
     loop {
         let listed = match agent.providers() {
@@ -231,6 +238,25 @@ pub fn config_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>)
     }
 }
 
+/// Asks which API a provider speaks. `None` when the menu is left.
+fn pick_api<R: BufRead, W: Write>(
+    term: &Shared<R, W>,
+    title: &str,
+    current: Option<ApiStyle>,
+) -> Option<ApiStyle> {
+    let rows: Vec<MenuItem> = ApiStyle::ALL
+        .iter()
+        .map(|api| {
+            let mut detail = api.describe().to_owned();
+            if current == Some(*api) {
+                detail.push_str("  (now)");
+            }
+            MenuItem::new(api.as_str()).with_detail(detail)
+        })
+        .collect();
+    pick(term, title, &rows).map(|chosen| ApiStyle::ALL[chosen])
+}
+
 fn add_provider<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
     let Some(name) = ask(term, "name (empty cancels)", None).filter(|n| !n.is_empty()) else {
         return;
@@ -244,36 +270,80 @@ fn add_provider<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
     if let Err(why) = providers::check_base_url(&base_url) {
         return error(term, &why);
     }
-    let Some(model) = ask(term, "default model", None) else {
+    let Some(api) = pick_api(term, "which API does it speak?", None) else {
         return;
     };
-    if let Err(why) = providers::check_model(&model) {
-        return error(term, &why);
-    }
     let Some(key) = ask_secret(term, "API key, Enter for none") else {
         return;
     };
-    let def = ProviderDef {
+    let mut def = ProviderDef {
         name: name.clone(),
         base_url,
-        model,
+        model: String::new(),
         api_key: (!key.trim().is_empty()).then(|| key.trim().to_owned()),
         router: kernel::RouterOptions::default(),
+        api,
     };
+    // The key is known now, so the provider can be asked what it offers before a default model
+    // is chosen: pick one (typing filters the list) instead of typing an id from memory.
+    let Some(model) = choose_default_model(agent, term, &def) else {
+        return;
+    };
+    def.model = model;
     match agent.add_provider(def) {
         Ok(()) => done(term, &format!("saved provider {name}")),
         Err(why) => error(term, &why),
     }
 }
 
+/// The default model of a provider being added: picked from the provider's own list when it has
+/// one, typed when it has none or the list could not be fetched. `None` when cancelled.
+fn choose_default_model<R: BufRead, W: Write>(
+    agent: &Agent,
+    term: &Shared<R, W>,
+    def: &ProviderDef,
+) -> Option<String> {
+    let offered = match agent.models_offered_by(def) {
+        Ok(ids) => ids,
+        Err(why) => {
+            let style = term.borrow().style();
+            say_line(
+                term,
+                &style.yellow(&format!("could not list its models ({why}); type one")),
+            );
+            Vec::new()
+        }
+    };
+    if !offered.is_empty() {
+        let mut rows: Vec<MenuItem> = offered.iter().map(MenuItem::new).collect();
+        rows.push(MenuItem::action("+ type a model id"));
+        let chosen = pick(
+            term,
+            &format!("default model ({} offered; type to filter)", offered.len()),
+            &rows,
+        )?;
+        if let Some(id) = offered.get(chosen) {
+            return Some(id.clone());
+        }
+    }
+    let typed = ask(term, "default model", None)?;
+    match providers::check_model(&typed) {
+        Ok(()) => Some(typed),
+        Err(why) => {
+            error(term, &why);
+            None
+        }
+    }
+}
+
 fn provider_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, entry: &Listed) {
     let name = entry.name.clone();
-    if entry.source == Source::Profile {
+    if entry.source == Source::File {
         let why = entry.def.as_ref().err().cloned().unwrap_or_default();
         return error(
             term,
             &format!(
-                "{name} is a profile file that could not be copied into the database ({why}); fix the file"
+                "{name} is a provider file that could not be copied into the database ({why}); fix the file"
             ),
         );
     }
@@ -473,6 +543,7 @@ fn edit_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, nam
                     .clone()
                     .unwrap_or_else(|| "(none)".to_owned()),
             ),
+            MenuItem::new("API").with_detail(def.api.as_str()),
         ];
         let Some(field) = pick(term, &format!("edit {name}"), &items) else {
             return name;
@@ -540,6 +611,7 @@ fn edit_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, nam
                     None
                 }
             }),
+            7 => pick_api(term, "API", Some(def.api)).map(|api| next.api = api),
             _ => ask(
                 term,
                 &format!("session id ({hint})"),
@@ -592,6 +664,7 @@ mod tests {
 
     fn def(name: &str, model: &str) -> ProviderDef {
         ProviderDef {
+            api: crate::config::ApiStyle::OpenAi,
             name: name.to_owned(),
             base_url: format!("http://{name}.example/v1"),
             model: model.to_owned(),
@@ -625,7 +698,7 @@ mod tests {
             },
         )
         .with_catalog(Catalog {
-            profile_dir: Some(dir.path().join("profiles")),
+            provider_dir: Some(dir.path().join("providers")),
             build: Box::new(move |_| {
                 Box::new(
                     ScriptedProvider::new(vec![ScriptedProvider::text("ok")])
@@ -748,7 +821,10 @@ mod tests {
         let dir = Scratch::new("ui-add");
         let typed = keys(&[
             ENTER,
-            "newp\nhttp://n.example/v1\nnm\nSECRET-KEY-555\n",
+            "newp\nhttp://n.example/v1\n",
+            ENTER, // API: the first one, chat completions
+            "SECRET-KEY-555\n",
+            "nm\n", // the router offered no models, so the model is typed
             ESC,
         ]);
         let (mut agent, term) = rig(&dir, &typed, Ok(vec![]));
@@ -758,6 +834,7 @@ mod tests {
         assert_eq!(all[0].name, "newp");
         assert_eq!(all[0].model, "nm");
         assert_eq!(all[0].api_key.as_deref(), Some("SECRET-KEY-555"));
+        assert_eq!(all[0].api, ApiStyle::OpenAi);
         let out = screen(&term);
         assert!(out.contains("saved provider newp"), "{out}");
         assert!(!out.contains("SECRET-KEY"), "{out}");
@@ -779,7 +856,10 @@ mod tests {
             ENTER,
             "../y\n",
             ENTER,
-            "ok\nhttp://h/v1\ntwo words\n",
+            "ok\nhttp://h/v1\n",
+            ENTER, // API
+            "\n",  // no key
+            "two words\n",
             ESC,
         ]);
         let (mut agent, term) = rig(&dir, &typed, Ok(vec![]));
@@ -935,6 +1015,85 @@ mod tests {
     }
 
     #[test]
+    fn the_default_model_is_picked_from_what_the_provider_offers() {
+        let dir = Scratch::new("ui-add-pick");
+        let typed = keys(&[
+            ENTER,
+            "pick\nhttp://p.example/v1\n",
+            ENTER, // API
+            "KEY-9\n",
+            DOWN,
+            ENTER, // the second model offered
+            ESC,
+        ]);
+        let offered = ["x/one", "x/two", "x/three"].map(str::to_owned).to_vec();
+        let (mut agent, term) = rig(&dir, &typed, Ok(offered));
+        config_menu(&mut agent, &term);
+        let all = saved(&dir);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].model, "x/two");
+        let out = screen(&term);
+        assert!(out.contains("3 offered"), "{out}");
+        assert!(!out.contains("KEY-9"), "{out}");
+    }
+
+    #[test]
+    fn when_the_provider_cannot_list_models_the_model_is_typed_and_the_reason_is_shown() {
+        let dir = Scratch::new("ui-add-no-list");
+        let typed = keys(&[
+            ENTER,
+            "nolist\nhttp://n.example/v1\n",
+            ENTER,
+            "\n",
+            "typed/model\n",
+            ESC,
+        ]);
+        let (mut agent, term) = rig(&dir, &typed, Err("no model list here".to_owned()));
+        config_menu(&mut agent, &term);
+        assert_eq!(saved(&dir)[0].model, "typed/model");
+        assert!(
+            screen(&term).contains("could not list its models (no model list here)"),
+            "{}",
+            screen(&term)
+        );
+    }
+
+    #[test]
+    fn a_provider_can_be_added_with_the_anthropic_api() {
+        let dir = Scratch::new("ui-add-anthropic");
+        let typed = keys(&[
+            ENTER,
+            "claude\nhttps://api.anthropic.com/v1\n",
+            DOWN,
+            ENTER, // API: Anthropic Messages
+            "\n",
+            "claude-sonnet-5.5\n",
+            ESC,
+        ]);
+        let (mut agent, term) = rig(&dir, &typed, Ok(vec![]));
+        config_menu(&mut agent, &term);
+        let all = saved(&dir);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].api, ApiStyle::Anthropic);
+        let listing = screen(&term);
+        assert!(listing.contains("saved provider claude"), "{listing}");
+    }
+
+    #[test]
+    fn the_api_of_a_saved_provider_can_be_changed_and_the_list_says_when_it_is_not_the_default() {
+        let dir = Scratch::new("ui-edit-api");
+        let mut typed = vec![ENTER, DOWN, DOWN, ENTER]; // provider a, edit
+        typed.extend([DOWN; 7]);
+        typed.extend([ENTER, DOWN, ENTER]); // API: Anthropic Messages
+        typed.extend([ESC, ESC, ESC]);
+        let (mut agent, term) = rig(&dir, &keys(&typed), Ok(vec![]));
+        agent.add_provider(def("a", "am")).unwrap();
+        config_menu(&mut agent, &term);
+        assert_eq!(saved(&dir)[0].api, ApiStyle::Anthropic);
+        assert!(screen(&term).contains("anthropic"), "{}", screen(&term));
+    }
+
+    #[test]
     fn a_dash_clears_the_key_and_a_bad_value_changes_nothing() {
         let dir = Scratch::new("ui-edit-clear");
         let typed = keys(&[
@@ -1015,23 +1174,23 @@ mod tests {
             .is_err()
     }
 
-    fn write_profile(dir: &Scratch, name: &str, text: &str) -> std::path::PathBuf {
-        let profiles = dir.path().join("profiles");
-        std::fs::create_dir_all(&profiles).unwrap();
-        let path = profiles.join(format!("{name}.profile"));
+    fn write_provider_file(dir: &Scratch, name: &str, text: &str) -> std::path::PathBuf {
+        let folder = dir.path().join("providers");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("{name}.provider"));
         std::fs::write(&path, text).unwrap();
         path
     }
 
     #[test]
-    fn profile_files_are_copied_in_once_with_their_keys_and_left_alone() {
+    fn provider_files_are_copied_in_once_with_their_keys_and_left_alone() {
         let dir = Scratch::new("ui-import");
         let text =
             "HARNESS_BASE_URL=http://p.example/v1\nHARNESS_MODEL=pm\nHARNESS_API_KEY=FILE-KEY\n";
-        let path = write_profile(&dir, "p", text);
-        write_profile(&dir, "broken", "HARNESS_MODEL=m\n");
+        let path = write_provider_file(&dir, "p", text);
+        write_provider_file(&dir, "broken", "HARNESS_MODEL=m\n");
         let (mut agent, term) = rig(&dir, ESC, Ok(vec![]));
-        assert_eq!(agent.import_profiles().unwrap(), 1);
+        assert_eq!(agent.import_provider_files().unwrap(), 1);
         let all = saved(&dir);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].name, "p");
@@ -1043,7 +1202,7 @@ mod tests {
             "file untouched"
         );
         // Again: nothing new. The config menu says nothing about an import either.
-        assert_eq!(agent.import_profiles().unwrap(), 0);
+        assert_eq!(agent.import_provider_files().unwrap(), 0);
         config_menu(&mut agent, &term);
         assert!(!screen(&term).contains("copied"));
     }
@@ -1051,23 +1210,23 @@ mod tests {
     #[test]
     fn a_deleted_import_is_not_imported_again() {
         let dir = Scratch::new("ui-import-tombstone");
-        write_profile(
+        write_provider_file(
             &dir,
             "p",
             "HARNESS_BASE_URL=http://p.example/v1\nHARNESS_MODEL=pm\n",
         );
         let (mut agent, _term) = rig(&dir, "", Ok(vec![]));
-        assert_eq!(agent.import_profiles().unwrap(), 1);
+        assert_eq!(agent.import_provider_files().unwrap(), 1);
         agent.remove_provider("p").unwrap();
-        assert_eq!(agent.import_profiles().unwrap(), 0);
+        assert_eq!(agent.import_provider_files().unwrap(), 0);
         assert!(saved(&dir).is_empty());
-        assert!(dir.path().join("profiles/p.profile").exists());
+        assert!(dir.path().join("providers/p.provider").exists());
     }
 
     #[test]
     fn the_config_menu_announces_an_import() {
         let dir = Scratch::new("ui-import-announced");
-        write_profile(
+        write_provider_file(
             &dir,
             "p",
             "HARNESS_BASE_URL=http://p.example/v1\nHARNESS_MODEL=pm\n",
@@ -1076,7 +1235,7 @@ mod tests {
         config_menu(&mut agent, &term);
         let out = screen(&term);
         assert!(
-            out.contains("copied 1 profile file into the database"),
+            out.contains("copied 1 provider file into the database"),
             "{out}"
         );
         assert_eq!(saved(&dir).len(), 1);

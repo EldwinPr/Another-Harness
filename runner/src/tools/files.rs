@@ -54,6 +54,9 @@ impl Shared {
     /// `true` when the change may go ahead: auto mode, an earlier "always" for this tool, or the
     /// person said yes. `tool` is the name the model called.
     fn allowed(&self, tool: &str, question: &str, detail: &str, full: Option<&str>) -> bool {
+        if self.mode.planning() {
+            return false;
+        }
         if self.mode.mode() == Mode::Auto {
             return true;
         }
@@ -101,6 +104,16 @@ fn relative(path: &str) -> Result<&Path, String> {
     }
     if rel.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(format!("error: '{path}' contains '..'"));
+    }
+    // Git runs programs named in .git/config, and the git commands that run unasked would run
+    // them, so the file tools do not touch repository internals.
+    if rel
+        .components()
+        .any(|c| matches!(c, Component::Normal(name) if name == ".git"))
+    {
+        return Err(format!(
+            "error: '{path}' is inside .git; the file tools do not change repository internals"
+        ));
     }
     Ok(rel)
 }
@@ -196,7 +209,10 @@ impl CreateFile {
             &format!("{} ({bytes} bytes)", args.path),
             Some(&args.content),
         ) {
-            return Err("denied by user: nothing was changed".to_owned());
+            return Err(self
+                .shared
+                .mode
+                .denial("denied by user: nothing was changed"));
         }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -268,7 +284,10 @@ impl WriteFile {
             &format!("{} ({bytes} bytes, replaces {was})", args.path),
             Some(&args.content),
         ) {
-            return Err("denied by user: nothing was changed".to_owned());
+            return Err(self
+                .shared
+                .mode
+                .denial("denied by user: nothing was changed"));
         }
         std::fs::write(&target, args.content.as_bytes())
             .map_err(|e| format!("error: cannot write '{}': {e}", args.path))?;
@@ -374,7 +393,10 @@ impl EditFile {
             ),
             Some(&diff),
         ) {
-            return Err("denied by user: nothing was changed".to_owned());
+            return Err(self
+                .shared
+                .mode
+                .denial("denied by user: nothing was changed"));
         }
         std::fs::write(&target, updated.as_bytes())
             .map_err(|e| format!("error: cannot write '{}': {e}", args.path))?;
@@ -446,7 +468,10 @@ impl DeleteFile {
             &format!("{} ({} bytes)", args.path, meta.len()),
             None,
         ) {
-            return Err("denied by user: nothing was changed".to_owned());
+            return Err(self
+                .shared
+                .mode
+                .denial("denied by user: nothing was changed"));
         }
         std::fs::remove_file(&target)
             .map_err(|e| format!("error: cannot delete '{}': {e}", args.path))?;
@@ -545,6 +570,38 @@ mod tests {
         fn file(&self, path: &str) -> PathBuf {
             self.dir.path().join(path)
         }
+    }
+
+    #[test]
+    fn the_file_tools_leave_git_internals_alone() {
+        let r = rig("files-git", Mode::Auto, Answer::Yes);
+        std::fs::create_dir_all(r.dir.path().join(".git")).unwrap();
+        std::fs::write(r.dir.path().join(".git/config"), "[core]\n").unwrap();
+        for path in [".git/config", "sub/.git/hooks/pre-commit"] {
+            let made = r.call(
+                "create_file",
+                serde_json::json!({ "path": path, "content": "x" }),
+            );
+            assert!(made.contains("inside .git"), "{path}: {made}");
+            let written = r.call(
+                "write_file",
+                serde_json::json!({ "path": path, "content": "x" }),
+            );
+            assert!(written.contains("inside .git"), "{path}: {written}");
+            assert!(r.edit(path, "a", "b").contains("inside .git"), "{path}");
+            let deleted = r.call("delete_file", serde_json::json!({ "path": path }));
+            assert!(deleted.contains("inside .git"), "{path}: {deleted}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(r.dir.path().join(".git/config")).unwrap(),
+            "[core]\n"
+        );
+        // Names that only start like it are fine.
+        let ok = r.call(
+            "create_file",
+            serde_json::json!({ "path": ".gitignore", "content": "x" }),
+        );
+        assert!(!ok.starts_with("error"), "{ok}");
     }
 
     #[test]

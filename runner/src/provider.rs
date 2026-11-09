@@ -284,7 +284,7 @@ impl HttpProvider {
 //
 // Rust note: a trait is a promise about methods, like an interface. The agent
 // loop holds a `Box<dyn Provider>`, so it works with either without knowing which.
-pub trait Provider {
+pub trait Provider: Send + Sync {
     fn complete(&self, request: &[u8]) -> Result<Reply, Box<ProviderError>>;
 
     /// Like [`Provider::complete`], but gives up early with an error when `cancel` is set while
@@ -300,6 +300,42 @@ pub trait Provider {
     /// The model ids this provider offers. Not every provider can say.
     fn models(&self) -> Result<Vec<String>, String> {
         Err("this provider cannot list its models".to_owned())
+    }
+}
+
+/// Runs `job` (one request) on its own thread and watches `cancel` every 25 ms; after a cancel the
+/// thread is left to finish by itself (it ends at the request timeout) and its answer is dropped.
+pub(crate) fn run_cancellable(
+    served_by: &ServedBy,
+    cancel: &Cancel,
+    job: impl FnOnce() -> Result<Reply, Box<ProviderError>> + Send + 'static,
+) -> Result<Reply, Box<ProviderError>> {
+    let started = Instant::now();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(job());
+    });
+    let gone = |message: &str| {
+        Box::new(ProviderError {
+            message: message.to_owned(),
+            status: None,
+            raw_body: None,
+            elapsed: started.elapsed(),
+            served_by: served_by.clone(),
+        })
+    };
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.is_cancelled() {
+                    return Err(gone(CANCELLED));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(gone("the request thread ended without an answer"));
+            }
+        }
     }
 }
 
@@ -343,35 +379,11 @@ impl Provider for HttpProvider {
         request: &[u8],
         cancel: &Cancel,
     ) -> Result<Reply, Box<ProviderError>> {
-        let started = Instant::now();
-        let (sender, receiver) = std::sync::mpsc::channel();
         let me = self.clone();
         let body = request.to_vec();
-        std::thread::spawn(move || {
-            let _ = sender.send(HttpProvider::complete(&me, &body));
-        });
-        let gone = |message: &str| {
-            Box::new(ProviderError {
-                message: message.to_owned(),
-                status: None,
-                raw_body: None,
-                elapsed: started.elapsed(),
-                served_by: self.served_by.clone(),
-            })
-        };
-        loop {
-            match receiver.recv_timeout(Duration::from_millis(25)) {
-                Ok(result) => return result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if cancel.is_cancelled() {
-                        return Err(gone(CANCELLED));
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(gone("the request thread ended without an answer"));
-                }
-            }
-        }
+        run_cancellable(&self.served_by, cancel, move || {
+            HttpProvider::complete(&me, &body)
+        })
     }
 
     fn models(&self) -> Result<Vec<String>, String> {

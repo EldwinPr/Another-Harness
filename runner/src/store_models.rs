@@ -7,10 +7,12 @@ use rusqlite::{OptionalExtension, params};
 use crate::providers::ProviderDef;
 use crate::store::{LAST_PROVIDER, Store, StoreError};
 
-/// The `settings` key holding the names of the profile files already copied into the database
+/// The `settings` key holding the names of the provider files already copied into the database
 /// (a JSON array). A name stays in it after its provider is deleted, so the file is not imported
 /// again.
-pub const IMPORTED_PROFILES: &str = "imported_profiles";
+/// The stored text of the key keeps its old spelling (`imported_profiles`): changing it would make
+/// the program forget which files were imported (issue 30).
+pub const IMPORTED_PROVIDER_FILES: &str = "imported_profiles";
 
 /// One stored model of a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +126,9 @@ impl Store {
         ids: &[String],
     ) -> Result<MergeReport, StoreError> {
         let provider_id = self.provider_row(provider)?;
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut added = 0;
         let now = now_secs();
         for id in ids {
@@ -165,7 +169,9 @@ impl Store {
         display_name: &str,
     ) -> Result<(), StoreError> {
         let provider_id = self.provider_row(provider)?;
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let old: String = tx
             .query_row(
                 "SELECT model_id FROM provider_models WHERE id = ?1 AND provider_id = ?2",
@@ -263,10 +269,12 @@ impl Store {
                 )));
             }
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "UPDATE providers SET name = ?2, base_url = ?3, model = ?4, api_key = ?5, \
-             provider_order = ?6, allow_fallbacks = ?7, session_id = ?8 WHERE id = ?1",
+             provider_order = ?6, allow_fallbacks = ?7, session_id = ?8, api = ?9 WHERE id = ?1",
             params![
                 provider_id,
                 def.name,
@@ -276,7 +284,8 @@ impl Store {
                 serde_json::to_string(&def.router.provider_order)
                     .map_err(|e| err(e.to_string()))?,
                 def.router.allow_fallbacks,
-                def.router.session_id
+                def.router.session_id,
+                def.api.as_str()
             ],
         )?;
         if def.name != old_name {
@@ -306,17 +315,17 @@ impl Store {
         Ok(())
     }
 
-    /// The profile files already copied into the database (see [`IMPORTED_PROFILES`]).
-    pub fn imported_profiles(&self) -> Result<Vec<String>, StoreError> {
+    /// The provider files already copied into the database (see [`IMPORTED_PROVIDER_FILES`]).
+    pub fn imported_provider_files(&self) -> Result<Vec<String>, StoreError> {
         Ok(self
-            .setting(IMPORTED_PROFILES)?
+            .setting(IMPORTED_PROVIDER_FILES)?
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default())
     }
 
-    /// Remembers that these profile files have been imported.
+    /// Remembers that these provider files have been imported.
     pub fn mark_imported(&mut self, names: &[String]) -> Result<(), StoreError> {
-        let mut all = self.imported_profiles()?;
+        let mut all = self.imported_provider_files()?;
         for name in names {
             if !all.contains(name) {
                 all.push(name.clone());
@@ -324,7 +333,7 @@ impl Store {
         }
         all.sort();
         let json = serde_json::to_string(&all).map_err(|e| err(e.to_string()))?;
-        self.set_setting(IMPORTED_PROFILES, &json)
+        self.set_setting(IMPORTED_PROVIDER_FILES, &json)
     }
 }
 
@@ -346,6 +355,7 @@ mod tests {
 
     fn provider(name: &str, model: &str) -> ProviderDef {
         ProviderDef {
+            api: crate::config::ApiStyle::OpenAi,
             name: name.into(),
             base_url: format!("http://{name}/v1"),
             model: model.into(),
@@ -581,6 +591,55 @@ mod tests {
     }
 
     #[test]
+    fn the_api_of_a_provider_is_saved_listed_and_changed() {
+        let dir = Scratch::new("models-api");
+        let mut store = open(&dir);
+        store.add_provider(&provider("plain", "m")).unwrap();
+        let mut claude = provider("claude", "c");
+        claude.api = crate::config::ApiStyle::Anthropic;
+        store.add_provider(&claude).unwrap();
+        let apis = |store: &Store| {
+            store
+                .list_providers()
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.name, p.api))
+                .collect::<Vec<_>>()
+        };
+        use crate::config::ApiStyle::{Anthropic, OpenAi};
+        assert_eq!(
+            apis(&store),
+            [
+                ("claude".to_owned(), Anthropic),
+                ("plain".to_owned(), OpenAi)
+            ]
+        );
+        let mut changed = provider("plain", "m");
+        changed.api = Anthropic;
+        store.update_provider("plain", &changed).unwrap();
+        assert!(apis(&store).iter().all(|(_, api)| *api == Anthropic));
+    }
+
+    #[test]
+    fn schema_18_makes_every_saved_provider_a_chat_completions_one() {
+        let dir = Scratch::new("models-schema-18");
+        let path = dir.path().join("harness.db");
+        let mut store = Store::open(&path).unwrap();
+        store.add_provider(&provider("old", "m")).unwrap();
+        drop(store);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE providers DROP COLUMN api; PRAGMA user_version = 17;")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let saved = store.list_providers().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].api, crate::config::ApiStyle::OpenAi);
+        assert!(dir.path().join("harness.db.before-20").exists());
+    }
+
+    #[test]
     fn updating_a_provider_renames_it_and_the_used_last_memory_follows() {
         let dir = Scratch::new("models-update");
         let mut store = open(&dir);
@@ -617,13 +676,13 @@ mod tests {
     }
 
     #[test]
-    fn imported_profiles_are_remembered_sorted_and_without_repeats() {
+    fn imported_provider_files_are_remembered_sorted_and_without_repeats() {
         let dir = Scratch::new("models-imported");
         let mut store = open(&dir);
-        assert!(store.imported_profiles().unwrap().is_empty());
+        assert!(store.imported_provider_files().unwrap().is_empty());
         store.mark_imported(&strings(&["b", "a"])).unwrap();
         store.mark_imported(&strings(&["a", "c"])).unwrap();
-        assert_eq!(store.imported_profiles().unwrap(), ["a", "b", "c"]);
+        assert_eq!(store.imported_provider_files().unwrap(), ["a", "b", "c"]);
     }
 
     #[test]

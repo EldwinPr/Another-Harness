@@ -42,6 +42,10 @@ struct Request<'a> {
     provider: Option<WireProvider<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    // OpenRouter's automatic prompt caching for Claude models: one marker at the top of the
+    // request, and the router keeps the cache breakpoint at the end of the conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<WireCacheControl>,
     // Always present, always false. No `tool_choice` is ever sent.
     stream: bool,
 }
@@ -104,6 +108,18 @@ struct WireFunction<'a> {
     // Rust note: a `RawValue` is JSON text that serde copies into the output
     // exactly as written, instead of parsing and re-formatting it.
     parameters: &'a RawValue,
+}
+
+#[derive(Serialize)]
+struct WireCacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// Whether a model id names a Claude model on OpenRouter (`anthropic/...`), which only caches
+/// a prompt when asked to.
+pub fn asks_for_prompt_cache(model: &str) -> bool {
+    model.starts_with("anthropic/")
 }
 
 #[derive(Serialize)]
@@ -211,6 +227,8 @@ pub fn assemble(config: &Config, messages: &[Message]) -> Vec<u8> {
         max_tokens: config.max_tokens,
         provider,
         session_id: router.session_id.as_deref(),
+        cache_control: asks_for_prompt_cache(&config.model)
+            .then_some(WireCacheControl { kind: "ephemeral" }),
         stream: false,
     };
     // Rust note: no `;` on the last line, so this is the function's return
@@ -377,5 +395,31 @@ mod tests {
         assert!(message_from_json("not json").is_err());
         assert!(message_from_json(r#"{"role":"robot","content":"x"}"#).is_err());
         assert!(message_from_json(r#"{"role":"user"}"#).is_err());
+    }
+
+    #[test]
+    fn a_claude_model_on_openrouter_asks_for_prompt_caching_and_no_other_model_does() {
+        let ask = |model: &str| {
+            let config = Config {
+                model: model.into(),
+                ..Config::default()
+            };
+            String::from_utf8(assemble(&config, &[Message::User("hi".into())])).unwrap()
+        };
+        let claude = ask("anthropic/claude-sonnet-5-5");
+        assert!(
+            claude.contains(r#""cache_control":{"type":"ephemeral"},"stream":false"#),
+            "{claude}"
+        );
+        for other in [
+            "deepseek/deepseek-v4",
+            "gpt-5",
+            "claude-sonnet-5-5",
+            "cc/anthropic/x",
+        ] {
+            assert!(!ask(other).contains("cache_control"), "{other}");
+        }
+        // The same model gives the same bytes every time.
+        assert_eq!(ask("anthropic/c"), ask("anthropic/c"));
     }
 }

@@ -180,7 +180,6 @@ pub fn verdict(samples: &[Sample]) -> Verdict {
 mod tests {
     use super::*;
     use crate::tools::testutil::Scratch;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
 
     fn none() -> RouterOptions {
@@ -312,13 +311,13 @@ mod tests {
 
     /// Answers from a list and remembers the bytes it was sent.
     struct Script {
-        usages: RefCell<VecDeque<&'static str>>,
-        seen: RefCell<Vec<Vec<u8>>>,
+        usages: std::sync::Mutex<VecDeque<&'static str>>,
+        seen: std::sync::Mutex<Vec<Vec<u8>>>,
     }
     impl Provider for Script {
         fn complete(&self, request: &[u8]) -> Result<Reply, Box<ProviderError>> {
-            self.seen.borrow_mut().push(request.to_vec());
-            let usage = self.usages.borrow_mut().pop_front().unwrap();
+            self.seen.lock().unwrap().push(request.to_vec());
+            let usage = self.usages.lock().unwrap().pop_front().unwrap();
             Ok(Reply {
                 status: 200,
                 raw_body: "{}".into(),
@@ -339,7 +338,7 @@ mod tests {
     fn run_sends_identical_bytes_every_time_and_logs_each_call() {
         let dir = Scratch::new("cache-run");
         let script = Script {
-            usages: RefCell::new(
+            usages: std::sync::Mutex::new(
                 [
                     r#"{"prompt_tokens":900,"prompt_tokens_details":{"cached_tokens":0}}"#,
                     r#"{"prompt_tokens":900,"prompt_tokens_details":{"cached_tokens":768}}"#,
@@ -347,13 +346,20 @@ mod tests {
                 ]
                 .into(),
             ),
-            seen: RefCell::new(vec![]),
+            seen: std::sync::Mutex::new(vec![]),
         };
         let request = build_request("m", "r", 300, &none());
         let mut log = TurnLog::create(&dir.path().join("logs")).unwrap();
         let samples = run(&script, &request, 3, Duration::ZERO, &mut log).unwrap();
 
-        assert!(script.seen.borrow().iter().all(|sent| *sent == request));
+        assert!(
+            script
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|sent| *sent == request)
+        );
         let cached: Vec<_> = samples.iter().map(|s| s.cached_tokens).collect();
         assert_eq!(cached, [Some(0), Some(768), Some(768)]);
         assert_eq!(

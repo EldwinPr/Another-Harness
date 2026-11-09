@@ -55,6 +55,15 @@ pub fn summary(name: &str, arguments: &str, max: usize) -> String {
             format!("{first}{}", more_lines(&command))
         }),
         "read_file" | "delete_file" => text("path"),
+        "glossary" | "glossary_propose" => text("term"),
+        "delegate" => text("profile").zip(text("task")).map(|(profile, task)| {
+            let first = task
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            format!("{profile}: {first}")
+        }),
         "create_file" | "write_file" => text("path")
             .zip(text("content"))
             .map(|(path, content)| format!("{path} · {} bytes", content.len())),
@@ -75,7 +84,10 @@ pub fn summary(name: &str, arguments: &str, max: usize) -> String {
 /// Whether a tool's answer reads as a failure: an error, a refusal, or a command that exited non-zero.
 pub fn failed(result: &str) -> bool {
     let result = result.trim_end();
-    if result.starts_with("error:") || result.starts_with("denied by user") {
+    if result.starts_with("error:")
+        || result.starts_with("denied by user")
+        || result.starts_with("plan mode is on")
+    {
         return true;
     }
     result
@@ -153,6 +165,12 @@ pub fn full(number: usize, record: &ToolRecord) -> String {
             }
             _ => out.push_str(&format!("arguments:\n{}\n", record.arguments)),
         },
+        "delegate" => match (text("profile"), text("task")) {
+            (Some(profile), Some(task)) => {
+                out.push_str(&format!("profile: {profile}\ntask:\n{task}\n"));
+            }
+            _ => out.push_str(&format!("arguments:\n{}\n", record.arguments)),
+        },
         "read_file" | "delete_file" => match text("path") {
             Some(path) => out.push_str(&format!("path: {path}\n")),
             None => out.push_str(&format!("arguments:\n{}\n", record.arguments)),
@@ -220,6 +238,18 @@ mod tests {
             "src/x.rs"
         );
         assert_eq!(summary("bash", r#"{"command":"ls -la"}"#, 80), "ls -la");
+        assert_eq!(
+            summary("glossary", r#"{"term":"kartu stok"}"#, 80),
+            "kartu stok"
+        );
+        assert_eq!(
+            summary(
+                "glossary_propose",
+                r#"{"term":"claim","definition":"d","reason":"r"}"#,
+                80
+            ),
+            "claim"
+        );
     }
 
     #[test]

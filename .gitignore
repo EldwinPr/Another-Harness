@@ -4,8 +4,8 @@
 # Chat database and per-run turn logs (saved chats, and API keys saved with /provider add)
 /logs/
 
-# Local profiles hold API keys (only the .example templates are tracked)
-/profiles/*.profile
+# Local provider files hold API keys (only the .example templates are tracked)
+/providers/*.provider
 
 # Files the model writes while chatting (workspace/ is the chat's working directory)
 /workspace/*

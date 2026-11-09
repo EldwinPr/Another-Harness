@@ -22,14 +22,15 @@ use crate::repl::{Shared, say_line};
 use crate::store::{Store, StoreError};
 use crate::store_prompts::{
     BASE_DESCRIPTION, BASE_NAME, BUILTIN_PROMPT, MAX_PROMPT_BYTES, Prompt, PromptType,
-    check_prompt_name, check_prompt_text, short_hash, size_label,
+    SUBAGENT_CODER_NAME, SUBAGENT_CODER_PROMPT, SUBAGENT_NAME, SUBAGENT_PROMPT, check_prompt_name,
+    check_prompt_text, short_hash, size_label,
 };
 
 /// Said after every change: the running chat keeps the prompt it started with.
 const NEXT_CHAT: &str = "applies to the next chat: /new starts one";
 
 /// Runs `f` on the store, reporting a failure on screen. `None` after a failure.
-fn with_store<R: BufRead, W: Write, T>(
+pub(crate) fn with_store<R: BufRead, W: Write, T>(
     agent: &mut Agent,
     term: &Shared<R, W>,
     f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
@@ -171,6 +172,128 @@ fn read_prompt_file(path: &str) -> Result<(String, String), String> {
     Ok((text, absolute))
 }
 
+/// One skill (or prompt) found in a file or folder given to `add`.
+struct Found {
+    name: String,
+    description: String,
+    text: String,
+    source: String,
+}
+
+/// An argument that is a path rather than a name: it has a `/` (or `~/`) in it or ends in `.md`.
+fn looks_like_path(arg: &str) -> bool {
+    arg.contains(['/', '\\']) || arg.starts_with('~') || arg.ends_with(".md")
+}
+
+fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) if !home.is_empty() => format!("{home}/{rest}"),
+        _ => path.to_owned(),
+    }
+}
+
+/// A leading `---` block of `key: value` lines (the format of a `SKILL.md`), and the rest.
+fn split_front_matter(text: &str) -> (Vec<(String, String)>, &str) {
+    let Some(after) = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+    else {
+        return (Vec::new(), text);
+    };
+    let mut offset = 0;
+    let mut pairs = Vec::new();
+    for line in after.split_inclusive('\n') {
+        offset += line.len();
+        let line = line.trim_end();
+        if line == "---" {
+            return (pairs, after[offset..].trim_start_matches(['\r', '\n']));
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            let value = value.trim().trim_matches(['"', '\'']);
+            pairs.push((key.trim().to_ascii_lowercase(), value.to_owned()));
+        }
+    }
+    // Never closed: it was not front matter.
+    (Vec::new(), text)
+}
+
+/// One file read as a skill: the name and description from its front matter, else the name of the
+/// folder it is called `SKILL.md` in, else its own name without `.md`.
+fn found_in_file(path: &std::path::Path) -> Result<Found, String> {
+    let (text, absolute) = read_prompt_file(&path.display().to_string())?;
+    let (pairs, body) = split_front_matter(&text);
+    let field = |key: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .filter(|v| !v.is_empty())
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let fallback = if file_name.eq_ignore_ascii_case("SKILL.md") {
+        std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.parent()?.file_name()?.to_str().map(str::to_owned))
+            .unwrap_or_default()
+    } else {
+        file_name
+            .strip_suffix(".md")
+            .unwrap_or(file_name)
+            .to_owned()
+    };
+    let name = field("name").unwrap_or(fallback);
+    check_prompt_name(&name).map_err(|why| format!("{}: {why}", path.display()))?;
+    let description: String = field("description")
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect();
+    Ok(Found {
+        name,
+        description,
+        text: body.trim().to_owned(),
+        source: absolute,
+    })
+}
+
+/// What a file or folder holds: a file is one; a folder with a `SKILL.md` is one; any other folder
+/// is each sub-folder that has a `SKILL.md` and each `.md` file in it.
+fn found_at(path: &str) -> Result<Vec<Found>, String> {
+    let path = std::path::PathBuf::from(expand_home(path.trim()));
+    let meta =
+        std::fs::metadata(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if meta.is_file() {
+        return Ok(vec![found_in_file(&path)?]);
+    }
+    let own = path.join("SKILL.md");
+    if own.is_file() {
+        return Ok(vec![found_in_file(&own)?]);
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter_map(|p| {
+            if p.is_dir() && p.join("SKILL.md").is_file() {
+                Some(p.join("SKILL.md"))
+            } else {
+                (p.is_file() && p.extension().is_some_and(|e| e == "md")).then_some(p)
+            }
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(format!(
+            "{} has no SKILL.md, no folders with one and no .md files",
+            path.display()
+        ));
+    }
+    files.iter().map(|f| found_in_file(f)).collect()
+}
+
 // ---- typed commands ----
 
 /// The plain list of system prompts: one line per prompt.
@@ -192,7 +315,10 @@ fn show_list<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
         .unwrap_or(0);
     let mut text = format!(
         "{}\n",
-        style.bold("system prompts (changes apply to the next chat):")
+        style.bold(&format!(
+            "system prompts of the profile {} (changes apply to the next chat):",
+            agent.selected_profile().unwrap_or_default()
+        ))
     );
     for p in &all {
         let state = if p.enabled {
@@ -218,10 +344,11 @@ fn show_assembled<R: BufRead, W: Write>(agent: &Agent, term: &Shared<R, W>) {
         Err(why) => error(term, &why),
         Ok(assembled) => {
             let header = format!(
-                "system prompt of a new chat: {} ({}), hash {}",
+                "system prompt of a new chat under the profile {}: {} ({}), hash {}",
+                agent.selected_profile().unwrap_or_default(),
                 size_label(assembled.chars()),
                 if assembled.fallback {
-                    "the built-in text, no prompt is switched on".to_owned()
+                    "the built-in text, the profile has no system prompt".to_owned()
                 } else {
                     assembled.names.join(", ")
                 },
@@ -310,6 +437,48 @@ fn after_save(kind: PromptType, name: &str) -> String {
     }
 }
 
+/// `/skills add <file or folder>`: each skill found is saved under the name its file gives it.
+/// One that cannot be saved (the name is taken) is said so, and the others still go in.
+fn add_from_path<R: BufRead, W: Write>(
+    agent: &mut Agent,
+    term: &Shared<R, W>,
+    path: &str,
+    kind: PromptType,
+) {
+    let found = match found_at(path) {
+        Ok(found) => found,
+        Err(why) => return error(term, &why),
+    };
+    let mut saved = 0;
+    for item in &found {
+        let result = with_store(agent, term, |s| {
+            s.add_prompt_of_type(
+                &item.name,
+                &item.description,
+                &item.text,
+                Some(&item.source),
+                kind,
+            )
+        });
+        if result.is_some() {
+            saved += 1;
+            done(
+                term,
+                &format!(
+                    "saved {} {} ({}), {}",
+                    noun(kind),
+                    item.name,
+                    size_label(item.text.chars().count()),
+                    after_save(kind, &item.name)
+                ),
+            );
+        }
+    }
+    if found.len() > 1 {
+        say_line(term, &format!("{saved} of {} saved", found.len()));
+    }
+}
+
 fn add_typed<R: BufRead, W: Write>(
     agent: &mut Agent,
     term: &Shared<R, W>,
@@ -318,6 +487,9 @@ fn add_typed<R: BufRead, W: Write>(
 ) {
     let style = term.borrow().style();
     let tail = tail.trim();
+    if !tail.is_empty() && !tail.contains(char::is_whitespace) && looks_like_path(tail) {
+        return add_from_path(agent, term, tail, kind);
+    }
     let (name, file) = match tail.split_once(char::is_whitespace) {
         Some((name, file)) => (name.to_owned(), Some(file.trim().to_owned())),
         None if !tail.is_empty() => (tail.to_owned(), None),
@@ -464,11 +636,13 @@ pub fn checklist<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
                 &style.yellow("no system prompts: use /prompts config, then + add new"),
             );
         }
-        let chosen = term.borrow_mut().pick_from(
-            "system prompts: Enter switches on or off, Esc finishes",
-            &rows(&all, PromptType::System),
-            start,
+        let title = format!(
+            "system prompts of the profile {}: Enter puts one in or out, Esc finishes",
+            agent.selected_profile().unwrap_or_default()
         );
+        let chosen = term
+            .borrow_mut()
+            .pick_from(&title, &rows(&all, PromptType::System), start);
         let Some(index) = chosen else {
             break;
         };
@@ -567,7 +741,9 @@ fn prompt_screen<R: BufRead, W: Write>(
         if p.source_path.is_some() {
             actions.push(("reload from file", "read the file again", Action::Reload));
         }
-        if p.name == BASE_NAME && kind == PromptType::System {
+        if (p.name == BASE_NAME || p.name == SUBAGENT_NAME || p.name == SUBAGENT_CODER_NAME)
+            && kind == PromptType::System
+        {
             actions.push((
                 "restore built-in text",
                 "put the program's own text back",
@@ -669,11 +845,12 @@ fn prompt_screen<R: BufRead, W: Write>(
                 }
             }
             Action::Restore => {
-                if with_store(agent, term, |s| {
-                    s.set_prompt_text(&name, BUILTIN_PROMPT, None)
-                })
-                .is_some()
-                {
+                let own = match name.as_str() {
+                    SUBAGENT_NAME => SUBAGENT_PROMPT,
+                    SUBAGENT_CODER_NAME => SUBAGENT_CODER_PROMPT,
+                    _ => BUILTIN_PROMPT,
+                };
+                if with_store(agent, term, |s| s.set_prompt_text(&name, own, None)).is_some() {
                     done(
                         term,
                         &format!("{name} holds the built-in text again; {NEXT_CHAT}"),
@@ -880,9 +1057,7 @@ mod tests {
     use crate::style::Style;
     use crate::tools::testutil::Scratch;
     use crate::turn_log::TurnLog;
-    use std::cell::RefCell;
     use std::io::Cursor;
-    use std::rc::Rc;
 
     fn config_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
         manager(agent, term, PromptType::System);
@@ -893,7 +1068,7 @@ mod tests {
     const ESC: &str = "\x1b";
 
     type TestTerm = Shared<Cursor<Vec<u8>>, Vec<u8>>;
-    type Requests = Rc<RefCell<Vec<Vec<u8>>>>;
+    type Requests = crate::agent::Shared<Vec<Vec<u8>>>;
 
     fn downs(n: usize) -> String {
         DOWN.repeat(n)
@@ -1476,6 +1651,34 @@ mod tests {
         assert!(base.enabled);
     }
 
+    #[test]
+    fn the_subagent_prompt_can_be_put_back_to_the_built_in_text() {
+        let dir = Scratch::new("pu-restore-subagent");
+        add(&dir, SUBAGENT_NAME, "ruined");
+        // Rows: base, subagent. Open the second one and pick "restore built-in text".
+        let typed = [DOWN, ENTER, &downs(6), ENTER, ESC, ESC].concat();
+        let (mut agent, term, _) = rig(&dir, &typed, &[], true);
+        config_menu(&mut agent, &term);
+        assert_eq!(
+            store(&dir).prompt(SUBAGENT_NAME).unwrap().text,
+            SUBAGENT_PROMPT
+        );
+        assert!(screen(&term).contains("subagent holds the built-in text again"));
+    }
+
+    #[test]
+    fn the_coder_subagent_prompt_can_be_put_back_to_the_built_in_text() {
+        let dir = Scratch::new("pu-restore-coder");
+        add(&dir, SUBAGENT_CODER_NAME, "ruined");
+        let typed = [DOWN, ENTER, &downs(6), ENTER, ESC, ESC].concat();
+        let (mut agent, term, _) = rig(&dir, &typed, &[], true);
+        config_menu(&mut agent, &term);
+        assert_eq!(
+            store(&dir).prompt(SUBAGENT_CODER_NAME).unwrap().text,
+            SUBAGENT_CODER_PROMPT
+        );
+    }
+
     // ---- typed commands ----
 
     #[test]
@@ -1494,7 +1697,7 @@ mod tests {
         run(&mut agent, &term).unwrap();
         let out = screen(&term);
         assert!(
-            out.contains("system prompts (changes apply to the next chat):\n  on   base"),
+            out.contains("system prompts of the profile default (changes apply to the next chat):\n  on   base"),
             "{out}"
         );
         assert!(
@@ -1509,7 +1712,10 @@ mod tests {
             out.contains(&format!("{BUILTIN_PROMPT}\n\nBe brief.\nNo emoji.\n(end)")),
             "{out}"
         );
-        assert!(out.contains("system prompt of a new chat: "), "{out}");
+        assert!(
+            out.contains("system prompt of a new chat under the profile default: "),
+            "{out}"
+        );
         assert!(
             out.contains("a new chat would start with 1 on (rules)"),
             "{out}"
@@ -1705,6 +1911,69 @@ mod tests {
     }
 
     #[test]
+    fn a_path_given_to_add_is_read_for_its_name_and_a_folder_adds_every_skill_in_it() {
+        let dir = Scratch::new("pu-skill-path");
+        let root = dir.path().join("skills");
+        let one = root.join("tidy-up");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::write(
+            one.join("SKILL.md"),
+            "---\nname: tidy\ndescription: \"Clean up\"\n---\n\nKeep it tidy.\n",
+        )
+        .unwrap();
+        let two = root.join("plain");
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(two.join("SKILL.md"), "No front matter.").unwrap();
+        std::fs::write(root.join("notes.md"), "A loose file.").unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        let typed = format!(
+            "/skills add {root}\n/skills add {root}\n/skills add {one}\n/skills add {missing}\n/exit\n",
+            root = root.display(),
+            one = one.join("SKILL.md").display(),
+            missing = dir.path().join("nope.md").display()
+        );
+        let (mut agent, term, _) = rig(&dir, &typed, &[], false);
+        run(&mut agent, &term).unwrap();
+        let out = screen(&term);
+        let store = store(&dir);
+        let tidy = store.prompt("tidy").unwrap();
+        assert_eq!(tidy.text, "Keep it tidy.");
+        assert_eq!(tidy.description, "Clean up");
+        assert_eq!(tidy.prompt_type, PromptType::Skill);
+        assert_eq!(store.prompt("plain").unwrap().text, "No front matter.");
+        assert_eq!(store.prompt("notes").unwrap().text, "A loose file.");
+        assert!(out.contains("3 of 3 saved"), "{out}");
+        assert!(
+            out.contains("0 of 3 saved"),
+            "the second time all are taken: {out}"
+        );
+        assert!(
+            out.contains("there is already a prompt named tidy"),
+            "{out}"
+        );
+        assert!(out.contains("cannot read"), "{out}");
+    }
+
+    #[test]
+    fn a_folder_with_nothing_to_add_and_a_plain_name_are_told_apart() {
+        let dir = Scratch::new("pu-skill-path-none");
+        let empty = dir.path().join("none");
+        std::fs::create_dir_all(&empty).unwrap();
+        let typed = format!(
+            "/skills add {}\n/skills add word\nbody\n.\n/exit\n",
+            empty.display()
+        );
+        let (mut agent, term, _) = rig(&dir, &typed, &[], false);
+        run(&mut agent, &term).unwrap();
+        assert!(
+            screen(&term).contains("has no SKILL.md"),
+            "{}",
+            screen(&term)
+        );
+        assert_eq!(store(&dir).prompt("word").unwrap().text, "body");
+    }
+
+    #[test]
     fn typed_add_from_a_file_and_the_usual_mistakes() {
         let dir = Scratch::new("pu-typed-bad");
         let file = dir.path().join("rules file.md");
@@ -1712,7 +1981,7 @@ mod tests {
         let typed = format!(
             "/prompts add fromfile {}\n\
              /prompts add on\n\
-             /prompts add ../x\n\
+             /prompts add .x\n\
              /prompts add fromfile text\n\
              /prompts on nope\n\
              /prompts off\n\
@@ -1840,7 +2109,7 @@ mod tests {
         assert!(info.fallback);
         assert!(
             info.summary()
-                .contains("the built-in text, no prompt is switched on")
+                .contains("the built-in text, the profile has no system prompt")
         );
         agent.send("hi", &mut NoObserver);
         assert_eq!(system_of(&requests.borrow()[0]), BUILTIN_PROMPT);

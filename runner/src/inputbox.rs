@@ -16,10 +16,41 @@
 //! Each character counts as one column (wide characters are not measured).
 
 use std::io::{BufRead, Write};
+use std::time::{Duration, Instant};
 
 use crate::attach::{PICKER_ROWS, matches, mention};
 use crate::lineedit::{Edit, LineEditor, Step, parse_edit};
 use crate::style::Style;
+
+/// Rows the command list shows.
+const COMMAND_ROWS: usize = 8;
+
+/// The `/command` being typed: the line starts with `/` and the cursor is still inside that first
+/// word. Gives where the word ends (the cursor may be in the middle of it) and the text of the
+/// word up to the cursor, slash included.
+pub fn command_word(chars: &[char], cursor: usize) -> Option<(usize, String)> {
+    let cursor = cursor.min(chars.len());
+    if chars.first() != Some(&'/') || chars[..cursor].iter().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    let end = chars[cursor..]
+        .iter()
+        .position(|c| c.is_whitespace())
+        .map_or(chars.len(), |at| cursor + at);
+    Some((end, chars[..cursor].iter().collect()))
+}
+
+/// The commands that start with what was typed, in the order they are listed, at most `limit`.
+/// Nothing for a path such as `/etc/hosts`.
+pub fn command_matches(words: &[String], typed: &str, limit: usize) -> Vec<String> {
+    let typed = typed.to_lowercase();
+    words
+        .iter()
+        .filter(|w| w.starts_with(&typed))
+        .take(limit)
+        .cloned()
+        .collect()
+}
 
 /// The narrowest box worth drawing.
 const MIN_WIDTH: usize = 20;
@@ -52,12 +83,19 @@ pub fn frame(
 ) -> Frame {
     let (choices, selected) = picker;
     let (height, width) = size;
+    // The first line of `info` goes under the box; any more are a list under the choices.
+    let (info, panel) = info.split_once('\n').unwrap_or((info, ""));
+    let panel: Vec<&str> = panel.lines().collect();
     // One column short of the edge, so a full row never depends on how the terminal wraps.
     let width = width.max(MIN_WIDTH).saturating_sub(1).max(MIN_WIDTH);
     let inner = width - 4;
     let total = chars.len() / inner + 1;
     let (cursor_row, cursor_col) = (cursor / inner, cursor % inner);
-    let visible = total.min(height.saturating_sub(SCREEN_MARGIN + choices.len()).max(1));
+    let visible = total.min(
+        height
+            .saturating_sub(SCREEN_MARGIN + choices.len() + panel.len())
+            .max(1),
+    );
     if cursor_row < *scroll {
         *scroll = cursor_row;
     }
@@ -89,9 +127,15 @@ pub fn frame(
             style.dim(&format!("   {shown}"))
         });
     }
+    for line in &panel {
+        lines.push(style.dim(&format!(
+            " {}",
+            crate::toolview::cut(line, width.saturating_sub(2))
+        )));
+    }
 
     let target = 1 + cursor_row - *scroll;
-    let last = visible + 2 + choices.len();
+    let last = visible + 2 + choices.len() + panel.len();
     let mut text = String::new();
     if let Some(from) = redraw_from
         && from > 0
@@ -113,28 +157,36 @@ pub fn frame(
 }
 
 /// The box left at the bottom of the screen while the model works: `text` in it, the info line
-/// under it, and the cursor on the row below. Returns what to print and how many rows it has,
-/// which [`erase`] needs.
-pub fn static_box(style: Style, size: (usize, usize), text: &str, info: &str) -> (String, usize) {
+/// under it (and, if `info` has more lines, a list under that), `above` (already styled lines, such
+/// as a checklist) over it, and the cursor on the row below. Returns what to print and how many
+/// rows it has, which [`erase`] needs.
+pub fn static_box(
+    style: Style,
+    size: (usize, usize),
+    text: &str,
+    info: &str,
+    above: &[String],
+) -> (String, usize) {
     let width = size.1.max(MIN_WIDTH).saturating_sub(1).max(MIN_WIDTH);
     let inner = width - 4;
     let rule = "─".repeat(width - 2);
     let shown = crate::toolview::cut(text, inner);
     let pad = " ".repeat(inner - shown.chars().count());
-    let lines = [
-        style.cyan(&format!("╭{rule}╮")),
-        format!(
-            "{}{}{}",
-            style.cyan("│ "),
-            style.dim(&format!("{shown}{pad}")),
-            style.cyan(" │")
-        ),
-        style.cyan(&format!("╰{rule}╯")),
-        style.dim(&format!(
+    let mut lines: Vec<String> = above.to_vec();
+    lines.push(style.cyan(&format!("╭{rule}╮")));
+    lines.push(format!(
+        "{}{}{}",
+        style.cyan("│ "),
+        style.dim(&format!("{shown}{pad}")),
+        style.cyan(" │")
+    ));
+    lines.push(style.cyan(&format!("╰{rule}╯")));
+    for line in info.lines() {
+        lines.push(style.dim(&format!(
             " {}",
-            crate::toolview::cut(info, width.saturating_sub(2))
-        )),
-    ];
+            crate::toolview::cut(line, width.saturating_sub(2))
+        )));
+    }
     (format!("{}\r\n", lines.join("\r\n")), lines.len())
 }
 
@@ -163,36 +215,66 @@ pub fn read_boxed<R: BufRead, W: Write>(
     info: &dyn Fn(Option<usize>) -> String,
     files: &mut dyn FnMut() -> Vec<String>,
 ) -> (Option<String>, usize) {
-    read_boxed_from("", input, output, style, size, history, info, files)
+    let (line, row, _) =
+        read_boxed_waking("", input, output, style, size, history, info, files, None);
+    (line, row)
 }
 
 /// [`read_boxed`] with `initial` already in the box and the cursor after it (a cancelled message
-/// comes back this way, to be edited and sent again).
+/// comes back this way, to be edited and sent again), for a terminal whose reads give up after a
+/// short wait (issue 35): whenever a read finds nothing, `wake` is asked, and when it says yes the
+/// box ends with `None` and the text typed so far handed back as the third value, so the caller can
+/// act and bring the text back.
 #[allow(clippy::too_many_arguments)]
-pub fn read_boxed_from<R: BufRead, W: Write>(
+pub fn read_boxed_waking<R: BufRead, W: Write>(
     initial: &str,
     input: &mut R,
     output: &mut W,
     style: Style,
     size: (usize, usize),
     history: &[String],
-    info: &dyn Fn(Option<usize>) -> String,
+    info_for: &dyn Fn(Option<usize>) -> String,
     files: &mut dyn FnMut() -> Vec<String>,
-) -> (Option<String>, usize) {
-    let info = info(Some(size.1.saturating_sub(3)));
+    wake: Option<&dyn Fn() -> bool>,
+) -> (Option<String>, usize, Option<String>) {
+    let mut info = info_for(Some(size.1.saturating_sub(3)));
+    let mut woke: Option<String> = None;
     let mut editor = LineEditor::new(history);
     editor.replace(0, 0, initial);
+    let commands = crate::repl::command_words();
     let (mut scroll, mut from) = (0, None);
     let mut all: Option<Vec<String>> = None;
     // The `@` word the list was closed for with Esc, and the highlighted row.
     let mut closed_at: Option<usize> = None;
     let (mut selected, mut last_query) = (0usize, String::new());
+    // True while more bytes are waiting after the key just read: a paste, which is drawn once at
+    // its end instead of once per character.
+    let mut pasting = false;
+    // The screen is behind the line (a draw was skipped for a paste).
+    let mut stale: bool;
+    let (mut last_empty, mut quick) = (Instant::now(), 0u32);
     let result = loop {
-        let word = mention(editor.chars(), editor.cursor());
+        // The word being completed: an `@file` anywhere, or a `/command` at the start of the line.
+        let mut word = mention(editor.chars(), editor.cursor());
+        let command = if word.is_none() {
+            command_word(editor.chars(), editor.cursor())
+        } else {
+            None
+        };
+        if let Some((_, typed)) = &command {
+            word = Some((0, typed.clone()));
+        }
         if word.as_ref().map(|(start, _)| *start) != closed_at {
             closed_at = None;
         }
         let choices: Vec<String> = match &word {
+            Some((start, query)) if closed_at != Some(*start) && command.is_some() => {
+                if *query != last_query {
+                    last_query = query.clone();
+                    selected = 0;
+                }
+                command_matches(&commands, query, COMMAND_ROWS)
+            }
             Some((start, query)) if closed_at != Some(*start) => {
                 let list = all.get_or_insert_with(&mut *files);
                 if *query != last_query {
@@ -204,36 +286,83 @@ pub fn read_boxed_from<R: BufRead, W: Write>(
             _ => Vec::new(),
         };
         selected = selected.min(choices.len().saturating_sub(1));
-        let drawn = frame(
-            style,
-            size,
-            editor.chars(),
-            editor.cursor(),
-            &info,
-            &mut scroll,
-            from,
-            (&choices, selected),
-        );
-        let _ = output.write_all(drawn.text.as_bytes());
-        let _ = output.flush();
-        from = Some(drawn.cursor_row);
-        let edit = loop {
+        stale = pasting && from.is_some();
+        if !stale {
+            let drawn = frame(
+                style,
+                size,
+                editor.chars(),
+                editor.cursor(),
+                &info,
+                &mut scroll,
+                from,
+                (&choices, selected),
+            );
+            let _ = output.write_all(drawn.text.as_bytes());
+            let _ = output.flush();
+            from = Some(drawn.cursor_row);
+        }
+        let (edit, more) = loop {
             let Ok(buffer) = input.fill_buf() else {
-                break None;
+                break (None, false);
             };
             if buffer.is_empty() {
-                break None;
+                // A read that waited and found nothing (the terminal gives up after a moment):
+                // see whether to wake. Reads that come back at once many times in a row are an
+                // input that has really ended.
+                let Some(wake) = wake else {
+                    break (None, false);
+                };
+                if wake() {
+                    woke = Some(editor.text());
+                    break (None, false);
+                }
+                // What is shown under the box (the tasks that are running) may have changed.
+                let fresh = info_for(Some(size.1.saturating_sub(3)));
+                if fresh != info && !pasting {
+                    info = fresh;
+                    let drawn = frame(
+                        style,
+                        size,
+                        editor.chars(),
+                        editor.cursor(),
+                        &info,
+                        &mut scroll,
+                        from,
+                        (&choices, selected),
+                    );
+                    let _ = output.write_all(drawn.text.as_bytes());
+                    let _ = output.flush();
+                    from = Some(drawn.cursor_row);
+                }
+                if last_empty.elapsed() < Duration::from_millis(20) {
+                    quick += 1;
+                    if quick >= 20 {
+                        break (None, false);
+                    }
+                } else {
+                    quick = 0;
+                }
+                last_empty = Instant::now();
+                continue;
             }
             let (edit, used) = parse_edit(buffer);
+            let more = buffer.len() > used;
             input.consume(used);
             if edit.is_some() {
-                break edit;
+                break (edit, more);
             }
         };
-        let Some(edit) = edit else {
+        let Some(mut edit) = edit else {
             break None;
         };
-        if let (Some((start, _)), false) = (&word, choices.is_empty()) {
+        pasting = more;
+        // A command that is already complete is sent as it is; only a part of one is completed.
+        let complete = command
+            .as_ref()
+            .is_some_and(|(_, typed)| commands.iter().any(|c| c == typed));
+        let taking = !(complete && edit == Edit::Enter);
+        if let (Some((start, _)), false, true) = (&word, choices.is_empty(), taking) {
             match edit {
                 Edit::Up => {
                     selected = selected.saturating_sub(1);
@@ -244,8 +373,13 @@ pub fn read_boxed_from<R: BufRead, W: Write>(
                     continue;
                 }
                 Edit::Tab | Edit::Enter => {
-                    // A folder is left open, so the files in it are listed next.
                     let chosen = &choices[selected];
+                    if let Some((end, _)) = &command {
+                        // The whole command word is replaced, even the part after the cursor.
+                        editor.replace(0, *end, &format!("{chosen} "));
+                        continue;
+                    }
+                    // A folder is left open, so the files in it are listed next.
                     let gap = if chosen.ends_with('/') { "" } else { " " };
                     let text = format!("@{chosen}{gap}");
                     editor.replace(*start, editor.cursor(), &text);
@@ -258,13 +392,33 @@ pub fn read_boxed_from<R: BufRead, W: Write>(
                 _ => {}
             }
         }
+        // An Enter with more text behind it is part of a paste: it must not send the first line
+        // now and the rest as later messages.
+        if more && edit == Edit::Enter {
+            edit = Edit::Char(' ');
+        }
         match editor.key(edit) {
             Step::Continue => {}
             Step::Submit => break Some(editor.text()),
             Step::Eof => break None,
         }
     };
-    (result, from.unwrap_or(0))
+    if stale {
+        let drawn = frame(
+            style,
+            size,
+            editor.chars(),
+            editor.cursor(),
+            &info,
+            &mut scroll,
+            from,
+            (&[], 0),
+        );
+        let _ = output.write_all(drawn.text.as_bytes());
+        let _ = output.flush();
+        from = Some(drawn.cursor_row);
+    }
+    (result, from.unwrap_or(0), woke)
 }
 
 #[cfg(test)]
@@ -366,6 +520,95 @@ mod tests {
     }
 
     #[test]
+    fn the_command_word_is_the_first_word_while_the_cursor_is_in_it() {
+        let chars = |s: &str| s.chars().collect::<Vec<_>>();
+        assert_eq!(
+            command_word(&chars("/pro"), 4),
+            Some((4, "/pro".to_owned()))
+        );
+        // Cursor in the middle: the word to replace goes on to its end.
+        assert_eq!(
+            command_word(&chars("/prox rest"), 3),
+            Some((5, "/pr".to_owned()))
+        );
+        assert_eq!(
+            command_word(&chars("/model x"), 8),
+            None,
+            "past the first word"
+        );
+        assert_eq!(command_word(&chars("hi /pro"), 7), None, "not at the start");
+        assert_eq!(command_word(&chars(""), 0), None);
+    }
+
+    #[test]
+    fn commands_are_matched_by_what_they_start_with_and_a_path_matches_none() {
+        let words = crate::repl::command_words();
+        let found = command_matches(&words, "/prov", 8);
+        assert_eq!(found, ["/provider"]);
+        assert!(command_matches(&words, "/", 8).len() == 8);
+        assert_eq!(command_matches(&words, "/MOD", 8), ["/model", "/models"]);
+        assert!(command_matches(&words, "/etc/hosts", 8).is_empty());
+        assert!(words.contains(&"/compact".to_owned()) && words.contains(&"/quit".to_owned()));
+    }
+
+    #[test]
+    fn tab_completes_a_command_and_enter_sends_a_finished_one_as_it_is() {
+        let (line, _) = run_keys(
+            60,
+            24,
+            b"/prov\t
+",
+        );
+        assert_eq!(line.as_deref(), Some("/provider "));
+        // A finished command is not replaced by a longer one that starts the same way.
+        let (line, _) = run_keys(
+            60, 24, b"/model
+",
+        );
+        assert_eq!(line.as_deref(), Some("/model"));
+        // A part of one is completed by Enter, which then needs another Enter to send.
+        let (line, _) = run_keys(
+            60, 24, b"/sess
+
+",
+        );
+        assert_eq!(line.as_deref(), Some("/sessions "));
+        // The word is replaced even when the cursor is inside it.
+        let (line, _) = run_keys(
+            60,
+            24,
+            b"/provx\x1b[D\t
+",
+        );
+        assert_eq!(line.as_deref(), Some("/provider "));
+    }
+
+    #[test]
+    fn the_command_list_is_shown_under_the_box_and_a_path_or_a_message_gets_none() {
+        let (_, screen) = run_keys(60, 24, b"/mo");
+        let shown = screen.lines().join("\n");
+        assert!(
+            shown.contains("▸ /model") && shown.contains("/models"),
+            "{shown}"
+        );
+        let (line, screen) = run_keys(
+            60,
+            24,
+            b"/etc/hosts
+",
+        );
+        assert_eq!(line.as_deref(), Some("/etc/hosts"));
+        assert!(!screen.lines().join("\n").contains("▸"));
+        let (line, _) = run_keys(
+            60,
+            24,
+            b"hello /pro
+",
+        );
+        assert_eq!(line.as_deref(), Some("hello /pro"));
+    }
+
+    #[test]
     fn a_short_line_is_a_closed_box_with_the_info_under_it() {
         let (line, screen) = run_keys(30, 24, b"hello\r");
         assert_eq!(line.as_deref(), Some("hello"));
@@ -449,10 +692,41 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_text_with_line_breaks_is_one_message_drawn_once() {
+        let mut input = Cursor::new(b"fix X\n/approve auto\nthen Y\r".to_vec());
+        let mut output = Vec::new();
+        let (line, _) = read_boxed(
+            &mut input,
+            &mut output,
+            Style::plain(),
+            (60, 24),
+            &[],
+            &|_| "info".to_owned(),
+            &mut Vec::new,
+        );
+        assert_eq!(line.as_deref(), Some("fix X /approve auto then Y"));
+        // Once before the paste and once after it, not once per character.
+        let draws = String::from_utf8_lossy(&output).matches("info").count();
+        assert!(draws <= 3, "{draws} draws");
+        // A lone Enter still sends.
+        let mut input = Cursor::new(b"hi\r".to_vec());
+        let (line, _) = read_boxed(
+            &mut input,
+            &mut Vec::new(),
+            Style::plain(),
+            (60, 24),
+            &[],
+            &|_| "info".to_owned(),
+            &mut Vec::new,
+        );
+        assert_eq!(line.as_deref(), Some("hi"));
+    }
+
+    #[test]
     fn text_put_back_in_the_box_can_be_edited_and_sent() {
         let mut input = Cursor::new(b" now\r".to_vec());
         let mut output = Vec::new();
-        let (line, _) = read_boxed_from(
+        let (line, _, _) = read_boxed_waking(
             "fix the bug",
             &mut input,
             &mut output,
@@ -461,11 +735,52 @@ mod tests {
             &[],
             &|_| "info".to_owned(),
             &mut Vec::new,
+            None,
         );
         assert_eq!(line.as_deref(), Some("fix the bug now"));
         let mut screen = Screen::new(30);
         screen.feed(&output);
         assert!(screen.lines().join("\n").contains("fix the bug"));
+    }
+
+    #[test]
+    fn more_lines_in_the_info_are_a_list_under_the_box_and_the_working_box_takes_rows_for_them() {
+        let (shown, rows) = static_box(
+            Style::plain(),
+            (24, 30),
+            "working…",
+            "info\n● s1  sleep\n● a2  reviewer",
+            &[" steps 0/1".to_owned(), "  ▸ read".to_owned()],
+        );
+        assert_eq!(rows, 8);
+        let mut screen = Screen::new(30);
+        screen.feed(shown.as_bytes());
+        let lines = screen.lines();
+        assert_eq!(lines[0], " steps 0/1");
+        assert_eq!(lines[1], "  ▸ read");
+        assert_eq!(lines[2], format!("╭{}╮", "─".repeat(27)));
+        assert_eq!(lines[5], " info");
+        assert_eq!(lines[6], " ● s1  sleep");
+        assert_eq!(lines[7], " ● a2  reviewer");
+        assert_eq!(screen.row, 8);
+
+        let mut scroll = 0;
+        let drawn = frame(
+            Style::plain(),
+            (24, 30),
+            &[],
+            0,
+            "info\nlisted task",
+            &mut scroll,
+            None,
+            (&[], 0),
+        );
+        let mut screen = Screen::new(30);
+        screen.feed(drawn.text.as_bytes());
+        let lines = screen.lines();
+        assert_eq!(lines[3], " info");
+        assert_eq!(lines[4], " listed task");
+        assert_eq!(screen.row, 1, "the cursor is in the box");
     }
 
     #[test]
@@ -491,14 +806,14 @@ mod tests {
 
     #[test]
     fn the_box_for_the_time_the_model_works_sits_under_the_output_and_can_be_replaced() {
-        let (shown, rows) = static_box(Style::plain(), (24, 30), "working…", "info");
+        let (shown, rows) = static_box(Style::plain(), (24, 30), "working…", "info", &[]);
         assert_eq!(rows, 4);
         let mut output = shown.into_bytes();
         // A line of output goes above it: erase, print, draw again.
         output.extend_from_slice(erase(rows).as_bytes());
         output.extend_from_slice(b"a tool line\r\n");
         output.extend_from_slice(
-            static_box(Style::plain(), (24, 30), "working…", "info")
+            static_box(Style::plain(), (24, 30), "working…", "info", &[])
                 .0
                 .as_bytes(),
         );
@@ -651,5 +966,29 @@ mod tests {
             1,
             "{rows:?}"
         );
+    }
+    #[test]
+    fn a_wait_that_finds_nothing_can_wake_the_box_and_returns_what_was_typed() {
+        let run = |wake: bool| {
+            let mut input = Cursor::new(Vec::new());
+            let mut output = Vec::new();
+            let always = move || wake;
+            read_boxed_waking(
+                "abc",
+                &mut input,
+                &mut output,
+                Style::plain(),
+                (24, 80),
+                &[],
+                &|_| String::new(),
+                &mut Vec::new,
+                Some(&always),
+            )
+        };
+        let (line, _, woke) = run(true);
+        assert_eq!((line, woke), (None, Some("abc".to_owned())));
+        // An input that has ended for good does not spin: it ends the box.
+        let (line, _, woke) = run(false);
+        assert_eq!((line, woke), (None, None));
     }
 }

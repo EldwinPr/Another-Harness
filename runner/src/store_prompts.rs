@@ -5,9 +5,9 @@
 //! The texts the program ships with (the built-in prompt and the prompt-writing guide) live here
 //! too, because the first row of the table is seeded from the built-in one.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::store::{Store, StoreError, sha256_hex};
+use crate::store::{Edit, Store, StoreError, fingerprint, sha256_hex};
 
 /// The built-in text before issue 16 listed the tools. A database that still holds exactly this as
 /// `base` gets the new text in schema 8; an edited `base` is left alone.
@@ -21,9 +21,48 @@ pub const BUILTIN_PROMPT_V8: &str = "You are a coding assistant running in a ter
 /// gets the new text in schema 10.
 pub const BUILTIN_PROMPT_V9: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds.\nFile paths are relative to the working directory; absolute paths and .. are refused. Prefer the file tools to bash for reading and changing files, and edit_file to write_file for changes: use write_file only for a full rewrite. Looking commands such as ls, cd, pwd, cat and mkdir run without asking the user; any other command, and file changes in manual mode, need the user's approval. If a result says \"denied by user\", do not retry it: say what you wanted to do and ask. Use a tool when you need information you do not have, then answer concisely.";
 
+/// The built-in text of schema 10 (six tools and the rules from the logs). A database that still holds
+/// exactly this as `base` gets the new text in schema 11.
+pub const BUILTIN_PROMPT_V10: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\nRules:\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- To look, use ls, grep, find, head, tail, wc, cat or sed -n 'N,Mp' file. These, and pipes between them, run without asking the user; any other command, and file changes in manual mode, need the user's approval.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and a message is limited to 20 model calls.\n- If a result says \"denied by user\", do not retry it or find a way around it: say what you wanted to do and ask.\n- If something is not found after two tries (a file, a script, a command), stop searching and tell the user. Do not guess paths or scan the filesystem.\nUse a tool when you need information you do not have, then answer concisely.";
+
 /// The system prompt the program had before prompts were stored. It seeds the `base` row, is used
 /// when no prompt is switched on, and is what "restore built-in text" writes back.
-pub const BUILTIN_PROMPT: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\nRules:\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- To look, use ls, grep, find, head, tail, wc, cat or sed -n 'N,Mp' file. These, and pipes between them, run without asking the user; any other command, and file changes in manual mode, need the user's approval.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and a message is limited to 20 model calls.\n- If a result says \"denied by user\", do not retry it or find a way around it: say what you wanted to do and ask.\n- If something is not found after two tries (a file, a script, a command), stop searching and tell the user. Do not guess paths or scan the filesystem.\nUse a tool when you need information you do not have, then answer concisely.";
+/// The built-in text of schema 15 (the tools and the glossary, before the context tools were named). A
+/// database that still holds exactly this as `base`, or as a subagent prompt, gets the new text in schema 16.
+pub const BUILTIN_PROMPT_V15: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\n- glossary(term): look up a project word in the glossary the user keeps.\n- glossary_propose(term, definition, reason): propose a new glossary entry or a corrected definition. The user confirms each one.\nRules:\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- To look, use ls, grep, find, head, tail, wc, cat or sed -n 'N,Mp' file. These, and pipes between them, run without asking the user; any other command, and file changes in manual mode, need the user's approval.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and a message is limited to 20 model calls.\n- If a result says \"denied by user\", do not retry it or find a way around it: say what you wanted to do and ask.\n- If something is not found after two tries (a file, a script, a command), stop searching and tell the user. Do not guess paths or scan the filesystem.\n- When you meet a project word you do not know, look it up with glossary before guessing. When you learn what a word means, or a stored definition is wrong, propose it once with glossary_propose; after a refusal do not propose it again.\nUse a tool when you need information you do not have, then answer concisely.";
+
+/// The built-in text of schema 18 (before `library` and `profile` were named). A database that still
+/// holds exactly this as `base` gets the new text in schema 19.
+pub const BUILTIN_PROMPT_V16: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\n- glossary(term): look up a project word in the glossary the user keeps.\n- glossary_propose(term, definition, reason): propose a new glossary entry or a corrected definition. The user confirms each one.\n- context(name): read a rule, decision, shape or guide the user saved (offered once they have saved some).\n- context_propose(kind, name, text, quote): propose saving what the user told you; quote is their own words. The user confirms each one.\nRules:\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- To look, use ls, grep, find, head, tail, wc, cat or sed -n 'N,Mp' file. These, and pipes between them, run without asking the user; any other command, and file changes in manual mode, need the user's approval.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and a message is limited to 20 model calls.\n- If a result says \"denied by user\", do not retry it or find a way around it: say what you wanted to do and ask.\n- If something is not found after two tries (a file, a script, a command), stop searching and tell the user. Do not guess paths or scan the filesystem.\n- When you meet a project word you do not know, look it up with glossary before guessing. When you learn what a word means, or a stored definition is wrong, propose it once with glossary_propose; after a refusal do not propose it again.\n- Read a saved rule or decision with context before work it may cover. When the user clearly states a rule, a decision or how their business works, propose it once with context_propose (never invent one); after a refusal do not propose it again.\nUse a tool when you need information you do not have, then answer concisely.";
+
+/// The built-in text of schema 19 (before `task` and `steps` were named). A database that still
+/// holds exactly this as `base` gets the new text in schema 20.
+pub const BUILTIN_PROMPT_V17: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\n- glossary(term): look up a project word in the glossary the user keeps.\n- glossary_propose(term, definition, reason): propose a new glossary entry or a corrected definition. The user may refuse.\n- context(name): read a rule, decision, shape or guide the user saved (offered once they have saved some).\n- context_propose(kind, name, text, quote): propose saving what the user told you; quote is their own words. The user may refuse.\n- library(action, type, name, text, ...): list, show, add, edit or delete the user's skills, personalities and system prompts (type skill, personality, prompt). A new one is saved switched off.\n- profile(action, name, ...): the same for the user's profiles.\nRules:\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- To look, use ls, grep, find, head, tail, wc, cat or sed -n 'N,Mp' file. These, and pipes between them, run without asking the user; any other command, and file changes in manual mode, need the user's approval.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and a message is limited to 20 model calls.\n- If a result says \"denied by user\", do not retry it or find a way around it: say what you wanted to do and ask.\n- If something is not found after two tries (a file, a script, a command), stop searching and tell the user. Do not guess paths or scan the filesystem.\n- When you meet a project word you do not know, look it up with glossary before guessing. When you learn what a word means, or a stored definition is wrong, propose it once with glossary_propose; after a refusal do not propose it again.\n- Read a saved rule or decision with context before work it may cover. When the user clearly states a rule, a decision or how their business works, propose it once with context_propose (never invent one); after a refusal do not propose it again.\n- Change library or profile items only when asked; show before an edit. After a refusal do not ask again.\nUse a tool when you need information you do not have, then answer concisely.";
+
+/// The built-in text of the newest schema: the tools, the rules, the context tools, the library,
+/// background commands and steps.
+pub const BUILTIN_PROMPT: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\n- glossary(term): look up a project word in the glossary the user keeps.\n- glossary_propose(term, definition, reason): propose a new glossary entry or a corrected definition. The user may refuse.\n- context(name): read a rule, decision, shape or guide the user saved (offered once they have saved some).\n- context_propose(kind, name, text, quote): propose saving what the user told you; quote is their own words. The user may refuse.\n- library(action, type, name, text, ...): list, show, add, edit or delete the user's skills, personalities and system prompts (type skill, personality, prompt). A new one is saved switched off.\n- profile(action, name, ...): the same for the user's profiles.\n- task(action, id): list, read or stop commands you started with bash background true.\n- steps(steps): for 3+ stages, set a checklist (text, status todo|doing|done); send the whole list when it changes. The user sees it instead of each call.\nRules:\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- To look, use ls, grep, find, head, tail, wc, cat or sed -n 'N,Mp' file. These, and pipes between them, run without asking the user; any other command, and file changes in manual mode, need the user's approval.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and a message is limited to 20 model calls.\n- If a result says \"denied by user\", do not retry it or find a way around it: say what you wanted to do and ask.\n- If something is not found after two tries (a file, a script, a command), stop searching and tell the user. Do not guess paths or scan the filesystem.\n- When you meet a project word you do not know, look it up with glossary before guessing. When you learn what a word means, or a stored definition is wrong, propose it once with glossary_propose; after a refusal do not propose it again.\n- Read a saved rule or decision with context before work it may cover. When the user clearly states a rule, a decision or how their business works, propose it once with context_propose (never invent one); after a refusal do not propose it again.\n- Change library or profile items only when asked; show before an edit. After a refusal do not ask again.\nUse a tool when you need information you do not have, then answer concisely.";
+
+/// The prompt a subagent starts with in place of `base` (issue 33). It names only the tools a
+/// subagent has and says what a subagent is for, so its scope is clear. A copy is seeded under
+/// [`SUBAGENT_NAME`]; when that prompt is missing this text is used.
+pub const SUBAGENT_PROMPT_V15: &str = "You are a subagent. Another agent started you to do one task and will read only your final answer; the user is not reading you. You work in one folder (the working directory) and you can only look. You have these tools:\n- read_file(path): read a UTF-8 text file.\n- bash(command): run a looking command with bash -c in the working directory. Only looking commands run (ls, cat, head, tail, wc, grep, find, sed -n 'N,Mp' file, git status and the like, and pipes between them); any other command is refused, so do not try python, git rev-parse or find /. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\n- glossary(term): look up a project word in the glossary the user keeps.\n- write_note(name, content): save a note as .Aharness/tmp/<name>. This is the only thing you can write.\nRules:\n- Do the task you were given and nothing else. You cannot change the project, ask the user or anyone a question, or hand work to another agent. If something you need is missing, say so in your answer.\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not look through the rest of the computer (find /, ~).\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and you have at most 15 model calls.\n- If something is not found after two tries (a file, a script, a command), stop searching and report that.\n- When you meet a project word you do not know, look it up with glossary before guessing.\n- Put anything longer than a few lines (a plan, a review, a list) in a note with write_note, then answer with the note's path and a summary of at most 150 words, so that the next task can say: read .Aharness/tmp/<name>.\n- Finish with the result first, then the evidence: file paths with line numbers (path:line). Keep it short; the other agent reads only this answer.";
+
+pub const SUBAGENT_PROMPT: &str = "You are a subagent. Another agent started you to do one task and will read only your final answer; the user is not reading you. You work in one folder (the working directory) and you can only look. You have these tools:\n- read_file(path): read a UTF-8 text file.\n- bash(command): run a looking command with bash -c in the working directory. Only looking commands run (ls, cat, head, tail, wc, grep, find, sed -n 'N,Mp' file, git status and the like, and pipes between them); any other command is refused, so do not try python, git rev-parse or find /. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\n- glossary(term): look up a project word in the glossary the user keeps.\n- context(name): read a rule, decision, shape or guide the user saved for this project (if any exist).\n- write_note(name, content): save a note as .Aharness/tmp/<name>. This is the only thing you can write.\nRules:\n- Do the task you were given and nothing else. You cannot change the project, ask the user or anyone a question, or hand work to another agent. If something you need is missing, say so in your answer.\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not look through the rest of the computer (find /, ~).\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and you have at most 15 model calls.\n- If something is not found after two tries (a file, a script, a command), stop searching and report that.\n- When you meet a project word you do not know, look it up with glossary before guessing. Treat the user's words under \"Background from the project\" as binding, and read a saved entry with context when your task touches it.\n- Put anything longer than a few lines (a plan, a review, a list) in a note with write_note, then answer with the note's path and a summary of at most 150 words, so that the next task can say: read .Aharness/tmp/<name>.\n- Finish with the result first, then the evidence: file paths with line numbers (path:line). Keep it short; the other agent reads only this answer.";
+
+/// The prompt a subagent that may change files starts with (issue 34): the same, with the file
+/// tools. Used when the approval mode is `auto` at the moment the subagent starts.
+pub const SUBAGENT_CODER_PROMPT_V15: &str = "You are a subagent. Another agent started you to do one task and will read only your final answer; the user is not reading you. You work in one folder (the working directory) and you may change files in it. You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Only looking commands (ls, cat, head, tail, wc, grep, find, sed -n 'N,Mp' file, git status, mkdir and the like) and commands the user already allowed in this chat run; any other command is refused, because nobody can be asked. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\n- glossary(term): look up a project word in the glossary the user keeps.\n- write_note(name, content): save a note as .Aharness/tmp/<name>.\nRules:\n- Do the task you were given and change only what it needs. You cannot ask the user or anyone a question, or hand work to another agent. If something you need is missing, or the task and the code disagree, stop and say so in your answer.\n- If the task names a note or plan (for example .Aharness/tmp/plan.md), read it first and follow it.\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- After your changes run the project's own tests if you are allowed to run the command; if the command is refused, say which command should be run.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and you have at most 15 model calls.\n- If something is not found after two tries (a file, a script, a command), stop searching and report that.\n- Finish with the result first: what you did and the files you changed (one path per line), then anything left undone or unchecked. Keep it short; the other agent reads only this answer.";
+
+pub const SUBAGENT_CODER_PROMPT: &str = "You are a subagent. Another agent started you to do one task and will read only your final answer; the user is not reading you. You work in one folder (the working directory) and you may change files in it. You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Only looking commands (ls, cat, head, tail, wc, grep, find, sed -n 'N,Mp' file, git status, mkdir and the like) and commands the user already allowed in this chat run; any other command is refused, because nobody can be asked. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\n- glossary(term): look up a project word in the glossary the user keeps.\n- context(name): read a rule, decision, shape or guide the user saved for this project (if any exist).\n- write_note(name, content): save a note as .Aharness/tmp/<name>.\nRules:\n- Do the task you were given and change only what it needs. You cannot ask the user or anyone a question, or hand work to another agent. If something you need is missing, or the task and the code disagree, stop and say so in your answer.\n- If the task names a note or plan (for example .Aharness/tmp/plan.md), read it first and follow it.\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- After your changes run the project's own tests if you are allowed to run the command; if the command is refused, say which command should be run.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and you have at most 15 model calls.\n- If something is not found after two tries (a file, a script, a command), stop searching and report that.\n- Treat the user's words under \"Background from the project\" as binding, and read a saved entry with context when your task touches it.\n- Finish with the result first: what you did and the files you changed (one path per line), then anything left undone or unchecked. Keep it short; the other agent reads only this answer.";
+
+/// The name of the seeded subagent prompt.
+pub const SUBAGENT_NAME: &str = "subagent";
+pub const SUBAGENT_DESCRIPTION: &str = "The base instructions of a subagent that can only look";
+/// The subagent prompt for one that may change files (issue 34).
+pub const SUBAGENT_CODER_NAME: &str = "subagent-coder";
+pub const SUBAGENT_CODER_DESCRIPTION: &str =
+    "The base instructions of a subagent that can change files";
 
 /// The name of the seeded prompt.
 pub const BASE_NAME: &str = "base";
@@ -238,6 +277,12 @@ pub struct Prompt {
 }
 
 impl Prompt {
+    /// A stamp of what the prompt says (not whether it is on, nor where it stands in the list),
+    /// for the web page's "changed since you opened it" check.
+    pub fn fingerprint(&self) -> String {
+        fingerprint(&[&self.name, &self.description, &self.text])
+    }
+
     pub fn chars(&self) -> usize {
         self.text.chars().count()
     }
@@ -283,6 +328,40 @@ pub fn assemble(prompts: &[Prompt]) -> Assembled {
         names: on.iter().map(|p| p.name.clone()).collect(),
         fallback: false,
     }
+}
+
+/// The migration to schema 13 (and 14): adds the `subagent` and `subagent-coder` prompts (switched off,
+/// in no profile), each unless a prompt of that name exists, in which case it is kept as written. `add` is `!cfg!(test)`: the
+/// tests that count the prompts of a fresh database would otherwise all have to know it; the
+/// seeding is tested by calling this with `true`.
+pub(crate) fn seed_subagent(conn: &rusqlite::Connection, add: bool) -> Result<(), StoreError> {
+    if !add {
+        return Ok(());
+    }
+    for (name, description, text) in [
+        (SUBAGENT_NAME, SUBAGENT_DESCRIPTION, SUBAGENT_PROMPT),
+        (
+            SUBAGENT_CODER_NAME,
+            SUBAGENT_CODER_DESCRIPTION,
+            SUBAGENT_CODER_PROMPT,
+        ),
+    ] {
+        let taken: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prompts WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        if taken > 0 {
+            continue;
+        }
+        let now = crate::store::now_secs();
+        conn.execute(
+            "INSERT INTO prompts (name, description, text, enabled, position, created_at, updated_at, type) \
+             VALUES (?1, ?2, ?3, 0, (SELECT COALESCE(MAX(position), 0) + 1 FROM prompts), ?4, ?4, 'system')",
+            rusqlite::params![name, description, text, now],
+        )?;
+    }
+    Ok(())
 }
 
 /// A prompt's name: the provider-name rules, without the words `/prompts` uses.
@@ -340,7 +419,13 @@ fn read_prompt(row: &rusqlite::Row<'_>) -> rusqlite::Result<Prompt> {
     })
 }
 
-const COLUMNS: &str = "id, name, description, text, source_path, enabled, position, type";
+/// `enabled` is not the column of that name (no longer read, issue 31): a system prompt is "on"
+/// when it is in the profile new chats start under.
+const COLUMNS: &str = "id, name, description, text, source_path, \
+    EXISTS (SELECT 1 FROM profile_prompts pp JOIN profiles pr ON pr.id = pp.profile_id \
+            WHERE pp.prompt_id = prompts.id \
+              AND pr.name = COALESCE((SELECT value FROM settings WHERE key = 'profile'), 'default')), \
+    position, type";
 
 impl Store {
     /// Every prompt, in position order.
@@ -362,6 +447,78 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| err(format!("there is no prompt named {name} (see /prompts)")))
+    }
+
+    /// Changes the prompt `id` (name, description and text, in one transaction) if it still has
+    /// the stamp `expected` (see [`Prompt::fingerprint`]). The name and text rules are the ones
+    /// `/prompts` uses; a text imported from a file keeps its source path.
+    pub fn edit_prompt(
+        &mut self,
+        id: i64,
+        expected: &str,
+        name: &str,
+        description: &str,
+        text: &str,
+    ) -> Result<Edit, StoreError> {
+        check_prompt_name(name).map_err(err)?;
+        check_prompt_text(text).map_err(err)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let there = tx
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM prompts WHERE id = ?1"),
+                [id],
+                read_prompt,
+            )
+            .optional()?;
+        let Some(there) = there else {
+            return Ok(Edit::Gone);
+        };
+        if there.fingerprint() != expected {
+            return Ok(Edit::Stale);
+        }
+        let taken: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM prompts WHERE name = ?1 AND id <> ?2",
+            params![name, id],
+            |row| row.get(0),
+        )?;
+        if taken > 0 {
+            return Err(err(format!("there is already a prompt named {name}")));
+        }
+        if there.name == name && there.description == description && there.text == text {
+            return Ok(Edit::Done);
+        }
+        tx.execute(
+            "UPDATE prompts SET name = ?2, description = ?3, text = ?4, updated_at = ?5 WHERE id = ?1",
+            params![id, name, description, text, crate::store::now_secs()],
+        )?;
+        tx.commit()?;
+        Ok(Edit::Done)
+    }
+
+    /// Deletes the prompt `id` (and where chats had chosen it) if it still has the stamp `expected`.
+    pub fn delete_prompt_checked(&mut self, id: i64, expected: &str) -> Result<Edit, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let there = tx
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM prompts WHERE id = ?1"),
+                [id],
+                read_prompt,
+            )
+            .optional()?;
+        let Some(there) = there else {
+            return Ok(Edit::Gone);
+        };
+        if there.fingerprint() != expected {
+            return Ok(Edit::Stale);
+        }
+        tx.execute("DELETE FROM chat_prompt_state WHERE prompt_id = ?1", [id])?;
+        tx.execute("DELETE FROM prompts WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(Edit::Done)
     }
 
     /// What a chat started now would get as its system prompt.
@@ -392,7 +549,9 @@ impl Store {
     ) -> Result<(), StoreError> {
         check_prompt_name(name).map_err(err)?;
         check_prompt_text(text).map_err(err)?;
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let taken: i64 = tx.query_row(
             "SELECT COUNT(*) FROM prompts WHERE name = ?1",
             [name],
@@ -451,8 +610,9 @@ impl Store {
         self.exists(changed, name)
     }
 
-    /// Switches a system prompt on or off. Skills and personalities are never on in the library:
-    /// a chat chooses them (`ChatPrompts`), and a new chat starts with none.
+    /// Switches a system prompt on or off: in or out of the profile new chats start under (issue
+    /// 31). Skills and personalities are never on here: a chat chooses them (`ChatPrompts`), and a
+    /// profile lists the ones a new chat starts with.
     pub fn set_prompt_enabled(&mut self, name: &str, enabled: bool) -> Result<(), StoreError> {
         let prompt = self.prompt(name)?;
         if prompt.prompt_type != PromptType::System {
@@ -461,11 +621,7 @@ impl Store {
                 prompt.prompt_type.as_str()
             )));
         }
-        let changed = self.conn.execute(
-            "UPDATE prompts SET enabled = ?2, updated_at = ?3 WHERE name = ?1",
-            params![name, i64::from(enabled), crate::store::now_secs()],
-        )?;
-        self.exists(changed, name)
+        self.set_in_selected_profile(prompt.id, enabled)
     }
 
     /// The skills and personality a saved chat had.
@@ -501,7 +657,9 @@ impl Store {
         session_id: i64,
         state: &ChatPrompts,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM chat_prompt_state WHERE session_id = ?1",
             [session_id],
@@ -541,25 +699,36 @@ impl Store {
         self.exists(changed, old)
     }
 
-    /// Moves a prompt one place earlier (`-1`) or later (`1`) by swapping places with its
-    /// neighbour. At either end nothing happens and `false` comes back.
+    /// Moves a prompt one place earlier (`-1`) or later (`1`) among the prompts of its own type, by
+    /// swapping places with that neighbour (a skill is never swapped with a system prompt: the
+    /// list of its kind would look unchanged). At either end nothing happens and `false` comes back.
     pub fn move_prompt(&mut self, name: &str, delta: i32) -> Result<bool, StoreError> {
         let all = self.list_prompts()?;
-        let at = all
+        let me = all
             .iter()
-            .position(|p| p.name == name)
+            .find(|p| p.name == name)
             .ok_or_else(|| err(format!("there is no prompt named {name} (see /prompts)")))?;
+        let same: Vec<i64> = all
+            .iter()
+            .filter(|p| p.prompt_type == me.prompt_type)
+            .map(|p| p.id)
+            .collect();
+        let at = same.iter().position(|id| *id == me.id).unwrap_or(0);
         let to = match delta {
             d if d < 0 => at.checked_sub(1),
-            _ => (at + 1 < all.len()).then_some(at + 1),
+            _ => (at + 1 < same.len()).then_some(at + 1),
         };
         let Some(to) = to else {
             return Ok(false);
         };
-        let tx = self.conn.transaction()?;
         // Positions are renumbered 1..n so they stay distinct whatever came before.
         let mut order: Vec<i64> = all.iter().map(|p| p.id).collect();
-        order.swap(at, to);
+        let first = order.iter().position(|id| *id == same[at]).unwrap_or(0);
+        let second = order.iter().position(|id| *id == same[to]).unwrap_or(0);
+        order.swap(first, second);
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for (index, id) in order.iter().enumerate() {
             tx.execute(
                 "UPDATE prompts SET position = ?2 WHERE id = ?1",
@@ -571,7 +740,9 @@ impl Store {
     }
 
     pub fn delete_prompt(&mut self, name: &str) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM chat_prompt_state WHERE prompt_id IN (SELECT id FROM prompts WHERE name = ?1)",
             [name],
@@ -761,6 +932,110 @@ mod tests {
     }
 
     #[test]
+    fn a_move_swaps_with_the_neighbour_of_the_same_type() {
+        let dir = Scratch::new("prompts-move-kind");
+        let mut store = open(&dir);
+        store.add_prompt("sys1", "", "A", None).unwrap();
+        store
+            .add_prompt_of_type("skill1", "", "S1", None, PromptType::Skill)
+            .unwrap();
+        store.add_prompt("sys2", "", "B", None).unwrap();
+        store
+            .add_prompt_of_type("skill2", "", "S2", None, PromptType::Skill)
+            .unwrap();
+        let of = |s: &Store, kind: PromptType| -> Vec<String> {
+            s.list_prompts()
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.prompt_type == kind)
+                .map(|p| p.name)
+                .collect()
+        };
+        // sys2 moves above sys1 although a skill stands between them.
+        assert!(store.move_prompt("sys2", -1).unwrap());
+        assert_eq!(of(&store, PromptType::System), ["base", "sys2", "sys1"]);
+        assert_eq!(of(&store, PromptType::Skill), ["skill1", "skill2"]);
+        assert!(store.move_prompt("skill2", -1).unwrap());
+        assert_eq!(of(&store, PromptType::Skill), ["skill2", "skill1"]);
+        assert_eq!(of(&store, PromptType::System), ["base", "sys2", "sys1"]);
+        assert!(!store.move_prompt("skill2", -1).unwrap());
+    }
+
+    #[test]
+    fn a_checked_edit_or_delete_needs_the_row_to_be_as_it_was_shown() {
+        let dir = Scratch::new("prompts-checked");
+        let mut store = open(&dir);
+        store.add_prompt("one", "d", "text", None).unwrap();
+        store.add_prompt("two", "d", "text", None).unwrap();
+        let one = store.prompt("one").unwrap();
+        // Same row, same stamp: the edit is made, in one step with the rename.
+        assert_eq!(
+            store
+                .edit_prompt(one.id, &one.fingerprint(), "uno", "e", "new")
+                .unwrap(),
+            Edit::Done
+        );
+        let uno = store.prompt("uno").unwrap();
+        assert_eq!((uno.description.as_str(), uno.text.as_str()), ("e", "new"));
+        // The old stamp no longer fits.
+        assert_eq!(
+            store
+                .edit_prompt(one.id, &one.fingerprint(), "x", "", "y")
+                .unwrap(),
+            Edit::Stale
+        );
+        assert_eq!(
+            store
+                .delete_prompt_checked(one.id, &one.fingerprint())
+                .unwrap(),
+            Edit::Stale
+        );
+        // A refused name or text changes nothing, and neither does a taken name.
+        assert!(
+            store
+                .edit_prompt(uno.id, &uno.fingerprint(), "bad name", "", "y")
+                .is_err()
+        );
+        assert!(
+            store
+                .edit_prompt(uno.id, &uno.fingerprint(), "uno", "", "  ")
+                .is_err()
+        );
+        assert!(
+            store
+                .edit_prompt(uno.id, &uno.fingerprint(), "two", "", "y")
+                .is_err()
+        );
+        assert_eq!(store.prompt("uno").unwrap().text, "new");
+        // Keeping the name is not "taken"; the source path stays.
+        assert_eq!(
+            store
+                .edit_prompt(uno.id, &uno.fingerprint(), "uno", "e", "again")
+                .unwrap(),
+            Edit::Done
+        );
+        let uno = store.prompt("uno").unwrap();
+        assert_eq!(
+            store
+                .delete_prompt_checked(uno.id, &uno.fingerprint())
+                .unwrap(),
+            Edit::Done
+        );
+        assert_eq!(
+            store
+                .delete_prompt_checked(uno.id, &uno.fingerprint())
+                .unwrap(),
+            Edit::Gone
+        );
+        assert_eq!(
+            store
+                .edit_prompt(uno.id, &uno.fingerprint(), "uno", "", "t")
+                .unwrap(),
+            Edit::Gone
+        );
+    }
+
+    #[test]
     fn prompts_move_one_place_and_stop_at_the_ends() {
         let dir = Scratch::new("prompts-move");
         let mut store = open(&dir);
@@ -895,8 +1170,101 @@ mod tests {
             "limited to {} model calls",
             crate::agent::MAX_CALLS_PER_MESSAGE
         )));
-        // Every call carries it: keep it under about 600 tokens.
-        assert!(estimated_tokens(BUILTIN_PROMPT.chars().count()) < 600);
+        // Every call carries it: keep it under about 860 tokens (it was 600 before the context tools, 720 before the library, 800 before task and steps).
+        assert!(estimated_tokens(BUILTIN_PROMPT.chars().count()) < 860);
+    }
+
+    #[test]
+    fn schema_16_rewrites_unedited_prompts_to_name_the_context_tools_and_leaves_edited_ones() {
+        let dir = Scratch::new("prompt-v16");
+        let path = dir.path().join("harness.db");
+        drop(Store::open(&path).unwrap());
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let set = |name: &str, text: &str| {
+                conn.execute(
+                    "INSERT INTO prompts (name, description, text, enabled, position, created_at, updated_at) \
+                     VALUES (?1, '', ?2, 0, 50, 0, 0) \
+                     ON CONFLICT(name) DO UPDATE SET text = excluded.text",
+                    [name, text],
+                )
+                .unwrap();
+            };
+            set(BASE_NAME, BUILTIN_PROMPT_V15);
+            set(SUBAGENT_NAME, SUBAGENT_PROMPT_V15);
+            set(SUBAGENT_CODER_NAME, "My own coder rules.");
+            conn.pragma_update(None, "user_version", 15).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.prompt(BASE_NAME).unwrap().text, BUILTIN_PROMPT);
+        assert_eq!(store.prompt(SUBAGENT_NAME).unwrap().text, SUBAGENT_PROMPT);
+        assert_eq!(
+            store.prompt(SUBAGENT_CODER_NAME).unwrap().text,
+            "My own coder rules."
+        );
+        assert_ne!(BUILTIN_PROMPT_V15, BUILTIN_PROMPT);
+        assert!(BUILTIN_PROMPT.contains("- context(name)"));
+        assert!(BUILTIN_PROMPT.contains("- context_propose("));
+        for text in [SUBAGENT_PROMPT, SUBAGENT_CODER_PROMPT] {
+            assert!(text.contains("- context(name)"));
+            assert!(
+                !text.contains("context_propose"),
+                "a subagent cannot propose"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_19_names_the_library_tools_in_an_unedited_base_only() {
+        for (tag, base, expected) in [
+            ("prompt-v19", BUILTIN_PROMPT_V16, BUILTIN_PROMPT),
+            ("prompt-v19-edited", "My own rules.", "My own rules."),
+        ] {
+            let dir = Scratch::new(tag);
+            let path = dir.path().join("harness.db");
+            drop(Store::open(&path).unwrap());
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute(
+                    "UPDATE prompts SET text = ?1 WHERE name = ?2",
+                    [base, BASE_NAME],
+                )
+                .unwrap();
+                conn.pragma_update(None, "user_version", 18).unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.prompt(BASE_NAME).unwrap().text, expected);
+        }
+        assert_ne!(BUILTIN_PROMPT_V16, BUILTIN_PROMPT);
+        assert!(BUILTIN_PROMPT.contains("- library(") && BUILTIN_PROMPT.contains("- profile("));
+        for text in [SUBAGENT_PROMPT, SUBAGENT_CODER_PROMPT] {
+            assert!(!text.contains("library("), "a subagent has no library tool");
+        }
+    }
+
+    #[test]
+    fn schema_20_names_task_and_steps_in_an_unedited_base_only() {
+        for (tag, base, expected) in [
+            ("prompt-v20", BUILTIN_PROMPT_V17, BUILTIN_PROMPT),
+            ("prompt-v20-edited", "My own rules.", "My own rules."),
+        ] {
+            let dir = Scratch::new(tag);
+            let path = dir.path().join("harness.db");
+            drop(Store::open(&path).unwrap());
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute(
+                    "UPDATE prompts SET text = ?1 WHERE name = ?2",
+                    [base, BASE_NAME],
+                )
+                .unwrap();
+                conn.pragma_update(None, "user_version", 19).unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.prompt(BASE_NAME).unwrap().text, expected);
+        }
+        assert_ne!(BUILTIN_PROMPT_V17, BUILTIN_PROMPT);
+        assert!(BUILTIN_PROMPT.contains("- task(") && BUILTIN_PROMPT.contains("- steps("));
     }
 
     #[test]
@@ -929,7 +1297,33 @@ mod tests {
             DEFAULT_TIMEOUT,
             Box::new(Never),
         )));
-        assert_eq!(tools.len(), 6);
+        tools.extend(crate::tools::glossary_tools(
+            dir.path().join("harness.db"),
+            "/p",
+            std::rc::Rc::new(Never),
+            crate::tools::shared_mode(crate::tools::Mode::Manual),
+        ));
+        // The context tool is offered only once an entry exists.
+        Store::open(&dir.path().join("harness.db"))
+            .unwrap()
+            .set_context("/p", "one", "rule", "x", "y", None)
+            .unwrap();
+        tools.extend(crate::tools::context_tools(
+            dir.path().join("harness.db"),
+            "/p",
+            std::rc::Rc::new(Never),
+            crate::tools::shared_mode(crate::tools::Mode::Manual),
+        ));
+        tools.extend(crate::tools::library_tools(
+            dir.path().join("harness.db"),
+            std::rc::Rc::new(Never),
+            crate::tools::shared_mode(crate::tools::Mode::Manual),
+        ));
+        tools.push(Box::new(crate::tools::TaskTool::new(
+            crate::tools::ShellTasks::new(),
+        )));
+        tools.push(Box::new(crate::tools::StepsTool::new()));
+        assert_eq!(tools.len(), 14);
         for tool in &tools {
             let name = &tool.spec().name;
             assert!(
@@ -957,6 +1351,8 @@ mod tests {
                 router: &kernel::RouterOptions::default(),
                 system_prompt: "p",
                 cwd: "/w",
+                profile: None,
+                parent_id: None,
             })
             .unwrap()
     }

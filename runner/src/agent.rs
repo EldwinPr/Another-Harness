@@ -6,10 +6,9 @@
 //! or the call cap is hit. Because history is never rewritten, each request
 //! starts with exactly the messages of the one before it.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kernel::{Config, Message, RouterOptions, ToolCall, assemble};
@@ -23,6 +22,7 @@ use crate::store::{
     Store,
 };
 use crate::store_models::MergeReport;
+use crate::store_profiles::Start;
 use crate::store_prompts::{
     ACTIVE_MARK, Assembled, ChatPrompts, NONE_ACTIVE, PROMPT_WRITER_GUIDE, Prompt, PromptType,
     SUMMARY_MARK, SkillState, assemble as assemble_prompts, compose_once, compose_persistent,
@@ -62,7 +62,7 @@ impl PromptInfo {
             estimated_tokens(self.chars)
         );
         if self.fallback {
-            format!("the built-in text, no prompt is switched on; {size}")
+            format!("the built-in text, the profile has no system prompt; {size}")
         } else {
             format!(
                 "{} on ({}); {size}",
@@ -137,7 +137,13 @@ pub trait Observer {
     fn tool_result(&mut self, _call: &ToolCall, _result: &str) {}
     /// Something went wrong that did not stop the chat (the turn log could not be written).
     fn warning(&mut self, _text: &str) {}
+    /// Something about a background subagent (issue 35): it finished, or its answer was added.
+    fn subagent_note(&mut self, _text: &str) {}
 }
+
+/// How to build the tools of a subagent (issue 33): called once per delegation.
+pub type SubagentTools =
+    Arc<dyn Fn(&crate::subagent::Kit, &Cancel) -> Vec<Box<dyn Tool>> + Send + Sync>;
 
 /// An observer that ignores everything.
 pub struct NoObserver;
@@ -149,7 +155,7 @@ pub struct StoreContext {
     pub cwd: String,
 }
 
-/// Which provider the next request goes to. `name` is the profile or saved provider it came
+/// Which provider the next request goes to. `name` is the provider file or saved provider it came
 /// from (the router's host when launched without one).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Target {
@@ -216,7 +222,8 @@ struct Stored {
 pub struct Agent {
     config: Config,
     history: Vec<Message>,
-    provider: Box<dyn Provider>,
+    /// Shared (`Arc`) so a subagent, also one on another thread, can use the same provider.
+    provider: Arc<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
     log: TurnLog,
     stored: Option<Stored>,
@@ -225,20 +232,55 @@ pub struct Agent {
     catalog: Option<Catalog>,
     /// The skills and personality of the chat in use (issue 14).
     chat_prompts: ChatPrompts,
+    /// The profile the chat in use began under (issue 31), when it began under one.
+    profile: Option<String>,
     /// How the file tools are approved; shared with those tools (issue 16).
     approval: SharedMode,
     /// What the chat in use has cost so far (issue 17).
     usage: ChatUsage,
     cancel: Cancel,
+    /// Builds a subagent's tools; `None` means the chat cannot delegate (issue 33).
+    subagent_tools: Option<SubagentTools>,
+    /// The subagents started with `/subagent` (issue 35).
+    jobs: crate::jobs::Jobs,
+    /// Commands running in the background (issue 42); the same list the `bash` and `task` tools use.
+    shells: crate::tools::ShellTasks,
+    /// How many times `delegate` has been used for the message being answered.
+    delegations: u32,
+    /// Messages the program sent by itself since the owner last typed (issue 35).
+    auto_wakes: u32,
+    /// A subagent's agent: its `Cancel` is its own and is never cleared, so a stop that came
+    /// before its message began still counts.
+    keeps_cancel: bool,
+    /// The chat that delegated to this one, when this agent is a subagent.
+    parent_id: Option<i64>,
 }
 
 /// Said when the personality changes in a chat that already has replies.
+/// Messages the program may send by itself in a row, when subagents finish (issue 35).
+pub const MAX_AUTO_WAKES: u32 = 3;
+
+/// The message sent when the program wakes the model; the answers of the subagents come ahead of it.
+/// Added to every request while plan mode is on (issue 42). It is not kept in the chat.
+pub const PLAN_TEXT: &str = "Plan mode is on. Nothing may be changed: file changes, commands that are not looking commands, and saving to the glossary, context, library or profiles are all refused. Look at what you need (read_file, ls, grep, find, git log), then answer with a plan: the goal in one line; numbered steps, each naming the files it touches; and what you are unsure of. Do not start the work.";
+
+pub const WAKE_TEXT: &str = "A subagent you started has finished; its answer is in the message above. Carry on with what the user asked: use it, or tell the user what it found. If nothing more is needed, say so briefly.";
+
 pub const PERSONALITY_WARNING: &str = "changing the personality in the middle of a chat can be troublesome: earlier replies keep the old style and the model may keep following them. /new starts a clean chat.";
 
 impl Agent {
     pub fn new(
         model: impl Into<String>,
         provider: Box<dyn Provider>,
+        tools: Vec<Box<dyn Tool>>,
+        log: TurnLog,
+    ) -> Self {
+        Self::shared(model, Arc::from(provider), tools, log)
+    }
+
+    fn shared(
+        model: impl Into<String>,
+        provider: Arc<dyn Provider>,
         tools: Vec<Box<dyn Tool>>,
         log: TurnLog,
     ) -> Self {
@@ -258,10 +300,54 @@ impl Agent {
             target: Target::default(),
             catalog: None,
             chat_prompts: ChatPrompts::default(),
+            profile: None,
             approval: shared_mode(Mode::Manual),
             usage: ChatUsage::default(),
             cancel: Cancel::new(),
+            subagent_tools: None,
+            jobs: crate::jobs::Jobs::default(),
+            shells: crate::tools::ShellTasks::new(),
+            delegations: 0,
+            auto_wakes: 0,
+            keeps_cancel: false,
+            parent_id: None,
         }
+    }
+
+    /// Lets the model delegate tasks (issue 33): adds the `delegate` tool, and `tools` builds the
+    /// tools of each subagent. Call before the first message, so the tool list stays the same
+    /// for the whole chat.
+    /// The list of background commands the tools of this agent use, so `/tasks` shows them.
+    pub fn with_shells(mut self, shells: crate::tools::ShellTasks) -> Self {
+        self.shells = shells;
+        self
+    }
+
+    /// Plan mode (issue 42): the model may only look and write a plan.
+    pub fn planning(&self) -> bool {
+        self.approval.planning()
+    }
+
+    pub fn set_planning(&self, on: bool) {
+        self.approval.set_planning(on);
+    }
+
+    /// What is running in the background now, for the list under the box.
+    pub fn task_view(&self) -> crate::repl::TaskView {
+        crate::repl::TaskView {
+            shells: self.shells.clone(),
+            runs: self.jobs.views(),
+        }
+    }
+
+    pub fn shells(&self) -> &crate::tools::ShellTasks {
+        &self.shells
+    }
+
+    pub fn with_subagents(mut self, tools: SubagentTools) -> Self {
+        self.config.tools.push(crate::subagent::delegate_spec());
+        self.subagent_tools = Some(tools);
+        self
     }
 
     /// What the chat in use has cost so far, from the replies' `usage`.
@@ -356,6 +442,7 @@ impl Agent {
     /// message whose save fails fails. The turn log then becomes a secondary record, and a
     /// failure to write it is only a warning.
     pub fn with_store(mut self, store: Store, context: StoreContext) -> Self {
+        let store = store.with_project(context.cwd.clone());
         self.stored = Some(Stored {
             store,
             session_id: None,
@@ -371,6 +458,7 @@ impl Agent {
     /// after [`Agent::with_store`].
     pub fn restore(&mut self, resumed: Resumed) {
         let resumed_id = resumed.info.id;
+        self.profile = resumed.info.profile.clone();
         if let Some(stored) = &self.stored {
             self.chat_prompts = stored
                 .store
@@ -397,12 +485,42 @@ impl Agent {
         crate::store::router_json(&self.config.router)
     }
 
+    /// What a chat started now would get, without changing anything: the system prompt of the
+    /// selected profile, and its skills and personality (issue 31).
+    fn fresh_start(&self) -> Result<Start, String> {
+        match &self.stored {
+            Some(stored) => stored
+                .store
+                .start_of_selected_profile()
+                .map_err(|e| e.to_string()),
+            None => Ok(Start {
+                assembled: assemble_prompts(&[]),
+                profile: String::new(),
+                chat: ChatPrompts::default(),
+            }),
+        }
+    }
+
     /// What a chat started now would get as its system prompt, without changing anything.
     fn fresh_prompt(&self) -> Result<Assembled, String> {
-        match &self.stored {
-            Some(stored) => stored.store.assembled_prompt().map_err(|e| e.to_string()),
-            None => Ok(assemble_prompts(&[])),
-        }
+        self.fresh_start().map(|start| start.assembled)
+    }
+
+    /// The name of the profile new chats start under.
+    pub fn selected_profile(&self) -> Option<String> {
+        self.stored
+            .as_ref()
+            .and_then(|s| s.store.selected_profile().ok())
+    }
+
+    /// The profile the chat in use began under, if it began under one.
+    pub fn chat_profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    fn begin_under(&mut self, start: &Start) {
+        self.chat_prompts = start.chat.clone();
+        self.profile = (!start.profile.is_empty()).then(|| start.profile.clone());
     }
 
     /// Sets the system prompt from the prompts switched on. Only before the first message of a
@@ -413,25 +531,25 @@ impl Agent {
                 "a chat keeps the prompt it started with; /new starts a new chat".to_owned(),
             );
         }
-        let assembled = self.fresh_prompt()?;
-        self.history[0] = Message::System(assembled.text.clone());
-        self.chat_prompts = ChatPrompts::default();
-        Ok(PromptInfo::of(&assembled))
+        let start = self.fresh_start()?;
+        self.history[0] = Message::System(start.assembled.text.clone());
+        self.begin_under(&start);
+        Ok(PromptInfo::of(&start.assembled))
     }
 
     /// Starts a new chat: the history is dropped (the old chat stays saved) and the system prompt
     /// is assembled again from the prompts switched on now. The next message starts a new saved chat.
     pub fn new_chat(&mut self) -> Result<PromptInfo, String> {
-        let assembled = self.fresh_prompt()?;
-        self.history = vec![Message::System(assembled.text.clone())];
-        self.chat_prompts = ChatPrompts::default();
+        let start = self.fresh_start()?;
+        self.history = vec![Message::System(start.assembled.text.clone())];
+        self.begin_under(&start);
         self.usage = ChatUsage::default();
         if let Some(stored) = &mut self.stored {
             stored.session_id = None;
             stored.saved = 1;
             stored.turn = 0;
         }
-        Ok(PromptInfo::of(&assembled))
+        Ok(PromptInfo::of(&start.assembled))
     }
 
     /// The skills and personality of the chat in use.
@@ -751,6 +869,34 @@ impl Agent {
         })
     }
 
+    /// What the model is given in this chat: its tools, `delegate` among them (issue 38).
+    pub fn tool_infos(&self) -> Vec<crate::tool_list::ToolInfo> {
+        crate::tool_list::infos(&self.config.tools)
+    }
+
+    /// What a reader (`coder` false) or a coder subagent would be given; empty when the chat
+    /// cannot delegate.
+    pub fn subagent_tool_infos(&self, coder: bool) -> Vec<crate::tool_list::ToolInfo> {
+        let Some(build) = &self.subagent_tools else {
+            return Vec::new();
+        };
+        let kit = crate::subagent::Kit {
+            coder,
+            always: Vec::new(),
+        };
+        let tools = build(&kit, &Cancel::new());
+        let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
+        crate::tool_list::infos(&specs)
+    }
+
+    /// The project this chat works in: the working directory it was started in (issue 37).
+    pub fn project(&self) -> String {
+        self.stored
+            .as_ref()
+            .map(|s| s.context.cwd.clone())
+            .unwrap_or_default()
+    }
+
     /// The id of the chat being saved into, once its first message has been saved.
     pub fn current_session(&self) -> Option<i64> {
         self.stored.as_ref().and_then(|s| s.session_id)
@@ -887,11 +1033,41 @@ impl Agent {
             Ok(both) => both,
             Err(why) => return Outcome::Failed(format!("could not read the skills: {why}")),
         };
-        self.cancel.reset();
+        let extra = if self.approval.planning() {
+            Some(match extra {
+                Some(skills) => format!("{skills}\n\n{PLAN_TEXT}"),
+                None => PLAN_TEXT.to_owned(),
+            })
+        } else {
+            extra
+        };
+        if !self.keeps_cancel {
+            self.cancel.reset();
+        }
+        self.delegations = 0;
+        // The answers of background subagents that ended are added ahead of this message (issue 35).
+        let deliveries = self.jobs.take_finished(self.current_session());
+        let delivery = (!deliveries.is_empty()).then(|| crate::jobs::delivery_text(&deliveries));
+        for d in &deliveries {
+            observer.subagent_note(&format!(
+                "subagent #{} {}: answer added to the chat ({} characters)",
+                d.n,
+                d.profile,
+                d.text.chars().count()
+            ));
+        }
         let block = self.block_to_add(kept.as_deref());
-        let outcome = self.send_turn(text, block, extra.as_deref(), observer);
-        if !matches!(outcome, Outcome::Failed(_) | Outcome::Cancelled) {
+        let outcome = self.send_turn(text, delivery, block, extra.as_deref(), observer);
+        if matches!(outcome, Outcome::Failed(_) | Outcome::Cancelled) {
+            // They go with the next message that does go through.
+            let numbers: Vec<u32> = deliveries.iter().map(|d| d.n).collect();
+            self.jobs.undeliver(&numbers);
+        } else {
             self.chat_prompts.once.clear();
+            for d in &deliveries {
+                self.usage
+                    .add_subagent(d.prompt_tokens, d.completion_tokens);
+            }
         }
         outcome
     }
@@ -899,6 +1075,7 @@ impl Agent {
     fn send_turn(
         &mut self,
         text: &str,
+        delivery: Option<String>,
         block: Option<String>,
         extra: Option<&str>,
         observer: &mut dyn Observer,
@@ -907,6 +1084,12 @@ impl Agent {
         // leaves no half-finished exchange in memory (the log still has it, and
         // the database keeps it marked as failed).
         let rollback = self.history.len();
+        // How much of the history was saved before this message. After a compaction the summary
+        // is in the history but not yet saved, so going back must not count it as saved.
+        let saved = self.stored.as_ref().map_or(rollback, |s| s.saved);
+        if let Some(delivery) = delivery {
+            self.history.push(Message::User(delivery));
+        }
         if let Some(block) = block {
             self.history.push(Message::User(block));
         }
@@ -917,6 +1100,12 @@ impl Agent {
 
         let mut guard = LoopGuard::default();
         for round in 1..=self.max_calls {
+            for line in self.jobs.take_announcements() {
+                observer.subagent_note(&line);
+            }
+            for line in self.shells.take_announcements() {
+                observer.subagent_note(&line);
+            }
             // Old file text is left out of what is sent (the history itself stays whole).
             let shortened = crate::trim::trimmed(&self.history);
             let sent: &[Message] = shortened.as_deref().unwrap_or(&self.history);
@@ -932,7 +1121,7 @@ impl Agent {
             if self.cancel.is_cancelled() {
                 // The log keeps what was asked; nothing of this call is saved or used.
                 let _ = self.log.record_timed(&request, &result, None);
-                self.abandon(rollback);
+                self.abandon(rollback, saved);
                 return Outcome::Cancelled;
             }
             // A failed call, or a reply that is not an assistant message, fails the turn.
@@ -944,7 +1133,7 @@ impl Agent {
             let store_ms = match self.save(&request, &result, turn_failed) {
                 Ok(ms) => ms,
                 Err(why) => {
-                    self.abandon(rollback);
+                    self.abandon(rollback, saved);
                     return Outcome::Failed(format!("could not save the chat: {why}"));
                 }
             };
@@ -959,7 +1148,7 @@ impl Agent {
             let reply = match result {
                 Ok(reply) => reply,
                 Err(error) => {
-                    self.rewind(rollback);
+                    self.rewind(rollback, saved);
                     return Outcome::Failed(describe(&error));
                 }
             };
@@ -969,7 +1158,7 @@ impl Agent {
                 tool_calls,
             } = &reply.message
             else {
-                self.rewind(rollback);
+                self.rewind(rollback, saved);
                 return Outcome::Failed("the reply was not an assistant message".to_owned());
             };
             let (content, tool_calls) = (content.clone(), tool_calls.clone());
@@ -990,13 +1179,18 @@ impl Agent {
             let mut stop = false;
             for call in &tool_calls {
                 if self.cancel.is_cancelled() {
-                    self.abandon(rollback);
+                    self.abandon(rollback, saved);
                     return Outcome::Cancelled;
                 }
                 observer.tool_call(call);
-                let mut output = self.run_tool(call);
+                let mut output =
+                    if call.name == crate::subagent::DELEGATE && self.subagent_tools.is_some() {
+                        self.delegate(call)
+                    } else {
+                        self.run_tool(call)
+                    };
                 if self.cancel.is_cancelled() {
-                    self.abandon(rollback);
+                    self.abandon(rollback, saved);
                     return Outcome::Cancelled;
                 }
                 match guard.record(call, crate::toolview::failed(&output)) {
@@ -1019,7 +1213,7 @@ impl Agent {
             }
             if stop {
                 if let Err(why) = self.flush() {
-                    self.abandon(rollback);
+                    self.abandon(rollback, saved);
                     return Outcome::Failed(format!("could not save the chat: {why}"));
                 }
                 return Outcome::LoopStopped { calls: round };
@@ -1028,7 +1222,7 @@ impl Agent {
         // The last call's tool results are not carried by any further call, so save them now:
         // a chat that stopped on a tool call with no result could not be resumed.
         if let Err(why) = self.flush() {
-            self.abandon(rollback);
+            self.abandon(rollback, saved);
             return Outcome::Failed(format!("could not save the chat: {why}"));
         }
         Outcome::CapReached {
@@ -1044,34 +1238,19 @@ impl Agent {
         result: &Result<Reply, Box<ProviderError>>,
         turn_failed: bool,
     ) -> Result<Option<u64>, String> {
+        let started = Instant::now();
+        match &self.stored {
+            None => return Ok(None),
+            Some(stored) if stored.session_id.is_none() => {
+                self.ensure_session()?;
+            }
+            Some(_) => {}
+        }
         let Some(stored) = &mut self.stored else {
             return Ok(None);
         };
-        let started = Instant::now();
-        let session_id = match stored.session_id {
-            Some(id) => id,
-            None => {
-                let Some(Message::System(prompt)) = self.history.first() else {
-                    return Err("the history does not start with the system message".to_owned());
-                };
-                let id = stored
-                    .store
-                    .create_session(&NewSession {
-                        kind: Kind::Worker,
-                        model: &self.config.model,
-                        base_url: &self.target.base_url,
-                        router: &self.config.router,
-                        system_prompt: prompt,
-                        cwd: &stored.context.cwd,
-                    })
-                    .map_err(|e| e.to_string())?;
-                stored.session_id = Some(id);
-                stored
-                    .store
-                    .set_chat_prompts(id, &self.chat_prompts)
-                    .map_err(|e| e.to_string())?;
-                id
-            }
+        let Some(session_id) = stored.session_id else {
+            return Ok(None);
         };
         let reply = match result {
             Ok(r) if !turn_failed => Some(&r.message),
@@ -1119,17 +1298,17 @@ impl Agent {
     }
 
     /// Goes back to before the user's message. The database already has the turn marked failed.
-    fn rewind(&mut self, rollback: usize) {
+    fn rewind(&mut self, rollback: usize, saved: usize) {
         self.history.truncate(rollback);
         if let Some(stored) = &mut self.stored {
-            stored.saved = rollback;
+            stored.saved = saved.min(rollback);
         }
     }
 
     /// Like [`Agent::rewind`] for when the save itself failed: earlier calls of this turn may
     /// be in the database as good, so mark them failed too, as far as the database allows.
-    fn abandon(&mut self, rollback: usize) {
-        self.rewind(rollback);
+    fn abandon(&mut self, rollback: usize, saved: usize) {
+        self.rewind(rollback, saved);
         if let Some(stored) = &mut self.stored
             && let Some(session_id) = stored.session_id
         {
@@ -1139,9 +1318,9 @@ impl Agent {
         }
     }
 
-    /// Every provider that can be switched to: the saved ones, then the profile files that are
-    /// not saved yet, by name. A profile file whose name is saved or was imported before is not
-    /// listed. A profile that cannot be read is listed with the reason.
+    /// Every provider that can be switched to: the saved ones, then the provider files that are
+    /// not saved yet, by name. A provider file whose name is saved or was imported before is not
+    /// listed. A provider file that cannot be read is listed with the reason.
     pub fn providers(&self) -> Result<Vec<Listed>, String> {
         let catalog = self.catalog.as_ref().ok_or(NO_SWITCHING)?;
         let mut all = Vec::new();
@@ -1158,13 +1337,13 @@ impl Agent {
             hidden.extend(
                 stored
                     .store
-                    .imported_profiles()
+                    .imported_provider_files()
                     .map_err(|e| e.to_string())?,
             );
         }
-        if let Some(dir) = &catalog.profile_dir {
+        if let Some(dir) = &catalog.provider_dir {
             all.extend(
-                providers::read_profiles(dir)
+                providers::read_provider_files(dir)
                     .into_iter()
                     .filter(|l| !hidden.contains(&l.name)),
             );
@@ -1173,18 +1352,18 @@ impl Agent {
         Ok(all)
     }
 
-    /// Copies every readable profile file that has not been imported into the database (key
+    /// Copies every readable provider file that has not been imported into the database (key
     /// included) and remembers its name, so deleting the provider later is not undone. The files
     /// are not touched. Returns how many were copied.
-    pub fn import_profiles(&mut self) -> Result<usize, String> {
-        let dir = match self.catalog.as_ref().and_then(|c| c.profile_dir.clone()) {
+    pub fn import_provider_files(&mut self) -> Result<usize, String> {
+        let dir = match self.catalog.as_ref().and_then(|c| c.provider_dir.clone()) {
             Some(dir) => dir,
             None => return Ok(0),
         };
         let stored = self.stored.as_mut().ok_or(NOT_SAVING)?;
         let done = stored
             .store
-            .imported_profiles()
+            .imported_provider_files()
             .map_err(|e| e.to_string())?;
         let saved: Vec<String> = stored
             .store
@@ -1194,7 +1373,7 @@ impl Agent {
             .map(|d| d.name)
             .collect();
         let (mut copied, mut seen) = (0, Vec::new());
-        for entry in providers::read_profiles(&dir) {
+        for entry in providers::read_provider_files(&dir) {
             if done.contains(&entry.name) {
                 continue;
             }
@@ -1238,6 +1417,13 @@ impl Agent {
         self.store_mut()?
             .merge_fetched(name, &ids)
             .map_err(|e| e.to_string())
+    }
+
+    /// Asks a provider that is not saved yet which models it offers (so one can be chosen while
+    /// adding it). Nothing is stored.
+    pub fn models_offered_by(&self, def: &ProviderDef) -> Result<Vec<String>, String> {
+        let catalog = self.catalog.as_ref().ok_or(NO_SWITCHING)?;
+        (catalog.build)(def).models()
     }
 
     /// Sends one tiny request to a provider with a model and says how it went. Nothing is saved
@@ -1318,7 +1504,7 @@ impl Agent {
         Ok(warnings)
     }
 
-    /// Switches to a profile or saved provider by name, taking its model and pinning too. History
+    /// Switches to a provider file or saved provider by name, taking its model and pinning too. History
     /// stays. Nothing changes when the name is unknown or its definition cannot be read.
     pub fn switch_provider(&mut self, name: &str) -> Result<Vec<String>, String> {
         self.switch_provider_with(name, None)
@@ -1370,7 +1556,7 @@ impl Agent {
     /// Makes `def` the provider for the next request.
     fn select(&mut self, def: ProviderDef) -> Result<(), String> {
         let catalog = self.catalog.as_ref().ok_or(NO_SWITCHING)?;
-        self.provider = (catalog.build)(&def);
+        self.provider = Arc::from((catalog.build)(&def));
         self.config.model = def.model;
         self.config.router = def.router;
         self.target = Target {
@@ -1411,7 +1597,7 @@ impl Agent {
         self.select(def).err()
     }
 
-    /// Saves a new provider. The name must not belong to a profile or another saved provider.
+    /// Saves a new provider. The name must not belong to a provider file or another saved provider.
     pub fn add_provider(&mut self, def: ProviderDef) -> Result<(), String> {
         providers::check_name(&def.name)?;
         providers::check_base_url(&def.base_url)?;
@@ -1426,15 +1612,15 @@ impl Agent {
         stored.store.add_provider(&def).map_err(|e| e.to_string())
     }
 
-    /// Deletes a saved provider (profile files are never touched). The one in use stays in use
+    /// Deletes a saved provider (provider files are never touched). The one in use stays in use
     /// until you switch.
     pub fn remove_provider(&mut self, name: &str) -> Result<(), String> {
         let listed = self.providers()?;
         match listed.iter().find(|l| l.name == name) {
             None => return Err(format!("no provider named {name}")),
-            Some(l) if l.source == Source::Profile => {
+            Some(l) if l.source == Source::File => {
                 return Err(format!(
-                    "{name} is a profile file; delete the file to remove it"
+                    "{name} is a provider file; delete the file to remove it"
                 ));
             }
             Some(_) => {}
@@ -1455,11 +1641,381 @@ impl Agent {
         Ok(models)
     }
 
+    /// Runs `delegate` (issues 33, 35): starts a subagent in a chat of its own on a thread and
+    /// returns at once. Its answer is added to the chat at the owner's next message after it has
+    /// finished, so the owner can keep chatting while it works.
+    fn delegate(&mut self, call: &ToolCall) -> String {
+        use crate::subagent::{self, MAX_PER_MESSAGE};
+        let args = match subagent::parse(&call.arguments) {
+            Ok(args) => args,
+            Err(why) => return why,
+        };
+        if self.delegations >= MAX_PER_MESSAGE {
+            return format!(
+                "error: at most {MAX_PER_MESSAGE} delegations per message; do the rest yourself"
+            );
+        }
+        match self.launch(&args.profile, &args.task) {
+            Ok(run) => {
+                self.delegations += 1;
+                let kind = if run.coder { "coder" } else { "reader" };
+                format!(
+                    "subagent #{} ({}, {kind}) is running in the background. Its answer will be added to the chat when the user's next message comes after it has finished. Tell the user it is running and end your turn; do not wait or start it again.",
+                    run.n, run.profile
+                )
+            }
+            Err(why) if why.starts_with("error:") => why,
+            Err(why) => format!("error: {why}"),
+        }
+    }
+
+    /// Starts a subagent on a thread of its own (issues 33, 35); the jobs refuse a start that is
+    /// not allowed (too many running, a second one that changes files).
+    fn launch(&mut self, profile: &str, task: &str) -> Result<StartedRun, String> {
+        let cancel = Cancel::new();
+        let spec = self.child_spec(profile, task, cancel.clone())?;
+        let (coder, name, parent) = (spec.kit.coder, spec.profile.clone(), spec.parent_id);
+        let n = self
+            .jobs
+            .start(&name, coder, task, parent, cancel, move |observer| {
+                run_child(spec, observer)
+            })?;
+        Ok(StartedRun {
+            n,
+            profile: name,
+            coder,
+        })
+    }
+
+    /// Everything a subagent needs to run, as plain data, so that it can run on this thread or
+    /// on another (issues 33 and 35). Checks the profile; says what is wrong in the words the model
+    /// or the owner will see.
+    fn child_spec(
+        &mut self,
+        profile: &str,
+        task: &str,
+        cancel: Cancel,
+    ) -> Result<ChildSpec, String> {
+        let Some(build) = self.subagent_tools.clone() else {
+            return Err("error: this chat cannot start subagents".to_owned());
+        };
+        let Some(stored) = &self.stored else {
+            return Err(
+                "error: subagents need the saved-chat database, and this chat has none".to_owned(),
+            );
+        };
+        let profiles = stored
+            .store
+            .list_profiles()
+            .map_err(|e| format!("error: cannot read the profiles: {e}"))?;
+        let Some(profile) = profiles
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(profile.trim()))
+        else {
+            let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+            return Err(format!(
+                "error: no profile named {}; the profiles are: {}",
+                profile.trim(),
+                names.join(", ")
+            ));
+        };
+        // A subagent can change files only when the owner has said file changes need no question.
+        let kit = crate::subagent::Kit {
+            coder: self.approval.mode() == Mode::Auto && !self.approval.planning(),
+            always: self.approval.always_pairs(),
+        };
+        let mut start = stored
+            .store
+            .start_of_subagent(&profile.name, kit.coder)
+            .map_err(|e| format!("error: cannot start the subagent: {e}"))?;
+        // The shapes (and whatever else is marked preload) the owner has said, issue 37.
+        let (preloaded, context_left_out) = stored
+            .store
+            .preload_context(&stored.context.cwd)
+            .map_err(|e| format!("error: cannot read the context entries: {e}"))?;
+        if !preloaded.is_empty() {
+            start
+                .assembled
+                .text
+                .push_str("\n\nBackground from the project (the owner's words):");
+            for entry in &preloaded {
+                start.assembled.text.push_str(&format!(
+                    "\n\n## {} ({})\n{}",
+                    entry.name, entry.kind, entry.text
+                ));
+            }
+        }
+        let db = stored
+            .store
+            .path()
+            .ok_or("error: subagents need a database file")?;
+        let log_dir = self
+            .log
+            .path()
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_owned();
+        let cwd = stored.context.cwd.clone();
+        let parent_id = self.ensure_session()?;
+        Ok(ChildSpec {
+            profile: profile.name.clone(),
+            task: task.to_owned(),
+            model: self.config.model.clone(),
+            router: self.config.router.clone(),
+            target: self.target.clone(),
+            provider: Arc::clone(&self.provider),
+            build,
+            kit,
+            start,
+            context_left_out,
+            db,
+            cwd,
+            log_dir,
+            parent_id: Some(parent_id),
+            cancel,
+        })
+    }
+
+    /// The id of the chat being saved into; the chat row is made now when the first message has
+    /// not been saved yet, so that a subagent started before it has a parent to point at.
+    fn ensure_session(&mut self) -> Result<i64, String> {
+        let Some(stored) = &mut self.stored else {
+            return Err("error: subagents need the saved-chat database".to_owned());
+        };
+        if let Some(id) = stored.session_id {
+            return Ok(id);
+        }
+        let Some(Message::System(prompt)) = self.history.first() else {
+            return Err("the history does not start with the system message".to_owned());
+        };
+        let id = stored
+            .store
+            .create_session(&NewSession {
+                kind: Kind::Worker,
+                model: &self.config.model,
+                base_url: &self.target.base_url,
+                router: &self.config.router,
+                system_prompt: prompt,
+                cwd: &stored.context.cwd,
+                profile: self.profile.as_deref(),
+                parent_id: self.parent_id,
+            })
+            .map_err(|e| e.to_string())?;
+        stored.session_id = Some(id);
+        stored
+            .store
+            .set_chat_prompts(id, &self.chat_prompts)
+            .map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// `/subagent [profile] task` (issue 35): starts a subagent on a thread of its own and returns
+    /// at once. The first word is the profile when it names one; otherwise the whole text is the task
+    /// and the selected profile is used.
+    pub fn start_subagent(&mut self, text: &str) -> Result<StartedRun, String> {
+        if !self.ready() {
+            return Err(CHOOSE_A_PROVIDER.to_owned());
+        }
+        let text = text.trim();
+        let names: Vec<String> = match &self.stored {
+            Some(stored) => stored
+                .store
+                .list_profiles()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|p| p.name)
+                .collect(),
+            None => return Err(NOT_SAVING.to_owned()),
+        };
+        let (first, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        let (profile, task) = match names.iter().find(|n| n.eq_ignore_ascii_case(first)) {
+            Some(name) => (name.clone(), rest.trim()),
+            None => (
+                self.selected_profile()
+                    .unwrap_or_else(|| "default".to_owned()),
+                text,
+            ),
+        };
+        if task.is_empty() {
+            return Err("usage: /subagent [profile] <task>".to_owned());
+        }
+        self.launch(&profile, task)
+    }
+
+    /// The runs of this program run, oldest first.
+    pub fn subagent_runs(&self) -> Vec<crate::jobs::RunInfo> {
+        self.jobs.list()
+    }
+
+    /// Whether the program should send a message by itself now: a subagent of this chat finished
+    /// and its answer is not in the chat yet. At most [`MAX_AUTO_WAKES`] in a row without the owner
+    /// typing, so runs cannot start one another without end.
+    pub fn wake_ready(&self) -> bool {
+        self.auto_wakes < MAX_AUTO_WAKES && self.jobs.has_finished(self.current_session())
+    }
+
+    /// Counts a message the program sent by itself.
+    pub fn note_wake(&mut self) {
+        self.auto_wakes += 1;
+    }
+
+    /// No more messages of its own until the owner types (the last one failed or was cancelled).
+    pub fn stop_wakes(&mut self) {
+        self.auto_wakes = MAX_AUTO_WAKES;
+    }
+
+    /// The owner typed: the count starts again.
+    pub fn reset_wakes(&mut self) {
+        self.auto_wakes = 0;
+    }
+
+    /// How many are running now.
+    pub fn running_subagents(&self) -> usize {
+        self.jobs.running()
+    }
+
+    /// Stops run `n` (only that one).
+    pub fn stop_subagent(&mut self, n: u32) -> Result<(), String> {
+        self.jobs.stop(n)
+    }
+
     fn run_tool(&self, call: &ToolCall) -> String {
         match self.tools.iter().find(|t| t.spec().name == call.name) {
             Some(tool) => tool.run(&call.arguments),
             None => format!("error: unknown tool '{}'", call.name),
         }
+    }
+}
+
+/// The run `/subagent` started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedRun {
+    pub n: u32,
+    pub profile: String,
+    pub coder: bool,
+}
+
+/// Everything a subagent needs, as data that can move to another thread.
+pub(crate) struct ChildSpec {
+    pub profile: String,
+    pub task: String,
+    model: String,
+    router: RouterOptions,
+    target: Target,
+    provider: Arc<dyn Provider>,
+    build: SubagentTools,
+    pub kit: crate::subagent::Kit,
+    start: Start,
+    /// Preloaded entries that did not fit the token cap.
+    context_left_out: Vec<String>,
+    db: std::path::PathBuf,
+    cwd: String,
+    log_dir: std::path::PathBuf,
+    pub parent_id: Option<i64>,
+    cancel: Cancel,
+}
+
+/// How a subagent ended.
+pub struct ChildResult {
+    /// What the delegating side gets: the answer and a footer, or an error and a footer.
+    pub text: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl ChildResult {
+    fn error(text: String) -> Self {
+        Self {
+            text,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        }
+    }
+
+    /// Whether it did not finish its task.
+    pub fn failed(&self) -> bool {
+        self.text.starts_with("error:")
+    }
+}
+
+/// Runs one subagent to its end, on whatever thread calls this: builds its own agent from `spec`
+/// (its own database connection, turn log and tools), sends the task, and words the result.
+pub(crate) fn run_child(spec: ChildSpec, observer: &mut dyn Observer) -> ChildResult {
+    use crate::subagent::{self, MAX_CALLS};
+    // Stopped before it began (its own chat would clear the cancel when its message starts).
+    if spec.cancel.is_cancelled() {
+        return ChildResult::error("error: subagent stopped: cancelled".to_owned());
+    }
+    let store = match Store::open(&spec.db) {
+        Ok(store) => store,
+        Err(why) => return ChildResult::error(format!("error: cannot open the database: {why}")),
+    };
+    let log = match TurnLog::create(&spec.log_dir) {
+        Ok(log) => log,
+        Err(why) => {
+            return ChildResult::error(format!("error: cannot create the subagent's log: {why}"));
+        }
+    };
+    let tools = (spec.build)(&spec.kit, &spec.cancel);
+    let mut child = Agent::shared(spec.model, spec.provider, tools, log)
+        .with_router(spec.router)
+        .with_target(spec.target.name, spec.target.base_url)
+        .with_cancel(spec.cancel)
+        .with_max_calls(MAX_CALLS)
+        .with_store(store, StoreContext { cwd: spec.cwd });
+    child.parent_id = spec.parent_id;
+    child.keeps_cancel = true;
+    child.history[0] = Message::System(spec.start.assembled.text.clone());
+    child.begin_under(&spec.start);
+
+    let outcome = child.send(&spec.task, observer);
+    let calls = child
+        .history
+        .iter()
+        .filter(|m| matches!(m, Message::Assistant { .. }))
+        .count() as u32;
+    let footer = subagent::footer(
+        &spec.profile,
+        spec.kit.coder,
+        calls,
+        child.usage.prompt_total,
+        child.current_session(),
+    );
+    let footer = if spec.context_left_out.is_empty() {
+        footer
+    } else {
+        format!(
+            "{footer}\n[context left out, too big for the preload: {}]",
+            spec.context_left_out.join(", ")
+        )
+    };
+    let said_last = || {
+        child.history.iter().rev().find_map(|m| match m {
+            Message::Assistant {
+                content: Some(text),
+                ..
+            } if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        })
+    };
+    let stopped = |why: String| {
+        let mut text = format!("error: subagent stopped: {why}");
+        if let Some(last) = said_last() {
+            text.push_str(&format!("\nIt had said: {}", subagent::cut_answer(&last)));
+        }
+        format!("{text}\n{footer}")
+    };
+    let text = match outcome {
+        Outcome::Answer(answer) => format!("{}\n{footer}", subagent::cut_answer(&answer)),
+        Outcome::CapReached { calls } => stopped(format!("it used all {calls} of its calls")),
+        Outcome::LoopStopped { .. } => stopped("it kept repeating failing calls".to_owned()),
+        Outcome::Failed(why) => stopped(why),
+        Outcome::Cancelled => stopped("cancelled".to_owned()),
+    };
+    ChildResult {
+        text,
+        prompt_tokens: child.usage.prompt_total,
+        completion_tokens: child.usage.completion_total,
     }
 }
 
@@ -1478,22 +2034,56 @@ fn describe(error: &ProviderError) -> String {
 /// A provider that plays back prepared replies and records every request it
 /// receives. For tests; it never touches the network.
 //
-// Rust note: `Rc<RefCell<..>>` lets two owners (the provider, which moves into
-// the agent, and the test) share one list. `RefCell` allows changing it through
-// a shared reference, checked while the program runs.
+// Rust note: `Shared<..>` lets two owners (the provider, which moves into the agent, and the
+// test) share one value, also across threads (a background subagent uses the provider from its
+// own thread, issue 35). `borrow()` reads and `borrow_mut()` changes it.
 pub struct ScriptedProvider {
-    replies: RefCell<VecDeque<Result<Reply, Box<ProviderError>>>>,
-    requests: Rc<RefCell<Vec<Vec<u8>>>>,
+    replies: Shared<VecDeque<Result<Reply, Box<ProviderError>>>>,
+    requests: Shared<Vec<Vec<u8>>>,
     models: Option<Result<Vec<String>, String>>,
+    /// Sets the cancel flag in `slot` while answering the n-th request (a key press, in a test).
+    cancel_at: Option<(usize, Shared<Option<Cancel>>)>,
+}
+
+/// A value shared by several owners and threads: a reader-writer lock behind an `Arc`, with the
+/// method names of `RefCell` so that tests read the same.
+pub struct Shared<T>(Arc<std::sync::RwLock<T>>);
+
+impl<T> Shared<T> {
+    pub fn new(value: T) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(value)))
+    }
+
+    pub fn borrow(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn borrow_mut(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.0.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
 }
 
 impl ScriptedProvider {
     pub fn new(replies: Vec<Result<Reply, Box<ProviderError>>>) -> Self {
         Self {
-            replies: RefCell::new(replies.into()),
-            requests: Rc::new(RefCell::new(Vec::new())),
+            replies: Shared::new(replies.into()),
+            requests: Shared::new(Vec::new()),
             models: None,
+            cancel_at: None,
         }
+    }
+
+    /// Cancels while answering the `nth` request (counting from 1), once `slot` holds the
+    /// agent's [`Agent::cancel_handle`].
+    pub fn cancelling_at(mut self, nth: usize, slot: Shared<Option<Cancel>>) -> Self {
+        self.cancel_at = Some((nth, slot));
+        self
     }
 
     /// What `models()` answers; without this the provider cannot list models.
@@ -1504,8 +2094,8 @@ impl ScriptedProvider {
 
     /// Every request received so far, in order. Keep this before handing the
     /// provider to an agent.
-    pub fn requests(&self) -> Rc<RefCell<Vec<Vec<u8>>>> {
-        Rc::clone(&self.requests)
+    pub fn requests(&self) -> Shared<Vec<Vec<u8>>> {
+        self.requests.clone()
     }
 
     fn reply(message: Message, finish_reason: &str, body: serde_json::Value) -> Reply {
@@ -1586,6 +2176,12 @@ impl ScriptedProvider {
 impl Provider for ScriptedProvider {
     fn complete(&self, request: &[u8]) -> Result<Reply, Box<ProviderError>> {
         self.requests.borrow_mut().push(request.to_vec());
+        if let Some((nth, slot)) = &self.cancel_at
+            && self.requests.borrow().len() == *nth
+            && let Some(cancel) = slot.borrow().as_ref()
+        {
+            cancel.cancel();
+        }
         self.replies
             .borrow_mut()
             .pop_front()
@@ -1600,12 +2196,22 @@ impl Provider for ScriptedProvider {
 }
 
 #[cfg(test)]
+#[path = "agent_delegate_tests.rs"]
+mod delegate_tests;
+
+#[cfg(test)]
+#[path = "agent_background_tests.rs"]
+pub(crate) mod background_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::ReadFile;
     use crate::tools::testutil::Scratch;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
-    type Requests = Rc<RefCell<Vec<Vec<u8>>>>;
+    type Requests = Shared<Vec<Vec<u8>>>;
 
     fn agent_in(
         dir: &Scratch,
@@ -1788,6 +2394,34 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn a_failed_first_message_after_compacting_does_not_lose_the_summary() {
+        let dir = Scratch::new("agent-compact-then-fail");
+        let (mut agent, _) = stored_agent(
+            &dir,
+            vec![
+                ScriptedProvider::text("one"),
+                ScriptedProvider::text("the summary"),
+                ScriptedProvider::failure("router down"),
+                ScriptedProvider::text("two"),
+            ],
+        );
+        agent.send("a", &mut NoObserver);
+        agent.compact().unwrap();
+        assert!(matches!(
+            agent.send("b", &mut NoObserver),
+            Outcome::Failed(_)
+        ));
+        assert_eq!(agent.history().len(), 2);
+        agent.send("c", &mut NoObserver);
+        let store = peek(&dir);
+        let summary_rows = format!(
+            "SELECT COUNT(*) FROM messages WHERE status = 'ok' AND text LIKE '{}%'",
+            &SUMMARY_MARK[..20]
+        );
+        assert_eq!(rows(&store, &summary_rows), 1);
     }
 
     #[test]
@@ -2252,6 +2886,8 @@ mod tests {
                 router: &RouterOptions::default(),
                 system_prompt: "an older prompt",
                 cwd: "/w",
+                profile: None,
+                parent_id: None,
             })
             .unwrap();
         let user = [Message::User("earlier".into())];
@@ -2664,9 +3300,9 @@ mod tests {
 
     /// A catalog whose providers are scripted: every provider built answers "from <name>" and
     /// is recorded as (base_url, its requests).
-    fn scripted_catalog(profile_dir: Option<std::path::PathBuf>, built: Built) -> Catalog {
+    fn scripted_catalog(provider_dir: Option<std::path::PathBuf>, built: Built) -> Catalog {
         Catalog {
-            profile_dir,
+            provider_dir,
             build: Box::new(move |def| {
                 let provider = ScriptedProvider::new(vec![ScriptedProvider::text(&format!(
                     "from {}",
@@ -2680,10 +3316,10 @@ mod tests {
         }
     }
 
-    fn write_profile(dir: &Scratch, name: &str, text: &str) {
-        let profiles = dir.path().join("profiles");
-        std::fs::create_dir_all(&profiles).unwrap();
-        std::fs::write(profiles.join(format!("{name}.profile")), text).unwrap();
+    fn write_provider_file(dir: &Scratch, name: &str, text: &str) {
+        let folder = dir.path().join("providers");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(format!("{name}.provider")), text).unwrap();
     }
 
     fn switching_agent(
@@ -2692,7 +3328,7 @@ mod tests {
     ) -> (Agent, Requests, Built) {
         let (agent, requests) = stored_agent(dir, replies);
         let built = Rc::new(RefCell::new(Vec::new()));
-        let catalog = scripted_catalog(Some(dir.path().join("profiles")), Rc::clone(&built));
+        let catalog = scripted_catalog(Some(dir.path().join("providers")), Rc::clone(&built));
         (agent.with_catalog(catalog), requests, built)
     }
 
@@ -2763,7 +3399,7 @@ mod tests {
     #[test]
     fn a_provider_switch_sends_the_next_request_to_the_new_provider() {
         let dir = Scratch::new("agent-switch-provider");
-        write_profile(
+        write_provider_file(
             &dir,
             "other",
             "HARNESS_BASE_URL=http://other/v1\nHARNESS_MODEL=other-model\nHARNESS_PROVIDER_ORDER=relace/fp4\nHARNESS_ALLOW_FALLBACKS=false\n",
@@ -2810,7 +3446,7 @@ mod tests {
     #[test]
     fn a_resume_compares_with_what_the_chat_used_last() {
         let dir = Scratch::new("agent-switch-resume");
-        write_profile(
+        write_provider_file(
             &dir,
             "other",
             "HARNESS_BASE_URL=http://other/v1\nHARNESS_MODEL=other-model\n",
@@ -2832,7 +3468,7 @@ mod tests {
     #[test]
     fn a_failed_provider_switch_changes_nothing() {
         let dir = Scratch::new("agent-switch-provider-fails");
-        write_profile(&dir, "broken", "HARNESS_MODEL=m\n");
+        write_provider_file(&dir, "broken", "HARNESS_MODEL=m\n");
         let (mut agent, _, built) = switching_agent(&dir, vec![]);
         let before = (agent.model().to_owned(), agent.target().clone());
         let unknown = agent.switch_provider("nope").unwrap_err();
@@ -2855,6 +3491,7 @@ mod tests {
 
     fn saved(name: &str, key: Option<&str>) -> ProviderDef {
         ProviderDef {
+            api: crate::config::ApiStyle::OpenAi,
             name: name.into(),
             base_url: format!("http://{name}/v1"),
             model: format!("{name}-model"),
@@ -2866,9 +3503,9 @@ mod tests {
     #[test]
     fn a_saved_provider_is_listed_switched_to_and_removed() {
         let dir = Scratch::new("agent-saved-provider");
-        write_profile(
+        write_provider_file(
             &dir,
-            "fileprofile",
+            "fromfile",
             "HARNESS_BASE_URL=http://f/v1\nHARNESS_MODEL=fm\n",
         );
         let (mut agent, _, built) = switching_agent(&dir, vec![]);
@@ -2881,7 +3518,7 @@ mod tests {
             summary,
             [
                 ("alpha".to_owned(), Source::Saved),
-                ("fileprofile".to_owned(), Source::Profile),
+                ("fromfile".to_owned(), Source::File),
                 ("zeta".to_owned(), Source::Saved)
             ]
         );
@@ -2901,16 +3538,16 @@ mod tests {
         );
         assert!(
             agent
-                .remove_provider("fileprofile")
+                .remove_provider("fromfile")
                 .unwrap_err()
-                .contains("profile file")
+                .contains("provider file")
         );
     }
 
     #[test]
     fn a_provider_name_cannot_be_reused_or_made_unsafe() {
         let dir = Scratch::new("agent-provider-names");
-        write_profile(
+        write_provider_file(
             &dir,
             "taken",
             "HARNESS_BASE_URL=http://f/v1\nHARNESS_MODEL=fm\n",
@@ -3017,7 +3654,7 @@ mod tests {
         let built = Rc::new(RefCell::new(Vec::new()));
         let agent = Agent::new("", Box::new(crate::provider::NoProvider), vec![], log)
             .with_catalog(scripted_catalog(
-                Some(dir.path().join("profiles")),
+                Some(dir.path().join("providers")),
                 Rc::clone(&built),
             ))
             .with_store(Store::open(&db_path(dir)).unwrap(), context());
@@ -3053,7 +3690,7 @@ mod tests {
     #[test]
     fn the_first_switch_makes_the_agent_ready_without_a_cache_warning() {
         let dir = Scratch::new("agent-first-switch");
-        write_profile(
+        write_provider_file(
             &dir,
             "first",
             "HARNESS_BASE_URL=http://first/v1\nHARNESS_MODEL=fm\n",
@@ -3068,7 +3705,7 @@ mod tests {
             Outcome::Answer("from first".into())
         );
         // A second switch is a real change and warns.
-        write_profile(
+        write_provider_file(
             &dir,
             "second",
             "HARNESS_BASE_URL=http://second/v1\nHARNESS_MODEL=sm\n",
@@ -3079,12 +3716,12 @@ mod tests {
     #[test]
     fn the_last_provider_switched_to_is_the_one_a_new_start_uses() {
         let dir = Scratch::new("agent-remembered");
-        write_profile(
+        write_provider_file(
             &dir,
             "one",
             "HARNESS_BASE_URL=http://one/v1\nHARNESS_MODEL=m1\n",
         );
-        write_profile(
+        write_provider_file(
             &dir,
             "two",
             "HARNESS_BASE_URL=http://two/v1\nHARNESS_MODEL=m2\n",
@@ -3111,7 +3748,7 @@ mod tests {
     #[test]
     fn a_remembered_provider_that_is_gone_or_broken_starts_with_none() {
         let dir = Scratch::new("agent-remembered-gone");
-        write_profile(
+        write_provider_file(
             &dir,
             "gone",
             "HARNESS_BASE_URL=http://g/v1\nHARNESS_MODEL=gm\n",
@@ -3120,12 +3757,12 @@ mod tests {
         agent.switch_provider("gone").unwrap();
         drop(agent);
 
-        std::fs::remove_file(dir.path().join("profiles/gone.profile")).unwrap();
+        std::fs::remove_file(dir.path().join("providers/gone.provider")).unwrap();
         let (mut again, _) = unconfigured_agent(&dir);
         assert_eq!(again.use_remembered_provider(), None);
         assert!(!again.ready());
 
-        write_profile(&dir, "gone", "HARNESS_MODEL=gm\n");
+        write_provider_file(&dir, "gone", "HARNESS_MODEL=gm\n");
         let note = again.use_remembered_provider().unwrap();
         assert!(
             note.contains("gone") && note.contains("HARNESS_BASE_URL is missing"),

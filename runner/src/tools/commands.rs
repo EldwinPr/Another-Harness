@@ -16,7 +16,7 @@ pub const FREE_COMMANDS: &[&str] = &[
 /// Commands whose job is to run other commands (or code). "Always allow" is never offered for
 /// them, because it would allow everything.
 const RUNS_OTHER_COMMANDS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "fish", "ksh", "env", "sudo", "doas", "su", "xargs", "find",
+    "sh", "bash", "zsh", "dash", "fish", "ksh", "env", "sudo", "doas", "su", "xargs", "find", ".",
     "eval", "exec", "nohup", "time", "timeout", "watch", "nice", "ionice", "setsid", "stdbuf",
     "command", "builtin", "source", "python", "python2", "python3", "node", "deno", "bun", "perl",
     "ruby", "php", "lua", "awk", "gawk", "sed", "ssh", "npx", "uv", "pipx",
@@ -36,6 +36,16 @@ pub fn is_free(command: &str) -> bool {
         Some(stages) => !stages.is_empty() && stages.iter().all(|words| free_stage(words)),
         None => false,
     }
+}
+
+/// Whether the command may run in a subagent: [`is_free`], and nothing that makes a folder.
+pub fn is_looking(command: &str) -> bool {
+    is_free(command)
+        && stages(command).is_some_and(|stages| {
+            stages
+                .iter()
+                .all(|words| words.first().map(String::as_str) != Some("mkdir"))
+        })
 }
 
 /// Splits a command line into its commands, each a list of words with the quotes taken off.
@@ -191,15 +201,21 @@ fn free_stage(words: &[String]) -> bool {
     };
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match name.as_str() {
-        "ls" | "cd" | "cat" | "head" | "tail" | "wc" | "mkdir" | "du" => {
-            args.iter().all(|a| path_ok(a))
-        }
+        "ls" | "cat" | "head" | "tail" | "wc" | "mkdir" | "du" | "diff" | "cmp" | "stat"
+        | "basename" | "dirname" | "cut" | "nl" => args.iter().all(|a| path_ok(a)),
+        // Reads standard input only: its words are characters, not paths.
+        "tr" => args.iter().all(|a| !a.starts_with('/') || a.len() == 1),
+        // A bare `cd` goes to $HOME and `cd -` to the old directory: both leave the folder.
+        "cd" => matches!(args.as_slice(), [dir] if !dir.starts_with('-') && path_ok(dir)),
         "pwd" => args.iter().all(|a| matches!(*a, "-L" | "-P")),
         "echo" | "pgrep" | "printf" => true,
         "sort" => sort_ok(&args),
         "uniq" => {
             // A second path would be the file it writes to.
-            args.iter().filter(|a| !a.starts_with('-')).count() <= 1
+            args.iter()
+                .filter(|a| **a == "-" || !a.starts_with('-'))
+                .count()
+                <= 1
                 && args.iter().all(|a| path_ok(a))
         }
         "sleep" => {
@@ -210,7 +226,7 @@ fn free_stage(words: &[String]) -> bool {
         "python" | "python3" => args.len() == 1 && matches!(args[0], "--version" | "-V"),
         "node" => match args.as_slice() {
             ["--version" | "-v"] => true,
-            ["--check" | "-c", file] => path_ok(file),
+            ["--check" | "-c", file] => !file.starts_with('-') && path_ok(file),
             _ => false,
         },
         "grep" => grep_ok(&args),
@@ -227,7 +243,9 @@ fn grep_ok(args: &[&str]) -> bool {
     let mut pattern_seen = false;
     for arg in args {
         if let Some(long) = arg.strip_prefix("--") {
-            if long.starts_with("file") || long.starts_with("exclude-from") {
+            // `--reg` and `--exclude-f` are accepted by grep as short forms of these.
+            if long.starts_with("file") || long.starts_with("exclude-f") || long.starts_with("reg")
+            {
                 return false;
             }
             if !path_ok(arg) {
@@ -236,7 +254,8 @@ fn grep_ok(args: &[&str]) -> bool {
         } else if let Some(cluster) = arg.strip_prefix('-')
             && !cluster.is_empty()
         {
-            if cluster.contains('f') {
+            // With -e the pattern is given, so the first word after it would be a file.
+            if cluster.contains('f') || cluster.contains('e') {
                 return false;
             }
         } else if !pattern_seen {
@@ -248,7 +267,7 @@ fn grep_ok(args: &[&str]) -> bool {
     true
 }
 
-/// `git` only as `git status|log|diff|show ...` straight after the name (no `-c` or `-C` before
+/// `git` only as `git status|log|diff|show|ls-files|blame|rev-parse ...` (and `remote -v`, `branch -a`) straight after the name (no `-c` or `-C` before
 /// the subcommand), which read the repository. Flags that write a file or run a program are
 /// refused, and every path must stay below the working directory.
 fn git_ok(args: &[&str]) -> bool {
@@ -266,7 +285,20 @@ fn git_ok(args: &[&str]) -> bool {
     let [sub, rest @ ..] = args else {
         return false;
     };
-    if !matches!(*sub, "status" | "log" | "diff" | "show") {
+    // Listing remotes and branches: nothing that adds, renames or deletes one.
+    match *sub {
+        "remote" => return rest.is_empty() || rest == ["-v"],
+        "branch" => {
+            return rest
+                .iter()
+                .all(|a| matches!(*a, "-a" | "-r" | "-v" | "-vv" | "--list" | "--all"));
+        }
+        _ => {}
+    }
+    if !matches!(
+        *sub,
+        "status" | "log" | "diff" | "show" | "ls-files" | "blame" | "rev-parse"
+    ) {
         return false;
     }
     rest.iter().all(|arg| {
@@ -288,11 +320,17 @@ fn git_ok(args: &[&str]) -> bool {
 fn sort_ok(args: &[&str]) -> bool {
     args.iter().all(|arg| {
         if let Some(long) = arg.strip_prefix("--") {
-            !(long.starts_with("output")
-                || long.starts_with("compress-program")
-                || long.starts_with("files0-from")
-                || long.starts_with("temporary-directory"))
-                && path_ok(arg)
+            // GNU sort takes any unique prefix of a long option, so `--o` is `--output`.
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            let writes = [
+                "output",
+                "compress-program",
+                "files0-from",
+                "temporary-directory",
+            ]
+            .iter()
+            .any(|full| !name.is_empty() && full.starts_with(name));
+            !writes && path_ok(arg)
         } else if let Some(cluster) = arg.strip_prefix('-')
             && !cluster.is_empty()
         {
@@ -325,7 +363,8 @@ fn sed_ok(args: &[&str]) -> bool {
         None => number(range),
         Some((from, to)) => number(from) && number(to),
     };
-    range_ok && files.iter().all(|f| path_ok(f))
+    // A word starting with `-` is a flag (`-e`, `-i`, `-f`), not a file.
+    range_ok && files.iter().all(|f| !f.starts_with('-') && path_ok(f))
 }
 
 /// A flag, or a path that is relative and does not climb out of the working directory.
@@ -364,6 +403,41 @@ pub fn always_for(command: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn more_reading_commands_from_the_subagent_logs_are_free_and_the_writing_forms_are_not() {
+        for command in [
+            "diff -u a.txt b.txt",
+            "diff -r old new | head",
+            "cmp a b",
+            "stat a.txt",
+            "basename src/a.rs",
+            "cut -d: -f1 a.txt | sort | uniq",
+            "tr a-z A-Z",
+            "nl a.txt",
+            "git remote -v",
+            "git remote",
+            "git branch -a",
+            "git ls-files src",
+            "git blame a.txt",
+            "git rev-parse --show-toplevel",
+        ] {
+            assert!(is_free(command), "{command}");
+        }
+        for command in [
+            "diff /etc/passwd a",
+            "cmp ../x a",
+            "git remote add x http://h",
+            "git remote remove origin",
+            "git branch -D old",
+            "git branch new",
+            "git rev-parse --git-dir",
+            "git -C . remote -v",
+            "cut -d: -f1 /etc/passwd",
+        ] {
+            assert!(!is_free(command), "{command}");
+        }
+    }
 
     #[test]
     fn the_commands_from_the_logs_that_only_look_are_free() {
@@ -406,6 +480,10 @@ mod tests {
             "git diff HEAD~1 -- src/main.rs",
             "git show HEAD:src/main.rs | head -20",
             "git diff --stat 2>&1 | tail -3",
+            "sort -u a.txt | uniq -",
+            "cat a.txt | uniq -c",
+            "grep -n pat a.txt",
+            "sort --reverse a.txt",
         ] {
             assert!(is_free(command), "should be free: {command:?}");
         }
@@ -493,6 +571,29 @@ mod tests {
             "node script.js",
             "node -e 'x'",
             "node --check /etc/x.js",
+            "node --check --require=./pre.js",
+            "node --check --import=./x.mjs",
+            "sed -n 1p -e 'e touch pwned' g",
+            "sed -n 1p -i f",
+            "sed -n 1p --in-place f",
+            "sed -n 1p --expression=w\\ x g",
+            "cd",
+            "cd -",
+            "cd && cat .ssh/id_rsa",
+            "cd; ls -a",
+            "cd -P src",
+            "grep -e. /etc/hostname",
+            "grep -ex /etc/passwd",
+            "grep -r -e. ~/.ssh",
+            "grep --regexp=x /etc/passwd",
+            "grep --reg=x /etc/passwd",
+            "grep --exclude-f=/etc/x pat .",
+            "sort --o=s2 s",
+            "sort --ou=x s",
+            "sort --co=sh x",
+            "sort --t=/tmp x",
+            "echo x | uniq - out.txt",
+            ". ./x.sh",
             "du /",
             "ls --color=/etc/x",
             "grep 'unclosed x",
@@ -560,6 +661,7 @@ mod tests {
             "/bin/rm x",
             "echo $(rm x)",
             "ls > x",
+            ". ./x.sh",
             "",
         ] {
             assert_eq!(always_for(command), None, "{command:?}");

@@ -44,8 +44,21 @@ impl Style {
         }
     }
 
+    /// Whether colour is on.
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
     pub fn bold(self, text: &str) -> String {
         self.paint("1", text)
+    }
+
+    pub fn italic(self, text: &str) -> String {
+        self.paint("3", text)
+    }
+
+    pub fn underline(self, text: &str) -> String {
+        self.paint("4", text)
     }
 
     pub fn dim(self, text: &str) -> String {

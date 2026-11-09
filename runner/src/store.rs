@@ -16,12 +16,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::cache_check::parse_usage;
+use crate::config::ApiStyle;
 use crate::provider::{ProviderError, Reply};
 use crate::providers::ProviderDef;
 use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, earlier_line};
 
 /// The schema version this program writes. It is kept in SQLite's `user_version`.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// How long a write waits for another writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -165,6 +166,81 @@ CREATE TABLE chat_prompt_state (
 
 // Issue 14, second round: skills and personalities are no longer "on by default"; a new chat starts
 // with none. The column stays and means "switched on" for system prompts only.
+/// Issue 27: the glossary. `term` is unique ignoring case.
+// Issue 31: chat profiles. A profile is the starting setup of a chat: system prompts, skills that are
+// on, and a personality. The personality is a column (a profile has at most one).
+const SCHEMA_V12: &str = "
+CREATE TABLE IF NOT EXISTS profiles (
+    id             INTEGER PRIMARY KEY,
+    name           TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    description    TEXT NOT NULL DEFAULT '',
+    personality_id INTEGER REFERENCES prompts (id) ON DELETE SET NULL,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS profile_prompts (
+    profile_id INTEGER NOT NULL REFERENCES profiles (id) ON DELETE CASCADE,
+    prompt_id  INTEGER NOT NULL REFERENCES prompts (id) ON DELETE CASCADE,
+    PRIMARY KEY (profile_id, prompt_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS profile_skills (
+    profile_id INTEGER NOT NULL REFERENCES profiles (id) ON DELETE CASCADE,
+    prompt_id  INTEGER NOT NULL REFERENCES prompts (id) ON DELETE CASCADE,
+    PRIMARY KEY (profile_id, prompt_id)
+) STRICT;
+";
+
+// Issue 33: a subagent's chat points at the chat that delegated to it.
+const SCHEMA_V13: &str = "
+CREATE INDEX IF NOT EXISTS sessions_parent ON sessions (parent_id);
+";
+
+// Issue 37: context entries, the rules, decisions and shapes the owner has said, per project.
+const SCHEMA_V15: &str = "
+CREATE TABLE IF NOT EXISTS context_entries (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL COLLATE NOCASE,
+    kind       TEXT NOT NULL CHECK (kind IN ('rule', 'decision', 'shape', 'guide')),
+    text       TEXT NOT NULL,
+    quote      TEXT NOT NULL DEFAULT '',
+    area       TEXT NOT NULL DEFAULT '',
+    project    TEXT NOT NULL DEFAULT '',
+    preload    INTEGER NOT NULL DEFAULT 0 CHECK (preload IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (project, name)
+) STRICT;
+";
+
+const SCHEMA_V11: &str = "CREATE TABLE IF NOT EXISTS glossary (
+    id         INTEGER PRIMARY KEY,
+    term       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    area       TEXT NOT NULL DEFAULT '',
+    definition TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;";
+
+/// Issue 36: a glossary word can belong to one project (the working directory) or, with `project`
+/// empty, to every project. Every word there is becomes one for every project.
+const SCHEMA_V17: &str = "ALTER TABLE glossary RENAME TO glossary_old;
+CREATE TABLE glossary (
+    id         INTEGER PRIMARY KEY,
+    term       TEXT NOT NULL COLLATE NOCASE,
+    area       TEXT NOT NULL DEFAULT '',
+    definition TEXT NOT NULL,
+    project    TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (project, term)
+) STRICT;
+INSERT INTO glossary (id, term, area, definition, project, created_at, updated_at)
+    SELECT id, term, area, definition, '', created_at, updated_at FROM glossary_old;
+DROP TABLE glossary_old;";
+
+/// Issue 40: which API a provider speaks. Every provider so far speaks chat completions.
+const SCHEMA_V18: &str = "ALTER TABLE providers ADD COLUMN api TEXT NOT NULL DEFAULT 'openai' CHECK (api IN ('openai', 'anthropic'));";
+
 const SCHEMA_V7: &str = "UPDATE prompts SET enabled = 0 WHERE type <> 'system';";
 
 #[cfg(test)]
@@ -235,6 +311,28 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// What a checked edit or delete did (issue 29): it is made only if the row is still as the
+/// person saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    Done,
+    /// The row changed since it was shown; nothing was written.
+    Stale,
+    /// The row is gone; nothing was written.
+    Gone,
+}
+
+/// A short stamp of some texts: two readings of the same row have the same stamp, and a row that
+/// was edited in between does not. The parts are separated so `["ab", "c"]` and `["a", "bc"]` differ.
+pub fn fingerprint(parts: &[&str]) -> String {
+    let mut joined = Vec::new();
+    for part in parts {
+        joined.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        joined.extend_from_slice(part.as_bytes());
+    }
+    sha256_hex(&joined)[..16].to_owned()
+}
+
 /// The router settings as the text stored in `sessions.router_options`. Never holds the API
 /// key (it is not part of [`RouterOptions`]). Used both to store and to compare, so the same
 /// settings always give the same text.
@@ -272,6 +370,10 @@ pub struct NewSession<'a> {
     pub router: &'a RouterOptions,
     pub system_prompt: &'a str,
     pub cwd: &'a str,
+    /// The profile the chat began under (issue 31), if there was one.
+    pub profile: Option<&'a str>,
+    /// The chat that delegated this one to a subagent (issue 33); `None` for a chat of its own.
+    pub parent_id: Option<i64>,
 }
 
 /// One saved model call, with the messages that became permanent because of it.
@@ -309,6 +411,8 @@ pub struct SessionInfo {
     pub cwd: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The profile the chat began under (issue 31), if it was saved with one.
+    pub profile: Option<String>,
 }
 
 impl SessionInfo {
@@ -356,18 +460,91 @@ pub struct SessionSummary {
     pub first_message: Option<String>,
     /// The chat began from a compaction summary.
     pub continued: bool,
+    /// The profile the chat began under (issue 31), if it was saved with one.
+    pub profile: Option<String>,
 }
 
 pub struct Store {
     pub(crate) conn: Connection,
+    /// The project this connection works for (the working directory); what the glossary shows and
+    /// writes by default. Empty means no project: only the words for every project.
+    pub(crate) project: String,
 }
 
 impl Store {
+    /// Works for this project: the glossary shows its words and the shared ones.
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = project.into();
+        self
+    }
+
+    /// The database file this store has open, if it is a file.
+    pub fn path(&self) -> Option<std::path::PathBuf> {
+        self.conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    /// Opens an existing database for reading only: nothing is created, migrated or written.
+    /// A database of another version is refused (a program of the same version wrote it).
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        Self::open_existing(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            "reading",
+        )
+    }
+
+    /// Opens an existing database for reading and writing (the web page's edits, issue 29):
+    /// nothing is created or migrated, and a database of another version is refused.
+    pub fn open_for_writing(path: &Path) -> Result<Self, StoreError> {
+        let store = Self::open_existing(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            "writing",
+        )?;
+        store.conn.pragma_update(None, "foreign_keys", true)?;
+        Ok(store)
+    }
+
+    fn open_existing(
+        path: &Path,
+        flags: rusqlite::OpenFlags,
+        what: &str,
+    ) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(path, flags)
+            .map_err(|e| err(format!("cannot open {} for {what}: {e}", path.display())))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(err(format!(
+                "this database is version {version}, this program reads version {SCHEMA_VERSION}: start the chat once to upgrade it"
+            )));
+        }
+        Ok(Self {
+            conn,
+            project: String::new(),
+        })
+    }
+
     /// Opens the database at `path`, creating the file, its folder and the tables if needed.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)
                 .map_err(|e| err(format!("cannot create {}: {e}", dir.display())))?;
+        }
+        // The database holds provider API keys and every chat: a new file is readable by its
+        // owner only (SQLite gives the -wal and -shm files the same mode).
+        if !path.exists() {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| err(format!("cannot create {}: {e}", path.display())))?;
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -375,14 +552,20 @@ impl Store {
         // WAL lets another program read the chats while this one writes.
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        back_up_before_upgrade(&conn, path)?;
         migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            project: String::new(),
+        })
     }
 
     /// Starts a chat and returns its id.
     pub fn create_session(&mut self, new: &NewSession<'_>) -> Result<i64, StoreError> {
         let now = now_secs();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // The same prompt text always lands in the same row.
         tx.execute(
             "INSERT OR IGNORE INTO system_prompts (sha256, text, created_at) VALUES (?1, ?2, ?3)",
@@ -399,7 +582,8 @@ impl Store {
         )?;
         tx.execute(
             "INSERT INTO sessions (kind, model, base_url, router_options, system_prompt_id, cwd, \
-             harness_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+             harness_version, created_at, updated_at, profile, parent_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)",
             params![
                 new.kind.as_str(),
                 new.model,
@@ -408,7 +592,9 @@ impl Store {
                 prompt_id,
                 new.cwd,
                 env!("CARGO_PKG_VERSION"),
-                now
+                now,
+                new.profile,
+                new.parent_id
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -420,7 +606,9 @@ impl Store {
     /// transaction: either all of it is stored or none of it.
     pub fn save_call(&mut self, call: &SaveCall<'_>) -> Result<(), StoreError> {
         let now = now_secs();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         insert_messages(
             &tx,
             call.session_id,
@@ -451,7 +639,9 @@ impl Store {
     /// Saves a provider added from inside the chat. The name must be unused. Its default model
     /// becomes its first stored model.
     pub fn add_provider(&mut self, provider: &ProviderDef) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let taken: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM providers WHERE name = ?1)",
             [&provider.name],
@@ -466,7 +656,7 @@ impl Store {
         let now = now_secs();
         tx.execute(
             "INSERT INTO providers (name, base_url, model, api_key, provider_order, \
-             allow_fallbacks, session_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             allow_fallbacks, session_id, api, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 provider.name,
                 provider.base_url,
@@ -476,6 +666,7 @@ impl Store {
                     .map_err(|e| err(e.to_string()))?,
                 provider.router.allow_fallbacks,
                 provider.router.session_id,
+                provider.api.as_str(),
                 now
             ],
         )?;
@@ -492,7 +683,7 @@ impl Store {
     /// The saved providers, by name.
     pub fn list_providers(&self) -> Result<Vec<ProviderDef>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT name, base_url, model, api_key, provider_order, allow_fallbacks, session_id \
+            "SELECT name, base_url, model, api_key, provider_order, allow_fallbacks, session_id, api \
              FROM providers ORDER BY name",
         )?;
         let rows = statement.query_map([], |row| {
@@ -506,6 +697,10 @@ impl Store {
                     provider_order: serde_json::from_str(&order).unwrap_or_default(),
                     allow_fallbacks: row.get(5)?,
                     session_id: row.get(6)?,
+                },
+                api: {
+                    let text: String = row.get(7)?;
+                    ApiStyle::parse(&text).unwrap_or_default()
                 },
             })
         })?;
@@ -534,7 +729,9 @@ impl Store {
 
     /// Deletes a saved provider and its stored models. `false` when there was none by that name.
     pub fn remove_provider(&mut self, name: &str) -> Result<bool, StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM provider_models WHERE provider_id IN (SELECT id FROM providers WHERE name = ?1)",
             [name],
@@ -552,7 +749,9 @@ impl Store {
         messages: &[Message],
     ) -> Result<(), StoreError> {
         let now = now_secs();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         insert_messages(&tx, session_id, turn, messages.iter(), now)?;
         touch(&tx, session_id, now)?;
         tx.commit()?;
@@ -562,7 +761,9 @@ impl Store {
     /// Marks every message of a turn `failed`. Best effort by design: the caller is already
     /// handling a failure and may be unable to reach the database.
     pub fn mark_turn_failed(&mut self, session_id: i64, turn: u32) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         mark_failed(&tx, session_id, turn)?;
         tx.commit()?;
         Ok(())
@@ -571,13 +772,25 @@ impl Store {
     /// Deletes a chat with all its messages and calls, in one transaction. Other chats and the
     /// shared system prompts are not touched. An unknown id is an error.
     pub fn delete_session(&mut self, session_id: i64) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM chat_prompt_state WHERE session_id = ?1",
-            [session_id],
-        )?;
-        tx.execute("DELETE FROM calls WHERE session_id = ?1", [session_id])?;
-        tx.execute("DELETE FROM messages WHERE session_id = ?1", [session_id])?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The subagent chats under it go too (issue 33); they are never on their own.
+        for id in ["SELECT id FROM sessions WHERE parent_id = ?1", "SELECT ?1"] {
+            let ids: Vec<i64> = {
+                let mut statement = tx.prepare(id)?;
+                let rows = statement.query_map([session_id], |row| row.get(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for id in ids {
+                tx.execute("DELETE FROM chat_prompt_state WHERE session_id = ?1", [id])?;
+                tx.execute("DELETE FROM calls WHERE session_id = ?1", [id])?;
+                tx.execute("DELETE FROM messages WHERE session_id = ?1", [id])?;
+                if id != session_id {
+                    tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+                }
+            }
+        }
         let removed = tx.execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
         if removed == 0 {
             return Err(err(format!("no saved chat with id {session_id}")));
@@ -592,9 +805,9 @@ impl Store {
             .conn
             .query_row(
                 "SELECT s.id, s.model, s.base_url, s.router_options, p.text, s.cwd, \
-                        s.created_at, s.updated_at \
+                        s.created_at, s.updated_at, s.profile \
                  FROM sessions s JOIN system_prompts p ON p.id = s.system_prompt_id \
-                 WHERE s.kind = ?1 \
+                 WHERE s.kind = ?1 AND s.parent_id IS NULL \
                    AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id AND m.status = 'ok') \
                  ORDER BY s.updated_at DESC, s.id DESC LIMIT 1",
                 [kind.as_str()],
@@ -619,9 +832,10 @@ impl Store {
                       ORDER BY m.seq LIMIT 1), \
                     EXISTS (SELECT 1 FROM messages m \
                       WHERE m.session_id = s.id AND m.status = 'ok' AND m.role = 'user' \
-                        AND substr(m.text, 1, length(?4)) = ?4) \
+                        AND substr(m.text, 1, length(?4)) = ?4), \
+                    s.profile \
              FROM sessions s \
-             WHERE s.kind = ?1 \
+             WHERE s.kind = ?1 AND s.parent_id IS NULL \
                AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id AND m.status = 'ok') \
              ORDER BY s.updated_at DESC, s.id DESC LIMIT ?2",
         )?;
@@ -640,6 +854,7 @@ impl Store {
                     message_count: row.get(3)?,
                     first_message: row.get(4)?,
                     continued: row.get(5)?,
+                    profile: row.get(6)?,
                 })
             },
         )?;
@@ -666,7 +881,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT s.id, s.model, s.base_url, s.router_options, p.text, s.cwd, \
-                        s.created_at, s.updated_at \
+                        s.created_at, s.updated_at, s.profile \
                  FROM sessions s JOIN system_prompts p ON p.id = s.system_prompt_id \
                  WHERE s.id = ?1",
                 [session_id],
@@ -709,7 +924,9 @@ impl Store {
             open.then_some(*turn)
         });
         if let Some(turn) = unfinished {
-            let tx = self.conn.transaction()?;
+            let tx = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             mark_failed(&tx, session_id, u32::try_from(turn).unwrap_or(u32::MAX))?;
             tx.commit()?;
             kept.retain(|(t, _)| *t != turn);
@@ -747,6 +964,18 @@ impl Store {
         for tokens in rows {
             usage.add(tokens?);
         }
+        // The subagents' calls count in the chat that delegated them (issue 33).
+        let (prompt, completion): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(c.prompt_tokens), 0), COALESCE(SUM(c.completion_tokens), 0) \
+             FROM calls c JOIN sessions s ON s.id = c.session_id \
+             WHERE s.parent_id = ?1 AND c.error IS NULL AND c.http_status BETWEEN 200 AND 299",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        usage.add_subagent(
+            u64::try_from(prompt).unwrap_or(0),
+            u64::try_from(completion).unwrap_or(0),
+        );
         Ok(usage)
     }
 
@@ -767,7 +996,33 @@ fn read_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
         cwd: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+        profile: row.get(8)?,
     })
+}
+
+/// An existing database that is about to be upgraded is copied first, to `<file>.before-<version>`
+/// (readable by its owner only, like the database). An earlier copy is never replaced: when the
+/// name is taken the copy is `.before-<version>.2`, `.3` ...
+fn back_up_before_upgrade(conn: &Connection, path: &Path) -> Result<(), StoreError> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(1..SCHEMA_VERSION).contains(&version) {
+        return Ok(());
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    let mut copy = path.with_file_name(format!("{name}.before-{SCHEMA_VERSION}"));
+    let mut n = 1;
+    while copy.exists() {
+        n += 1;
+        copy = path.with_file_name(format!("{name}.before-{SCHEMA_VERSION}.{n}"));
+    }
+    let target = copy.to_string_lossy().into_owned();
+    conn.execute("VACUUM INTO ?1", [&target])
+        .map_err(|e| err(format!("cannot back up the database to {target}: {e}")))?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600));
+    Ok(())
 }
 
 /// Creates the tables on a new database. A database written by a newer program is refused.
@@ -859,6 +1114,131 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             new = crate::store_prompts::BUILTIN_PROMPT.replace('\'', "''"),
             old = crate::store_prompts::BUILTIN_PROMPT_V9.replace('\'', "''"),
             base = crate::store_prompts::BASE_NAME,
+        ))?;
+    }
+    if version < 11 {
+        // Issue 27: the glossary table, and the built-in prompt names its two tools. Only an
+        // unedited `base` changes.
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V11} \
+             UPDATE prompts SET text = '{new}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{base}' AND text = '{old}'; \
+             PRAGMA user_version = 11; COMMIT;",
+            new = crate::store_prompts::BUILTIN_PROMPT.replace('\'', "''"),
+            old = crate::store_prompts::BUILTIN_PROMPT_V10.replace('\'', "''"),
+            base = crate::store_prompts::BASE_NAME,
+        ))?;
+    }
+    if version < 12 {
+        // Issue 31: chat profiles. `default` starts as the system prompts that are on now, so the
+        // first chat after the upgrade has the system prompt it would have had. The column
+        // `prompts.enabled` stays but is no longer read.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(SCHEMA_V12)?;
+        let has_column: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'profile'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_column == 0 {
+            tx.execute_batch("ALTER TABLE sessions ADD COLUMN profile TEXT;")?;
+        }
+        crate::store_profiles::seed(&tx, !cfg!(test))?;
+        tx.execute_batch("PRAGMA user_version = 12;")?;
+        tx.commit()?;
+    }
+    if version < 13 {
+        // Issue 33: subagents. A subagent's chat has a parent; the `subagent` prompt is added if
+        // there is none by that name (one the owner already has is kept as written).
+        let tx = conn.unchecked_transaction()?;
+        let has_column: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'parent_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_column == 0 {
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN parent_id INTEGER REFERENCES sessions (id);",
+            )?;
+        }
+        tx.execute_batch(SCHEMA_V13)?;
+        crate::store_prompts::seed_subagent(&tx, !cfg!(test))?;
+        tx.execute_batch("PRAGMA user_version = 13;")?;
+        tx.commit()?;
+    }
+    if version < 14 {
+        // Issue 34: the `subagent-coder` prompt, added if there is none by that name (and the
+        // `subagent` prompt, if a database never had it).
+        let tx = conn.unchecked_transaction()?;
+        crate::store_prompts::seed_subagent(&tx, !cfg!(test))?;
+        tx.execute_batch("PRAGMA user_version = 14;")?;
+        tx.commit()?;
+    }
+    if version < 15 {
+        // Issue 37: the table of context entries.
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V15} PRAGMA user_version = 15; COMMIT;"
+        ))?;
+    }
+    if version < 16 {
+        // Issue 38: the prompts name the context tools. Only an unedited `base` and unedited
+        // subagent prompts change.
+        use crate::store_prompts as p;
+        let rewrite = |name: &str, old: &str, new: &str| {
+            format!(
+                "UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+                 WHERE name = '{name}' AND text = '{}';",
+                new.replace('\'', "''"),
+                old.replace('\'', "''")
+            )
+        };
+        conn.execute_batch(&format!(
+            "BEGIN; {} {} {} PRAGMA user_version = 16; COMMIT;",
+            rewrite(p::BASE_NAME, p::BUILTIN_PROMPT_V15, p::BUILTIN_PROMPT_V16),
+            rewrite(p::SUBAGENT_NAME, p::SUBAGENT_PROMPT_V15, p::SUBAGENT_PROMPT),
+            rewrite(
+                p::SUBAGENT_CODER_NAME,
+                p::SUBAGENT_CODER_PROMPT_V15,
+                p::SUBAGENT_CODER_PROMPT
+            ),
+        ))?;
+    }
+    if version < 17 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V17} PRAGMA user_version = 17; COMMIT;"
+        ))?;
+    }
+    if version < 18 {
+        // A file whose version was put back by hand already has the column.
+        let has_column: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('providers') WHERE name = 'api')",
+            [],
+            |row| row.get(0),
+        )?;
+        let alter = if has_column { "" } else { SCHEMA_V18 };
+        conn.execute_batch(&format!("BEGIN; {alter} PRAGMA user_version = 18; COMMIT;"))?;
+    }
+    if version < 19 {
+        // Issue 41: the base prompt names the `library` and `profile` tools. Only an unedited
+        // `base` changes.
+        use crate::store_prompts as p;
+        conn.execute_batch(&format!(
+            "BEGIN; UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{}' AND text = '{}'; PRAGMA user_version = 19; COMMIT;",
+            p::BUILTIN_PROMPT_V17.replace('\'', "''"),
+            p::BASE_NAME,
+            p::BUILTIN_PROMPT_V16.replace('\'', "''"),
+        ))?;
+    }
+    if version < 20 {
+        // Issue 42: the base prompt names `task` and `steps`. Only an unedited `base` changes.
+        use crate::store_prompts as p;
+        conn.execute_batch(&format!(
+            "BEGIN; UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{}' AND text = '{}'; PRAGMA user_version = 20; COMMIT;",
+            p::BUILTIN_PROMPT.replace('\'', "''"),
+            p::BASE_NAME,
+            p::BUILTIN_PROMPT_V17.replace('\'', "''"),
         ))?;
     }
     Ok(())
@@ -1007,6 +1387,8 @@ mod tests {
             router,
             system_prompt: prompt,
             cwd: "/work",
+            profile: None,
+            parent_id: None,
         }
     }
 
@@ -1067,6 +1449,23 @@ mod tests {
     }
 
     #[test]
+    fn a_new_database_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("store-mode");
+        let _store = open(&dir);
+        let mode = |name: &str| {
+            std::fs::metadata(dir.path().join(name)).map(|m| m.permissions().mode() & 0o777)
+        };
+        assert_eq!(mode("harness.db").unwrap(), 0o600);
+        // The -wal and -shm files, once they exist, follow the main file.
+        for name in ["harness.db-wal", "harness.db-shm"] {
+            if let Ok(found) = mode(name) {
+                assert_eq!(found, 0o600, "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn a_new_database_has_the_tables_wal_and_foreign_keys() {
         let dir = Scratch::new("store-open");
         let store = open(&dir);
@@ -1100,6 +1499,77 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(count(&store, "SELECT COUNT(*) FROM sessions"), 1);
         assert_eq!(count(&store, "PRAGMA user_version"), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgrading_to_schema_13_adds_parent_id_keeps_every_chat_and_makes_a_backup() {
+        let dir = Scratch::new("store-v13");
+        let path = dir.path().join("harness.db");
+        let mut store = Store::open(&path).unwrap();
+        let router = RouterOptions::default();
+        let id = store.create_session(&new_session(&router, "p")).unwrap();
+        drop(store);
+        {
+            // Put the file back as schema 12 left it.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP INDEX sessions_parent; ALTER TABLE sessions DROP COLUMN parent_id; \
+                 PRAGMA user_version = 12;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(count(&store, "PRAGMA user_version"), SCHEMA_VERSION);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM sessions"), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM sessions WHERE parent_id IS NULL"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT COUNT(*) FROM sessions WHERE id = {id}")
+            ),
+            1
+        );
+        let copy = Connection::open(
+            dir.path()
+                .join(format!("harness.db.before-{SCHEMA_VERSION}")),
+        )
+        .unwrap();
+        let version: i64 = copy
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+        // Opening again changes nothing.
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(count(&store, "PRAGMA user_version"), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_backup_name_that_is_taken_is_not_replaced() {
+        let dir = Scratch::new("store-backup-name");
+        let path = dir.path().join("harness.db");
+        drop(Store::open(&path).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 12;")
+            .unwrap();
+        let taken = dir
+            .path()
+            .join(format!("harness.db.before-{SCHEMA_VERSION}"));
+        std::fs::write(&taken, "an older copy").unwrap();
+        drop(Store::open(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "an older copy");
+        assert!(
+            dir.path()
+                .join(format!("harness.db.before-{SCHEMA_VERSION}.2"))
+                .exists()
+        );
     }
 
     #[test]
@@ -1665,6 +2135,7 @@ mod tests {
             cwd: String::new(),
             created_at: 0,
             updated_at: 0,
+            profile: None,
         };
         assert!(
             info.differences("a", "http://x/v1", &router_json(&router))
@@ -1867,7 +2338,10 @@ mod tests {
         assert_eq!(store.setting("k").unwrap().as_deref(), Some("one"));
         store.set_setting("k", "two").unwrap();
         assert_eq!(store.setting("k").unwrap().as_deref(), Some("two"));
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM settings"), 1);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM settings WHERE key = 'k'"),
+            1
+        );
     }
 
     #[test]
@@ -1917,6 +2391,7 @@ mod tests {
 
     fn provider(name: &str) -> ProviderDef {
         ProviderDef {
+            api: crate::config::ApiStyle::OpenAi,
             name: name.into(),
             base_url: format!("http://{name}/v1"),
             model: format!("{name}-model"),

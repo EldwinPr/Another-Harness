@@ -44,6 +44,13 @@ impl ChatUsage {
         self.completion_total += tokens.completion.unwrap_or(0);
         self.last = Some(tokens);
     }
+
+    /// Adds what a subagent used (issue 33) to the totals. `last` is the size of this chat's own
+    /// newest request, so it stays as it was.
+    pub fn add_subagent(&mut self, prompt: u64, completion: u64) {
+        self.prompt_total += prompt;
+        self.completion_total += completion;
+    }
 }
 
 /// `1234567` as `1,234,567`.
@@ -71,6 +78,10 @@ pub struct Info<'a> {
     pub approve: &'a str,
     /// How many "always" permissions were given in this run.
     pub always: usize,
+    /// How many background subagents are running (issue 35); shown only when above zero.
+    pub subagents: usize,
+    /// How many background commands are running (issue 42); shown only when above zero.
+    pub shells: usize,
     pub usage: &'a ChatUsage,
 }
 
@@ -115,6 +126,10 @@ pub fn info_line(info: &Info, width: Option<usize>) -> String {
             None => "context: not sent yet".to_owned(),
         },
     ]
+    .into_iter()
+    .chain((info.subagents > 0).then(|| format!("subagents: {} running", info.subagents)))
+    .chain((info.shells > 0).then(|| format!("commands: {} running", info.shells)))
+    .collect::<Vec<_>>()
     .join(" │ ");
 
     // Short: the same facts with short labels and no cached count.
@@ -210,6 +225,8 @@ mod tests {
             provider: "prov",
             approve: "manual",
             always,
+            subagents: 0,
+            shells: 0,
             usage,
         }
     }
@@ -280,5 +297,15 @@ mod tests {
             info_line(&info(&fresh, 0), Some(60)),
             "m · prov │ manual │ last: none │ chat 0/0 │ ctx -"
         );
+    }
+    #[test]
+    fn running_subagents_are_counted_only_when_there_are_some() {
+        let usage = ChatUsage::default();
+        let none = info_line(&info(&usage, 0), None);
+        assert!(!none.contains("subagent"), "{none}");
+        let mut running = info(&usage, 0);
+        running.subagents = 2;
+        let full = info_line(&running, None);
+        assert!(full.ends_with(" │ subagents: 2 running"), "{full}");
     }
 }

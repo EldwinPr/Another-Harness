@@ -340,16 +340,14 @@ mod tests {
     use crate::style::Style;
     use crate::tools::testutil::Scratch;
     use crate::turn_log::TurnLog;
-    use std::cell::RefCell;
     use std::io::Cursor;
-    use std::rc::Rc;
 
     const DOWN: &str = "\x1b[B";
     const ENTER: &str = "\r";
     const ESC: &str = "\x1b";
 
     type TestTerm = Shared<Cursor<Vec<u8>>, Vec<u8>>;
-    type Requests = Rc<RefCell<Vec<Vec<u8>>>>;
+    type Requests = crate::agent::Shared<Vec<Vec<u8>>>;
 
     fn screen(term: &TestTerm) -> String {
         String::from_utf8(term.borrow().output().clone()).unwrap()
