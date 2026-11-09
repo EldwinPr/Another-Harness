@@ -334,12 +334,55 @@ impl ShellTasks {
 
 // ---- the `task` tool ----
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","output","stop"]},"id":{"type":"integer","description":"The task number, for output and stop"}},"required":["action"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","output","stop"]},"id":{"type":["string","integer"],"description":"The id shown by list: s1 for a command, a1 for a subagent. For output and stop"}},"required":["action"]}"#;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawId {
+    Number(u32),
+    Text(String),
+}
 
 #[derive(Deserialize)]
 struct Args {
     action: String,
-    id: Option<u32>,
+    id: Option<RawId>,
+}
+
+/// What a `task` call asks for. The id is `('s', n)` for a command, `('a', n)` for a subagent, and
+/// `('?', n)` for a bare number (a command, as before subagents could be reached).
+#[derive(Debug, PartialEq, Eq)]
+pub struct TaskCall {
+    pub action: String,
+    pub id: Option<(char, u32)>,
+}
+
+/// `s2` or `a1` (a bare number, or `#3`, is also taken: its kind is `'?'`).
+pub fn task_id(word: &str) -> Option<(char, u32)> {
+    let word = word.trim().trim_start_matches('#');
+    let (kind, digits) = match word.chars().next()? {
+        c @ ('s' | 'a') => (c, &word[1..]),
+        _ => ('?', word),
+    };
+    digits.parse().ok().map(|n| (kind, n))
+}
+
+/// Reads the arguments of a `task` call; the words of the error are the ones the model sees.
+pub fn parse_task_call(arguments: &str) -> Result<TaskCall, String> {
+    let args: Args =
+        serde_json::from_str(arguments).map_err(|e| format!("error: invalid arguments: {e}"))?;
+    let id = match args.id {
+        None => None,
+        Some(RawId::Number(n)) => Some(('?', n)),
+        Some(RawId::Text(text)) => Some(
+            task_id(&text)
+                .ok_or_else(|| format!("error: '{text}' is not a task id (like s1 or a1)"))?,
+        ),
+    };
+    Ok(TaskCall {
+        action: args.action,
+        id,
+    })
 }
 
 pub struct TaskTool {
@@ -352,7 +395,7 @@ impl TaskTool {
         Self {
             spec: ToolSpec::new(
                 "task",
-                "Commands started with bash and background true: list them, read the latest output of one (output), or stop one (stop).",
+                "Background work: commands started with bash and background true (ids s1, s2) and subagents started with delegate (ids a1, a2). list shows them, output reads the latest output of a command or the progress and answer of a subagent, stop ends one.",
                 SCHEMA,
             )
             .expect("the schema constant is valid JSON"),
@@ -361,10 +404,15 @@ impl TaskTool {
     }
 
     fn go(&self, arguments: &str) -> Result<String, String> {
-        let args: Args = serde_json::from_str(arguments)
-            .map_err(|e| format!("error: invalid arguments: {e}"))?;
-        let id = || args.id.ok_or_else(|| "error: give the task id".to_owned());
-        match args.action.as_str() {
+        let call = parse_task_call(arguments)?;
+        let id = || match call.id {
+            Some(('a', n)) => Err(format!(
+                "error: a{n} is a subagent, and subagents cannot be reached from here"
+            )),
+            Some((_, n)) => Ok(n),
+            None => Err("error: give the task id".to_owned()),
+        };
+        match call.action.as_str() {
             "list" => {
                 let all = self.shells.list();
                 if all.is_empty() {
@@ -420,6 +468,31 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn task_ids_are_read_as_text_or_number() {
+        let call = |text: &str| parse_task_call(text).unwrap();
+        assert_eq!(call(r#"{"action":"stop","id":"a2"}"#).id, Some(('a', 2)));
+        assert_eq!(call(r#"{"action":"stop","id":"s10"}"#).id, Some(('s', 10)));
+        assert_eq!(call(r#"{"action":"output","id":3}"#).id, Some(('?', 3)));
+        assert_eq!(
+            call(r##"{"action":"output","id":"#3"}"##).id,
+            Some(('?', 3))
+        );
+        assert_eq!(call(r#"{"action":"list"}"#).id, None);
+        assert!(
+            parse_task_call(r#"{"action":"stop","id":"x"}"#)
+                .unwrap_err()
+                .contains("not a task id")
+        );
+    }
+
+    #[test]
+    fn the_tool_alone_points_a_subagent_id_to_the_agent() {
+        let tool = TaskTool::new(ShellTasks::new());
+        let out = tool.run(r#"{"action":"stop","id":"a1"}"#);
+        assert!(out.starts_with("error: a1 is a subagent"), "{out}");
     }
 
     #[test]

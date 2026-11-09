@@ -17,7 +17,7 @@ use crate::provider::router_host;
 use crate::providers::ProviderDef;
 use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, summary_body};
 use crate::style::Style;
-use crate::tools::{Answer, Approver, Ask, Mode};
+use crate::tools::{Answer, Approver, Ask, Mode, task_id};
 use crate::turn_log::utc_label;
 
 /// How wide a collapsed tool line may be when the terminal's width is not known.
@@ -2027,16 +2027,6 @@ fn calls_command<R: BufRead, W: Write>(term: &Shared<R, W>, rest: &str) {
         }
         _ => say_line(term, &style.yellow("usage: /calls [all | short]")),
     }
-}
-
-/// `s2` or `a1` (a bare number is also taken, as a command first and then a subagent).
-fn task_id(word: &str) -> Option<(char, u32)> {
-    let word = word.trim().trim_start_matches('#');
-    let (kind, digits) = match word.chars().next()? {
-        c @ ('s' | 'a') => (c, &word[1..]),
-        _ => ('?', word),
-    };
-    digits.parse().ok().map(|n| (kind, n))
 }
 
 /// `/tasks [show ID | stop ID]`: the background commands and subagents in one list (issue 42).

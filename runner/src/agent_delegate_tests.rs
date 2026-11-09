@@ -455,3 +455,67 @@ fn shapes_are_preloaded_into_a_subagent_and_it_can_read_but_not_propose() {
     assert!(tools.contains(&"context".to_owned()), "{tools:?}");
     assert!(!tools.contains(&"context_propose".to_owned()), "{tools:?}");
 }
+
+#[test]
+fn the_model_can_list_read_and_stop_a_subagent_with_task() {
+    let dir = Scratch::new("delegate-task");
+    let (mut agent, h) = setup(
+        &dir,
+        vec![
+            ScriptedProvider::tool_calls(&[
+                ("d1", "delegate", TASK),
+                ("t1", "task", r#"{"action":"list"}"#),
+                ("t2", "task", r#"{"action":"output","id":"a1"}"#),
+                ("t3", "task", r#"{"action":"stop","id":"a1"}"#),
+                ("t4", "task", r#"{"action":"stop","id":"a1"}"#),
+                ("t5", "task", r#"{"action":"stop","id":"a9"}"#),
+                ("t6", "task", r#"{"action":"stop","id":"zzz"}"#),
+            ]),
+            ScriptedProvider::text("Stopped it."),
+        ],
+        vec![ScriptedProvider::text("never delivered")],
+    );
+    let task_tool = crate::tools::TaskTool::new(agent.shells().clone());
+    agent.tools.push(Box::new(task_tool));
+    assert_eq!(
+        agent.send("start one and stop it", &mut NoObserver),
+        Outcome::Answer("Stopped it.".into())
+    );
+    let seen = json(&h.main_seen.borrow()[1]);
+    let messages = seen["messages"].as_array().unwrap();
+    let results: Vec<&str> = messages[messages.len() - 7..]
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert!(
+        results[0].contains("task with action stop and id a1"),
+        "{}",
+        results[0]
+    );
+    assert!(results[1].starts_with("a1  running"), "{}", results[1]);
+    assert!(
+        results[1].contains("planner: find where x is decided"),
+        "{}",
+        results[1]
+    );
+    assert!(results[2].contains("(no answer yet)"), "{}", results[2]);
+    assert_eq!(
+        results[3],
+        "stopping a1; its answer will not be added to the chat"
+    );
+    // A second stop before the thread has noticed the first is harmless.
+    assert!(results[4].starts_with("stopping a1"), "{}", results[4]);
+    assert!(
+        results[5].starts_with("error: ") && results[5].contains("no subagent #9"),
+        "{}",
+        results[5]
+    );
+    assert!(results[6].contains("is not a task id"), "{}", results[6]);
+
+    // The stopped run's answer never reaches the chat.
+    h.release();
+    wait_for(&agent, 1, Status::Stopped);
+    agent.send("and?", &mut NoObserver);
+    let delivered = json(&h.main_seen.borrow()[2])["messages"].to_string();
+    assert!(!delivered.contains("never delivered"), "{delivered}");
+}

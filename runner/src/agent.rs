@@ -1186,6 +1186,8 @@ impl Agent {
                 let mut output =
                     if call.name == crate::subagent::DELEGATE && self.subagent_tools.is_some() {
                         self.delegate(call)
+                    } else if call.name == "task" && self.has_tool("task") {
+                        self.task(call)
                     } else {
                         self.run_tool(call)
                     };
@@ -1660,13 +1662,49 @@ impl Agent {
                 self.delegations += 1;
                 let kind = if run.coder { "coder" } else { "reader" };
                 format!(
-                    "subagent #{} ({}, {kind}) is running in the background. Its answer will be added to the chat when the user's next message comes after it has finished. Tell the user it is running and end your turn; do not wait or start it again.",
-                    run.n, run.profile
+                    "subagent #{} ({}, {kind}) is running in the background. Its answer will be added to the chat when the user's next message comes after it has finished. Tell the user it is running and end your turn; do not wait or start it again. To stop it, use task with action stop and id a{}.",
+                    run.n, run.profile, run.n
                 )
             }
             Err(why) if why.starts_with("error:") => why,
             Err(why) => format!("error: {why}"),
         }
+    }
+
+    /// Runs `task` (issue 42): the model's view of what runs in the background. The tool itself
+    /// knows only the commands; the subagents are the agent's, so a list, a read or a stop that
+    /// names one (`a1`) is answered here, and everything else goes to the tool.
+    fn task(&mut self, call: &ToolCall) -> String {
+        use crate::tools::{ShellInfo, parse_task_call};
+        let parsed = match parse_task_call(&call.arguments) {
+            Ok(parsed) => parsed,
+            Err(why) => return why,
+        };
+        match (parsed.action.as_str(), parsed.id) {
+            ("list", _) => {
+                let mut lines: Vec<String> =
+                    self.shells.list().iter().map(ShellInfo::line).collect();
+                lines.extend(self.jobs.list().iter().map(|r| r.line()));
+                if lines.is_empty() {
+                    "no background commands or subagents".to_owned()
+                } else {
+                    lines.join("\n")
+                }
+            }
+            ("output", Some(('a', n))) => match self.jobs.list().into_iter().find(|r| r.n == n) {
+                Some(run) => run.detail(crate::subagent::MAX_ANSWER_CHARS),
+                None => format!("error: there is no subagent a{n} in this run"),
+            },
+            ("stop", Some(('a', n))) => match self.jobs.stop(n) {
+                Ok(()) => format!("stopping a{n}; its answer will not be added to the chat"),
+                Err(why) => format!("error: {why}"),
+            },
+            _ => self.run_tool(call),
+        }
+    }
+
+    fn has_tool(&self, name: &str) -> bool {
+        self.tools.iter().any(|t| t.spec().name == name)
     }
 
     /// Starts a subagent on a thread of its own (issues 33, 35); the jobs refuse a start that is

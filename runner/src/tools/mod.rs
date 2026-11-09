@@ -35,7 +35,9 @@ pub use library::library_tools;
 pub use notes::{MAX_NOTE_BYTES, NOTES_DIR, WriteNote};
 pub use read_file::ReadFile;
 pub use steps::{Step, StepStatus, StepsTool, parse_steps, unfinished};
-pub use tasks::{ShellInfo, ShellStatus, ShellTasks, TaskTool, clock};
+pub use tasks::{
+    ShellInfo, ShellStatus, ShellTasks, TaskCall, TaskTool, clock, parse_task_call, task_id,
+};
 pub use truncate::{HEAD_BYTES, MAX_OUTPUT_BYTES, TAIL_BYTES, truncate};
 
 // Rust note: a `trait` is a set of methods a type promises to provide, like a

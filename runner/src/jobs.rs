@@ -87,6 +87,47 @@ pub struct RunInfo {
     pub result: Option<String>,
 }
 
+impl RunInfo {
+    /// `a2  running  1m 05s  planner: find where x is decided`, the way `task list` shows it.
+    pub fn line(&self) -> String {
+        let head = format!(
+            "a{}  {}  {}  {}: ",
+            self.n,
+            self.status.name(),
+            crate::tools::clock(std::time::Duration::from_secs(self.seconds)),
+            self.profile
+        );
+        let task: String = self
+            .task
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
+        format!("{head}{task}")
+    }
+
+    /// Its line, the latest calls and, once it has one, its answer (cut at `max_answer` characters).
+    pub fn detail(&self, max_answer: usize) -> String {
+        let mut text = self.line();
+        if !self.recent.is_empty() {
+            text.push_str("\nlatest calls:");
+            for call in &self.recent {
+                text.push_str(&format!("\n  - {call}"));
+            }
+        }
+        match &self.result {
+            Some(result) => {
+                let shown: String = result.chars().take(max_answer).collect();
+                text.push_str(&format!("\nanswer:\n{shown}"));
+            }
+            None => text.push_str("\n(no answer yet)"),
+        }
+        text
+    }
+}
+
 /// A run seen from outside the chat: it shares the run's progress, so it stays current.
 #[derive(Clone)]
 pub struct RunView {
