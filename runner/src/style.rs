@@ -64,6 +64,21 @@ impl Style {
         self.paint("33", text)
     }
 
+    /// Plain cyan: the input box.
+    pub fn cyan(self, text: &str) -> String {
+        self.paint("36", text)
+    }
+
+    /// Switches cyan on for what is printed next (the typed line); empty without colour.
+    pub fn cyan_on(self) -> &'static str {
+        if self.enabled { "\x1b[36m" } else { "" }
+    }
+
+    /// Ends [`Style::cyan_on`].
+    pub fn cyan_off(self) -> &'static str {
+        if self.enabled { "\x1b[0m" } else { "" }
+    }
+
     /// Bold cyan: the prompt and the user's own lines.
     pub fn accent(self, text: &str) -> String {
         self.paint("1;36", text)

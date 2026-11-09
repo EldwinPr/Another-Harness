@@ -26,6 +26,10 @@ pub enum Edit {
     Up,
     Down,
     Enter,
+    /// Tab: accepts a suggestion when the box shows a list; otherwise nothing.
+    Tab,
+    /// The Escape key on its own: closes a list; otherwise nothing.
+    Escape,
     /// Ctrl-D: end of input on an empty line, else delete the character under the cursor.
     Eof,
     /// Ctrl-C: clear the line; on an empty line, end the input.
@@ -73,10 +77,12 @@ pub fn parse_edit(bytes: &[u8]) -> (Option<Edit>, usize) {
             Some(0x7f) => (Some(Edit::DeleteWord), 2),
             Some(b'b') => (Some(Edit::WordLeft), 2),
             Some(b'f') => (Some(Edit::WordRight), 2),
-            // The Escape key on its own: nothing to do in a line.
-            _ => (None, 1),
+            // The Escape key, on its own or followed by something we do not know: the next
+            // key is read as itself.
+            _ => (Some(Edit::Escape), 1),
         },
         b'\r' | b'\n' => (Some(Edit::Enter), 1),
+        b'\t' => (Some(Edit::Tab), 1),
         0x7f => (Some(Edit::Backspace), 1),
         0x08 | 0x17 => (Some(Edit::DeleteWord), 1),
         0x01 => (Some(Edit::Home), 1),
@@ -143,6 +149,20 @@ impl LineEditor {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// The characters typed so far.
+    pub fn chars(&self) -> &[char] {
+        &self.chars
+    }
+
+    /// Replaces the characters `start..end` with `text` and puts the cursor after it.
+    pub fn replace(&mut self, start: usize, end: usize, text: &str) {
+        let end = end.min(self.chars.len());
+        let start = start.min(end);
+        let new: Vec<char> = text.chars().collect();
+        self.cursor = start + new.len();
+        self.chars.splice(start..end, new);
     }
 
     fn word_start(&self, from: usize) -> usize {
@@ -231,6 +251,7 @@ impl LineEditor {
                 }
             },
             Edit::Enter => return Step::Submit,
+            Edit::Tab | Edit::Escape => {}
             Edit::Eof => {
                 if self.chars.is_empty() {
                     return Step::Eof;
@@ -376,9 +397,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_sequences_and_a_lone_escape_are_ignored_and_text_is_utf8() {
+    fn unknown_sequences_are_ignored_a_lone_escape_is_a_key_and_text_is_utf8() {
         assert_eq!(keys(b"\x1b[99Z"), []);
-        assert_eq!(keys(b"\x1b"), []);
+        assert_eq!(keys(b"\x1b"), [Edit::Escape]);
+        assert_eq!(keys(b"a\tb"), [Edit::Char('a'), Edit::Tab, Edit::Char('b')]);
         assert_eq!(
             keys("é日a".as_bytes()),
             [Edit::Char('é'), Edit::Char('日'), Edit::Char('a')]

@@ -9,9 +9,21 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::store::{Store, StoreError, sha256_hex};
 
+/// The built-in text before issue 16 listed the tools. A database that still holds exactly this as
+/// `base` gets the new text in schema 8; an edited `base` is left alone.
+pub const PREVIOUS_BUILTIN_PROMPT: &str = "You are a coding assistant running in a terminal. You can read files and run shell commands with the tools provided. Use a tool when you need information you do not have, then answer concisely.";
+
+/// The built-in text of schema 8 (the five tools). A database that still holds exactly this as
+/// `base` gets the new text in schema 9.
+pub const BUILTIN_PROMPT_V8: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds.\nFile paths are relative to the working directory; absolute paths and .. are refused. Prefer the file tools to bash for reading and changing files. Looking commands such as ls, cd, pwd, cat and mkdir run without asking the user; any other command, and file changes in manual mode, need the user's approval. If a result says \"denied by user\", do not retry it: say what you wanted to do and ask. Use a tool when you need information you do not have, then answer concisely.";
+
+/// The built-in text of schema 9 (six tools). A database that still holds exactly this as `base`
+/// gets the new text in schema 10.
+pub const BUILTIN_PROMPT_V9: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds.\nFile paths are relative to the working directory; absolute paths and .. are refused. Prefer the file tools to bash for reading and changing files, and edit_file to write_file for changes: use write_file only for a full rewrite. Looking commands such as ls, cd, pwd, cat and mkdir run without asking the user; any other command, and file changes in manual mode, need the user's approval. If a result says \"denied by user\", do not retry it: say what you wanted to do and ask. Use a tool when you need information you do not have, then answer concisely.";
+
 /// The system prompt the program had before prompts were stored. It seeds the `base` row, is used
 /// when no prompt is switched on, and is what "restore built-in text" writes back.
-pub const BUILTIN_PROMPT: &str = "You are a coding assistant running in a terminal. You can read files and run shell commands with the tools provided. Use a tool when you need information you do not have, then answer concisely.";
+pub const BUILTIN_PROMPT: &str = "You are a coding assistant running in a terminal, working in one folder (the working directory). You have these tools:\n- read_file(path): read a UTF-8 text file.\n- create_file(path, content): create a new file, with any missing folders. Fails if the file exists.\n- write_file(path, content): replace the whole content of an existing file.\n- edit_file(path, old_string, new_string, replace_all): change part of an existing file by replacing exact text; fails if old_string is not found or is not unique (unless replace_all is true).\n- delete_file(path): delete one file. Folders are never deleted.\n- bash(command): run a shell command with bash -c in the working directory; it stops after 30 seconds. Every call starts in the working directory again, so cd does not carry over: use paths like dir/file.\nRules:\n- Stay inside the working directory. File paths are relative; absolute paths and .. are refused. Do not write to /tmp or look through the rest of the computer (find /, ~).\n- Change files with edit_file for small changes, create_file for new files and write_file only for a full rewrite. Do not change files with shell redirects, heredocs or patch scripts.\n- To look, use ls, grep, find, head, tail, wc, cat or sed -n 'N,Mp' file. These, and pipes between them, run without asking the user; any other command, and file changes in manual mode, need the user's approval.\n- When you need several independent things, ask for them together in one response: every call re-sends the whole conversation, and a message is limited to 20 model calls.\n- If a result says \"denied by user\", do not retry it or find a way around it: say what you wanted to do and ask.\n- If something is not found after two tries (a file, a script, a command), stop searching and tell the user. Do not guess paths or scan the filesystem.\nUse a tool when you need information you do not have, then answer concisely.";
 
 /// The name of the seeded prompt.
 pub const BASE_NAME: &str = "base";
@@ -119,34 +131,94 @@ impl ChatPrompts {
     }
 }
 
-/// The text added after the user's message while a personality or skills are active: the
-/// personality first, then the skills that are on or for this message, each group by position.
-/// `None` when nothing is active. A name with no matching prompt of the right type is skipped.
-pub fn compose_injection(prompts: &[Prompt], state: &ChatPrompts) -> Option<String> {
+/// The start of every saved "active instructions" message. A resumed chat shows these as one
+/// line, and the agent finds the newest one to see whether the instructions changed.
+pub const ACTIVE_MARK: &str =
+    "Active instructions (set in the program's settings, not written by the user)";
+
+/// The start of the message a compacted chat begins with (issue 24). A resumed chat shows it as
+/// one line.
+pub const SUMMARY_MARK: &str = "Summary of the earlier conversation in this chat (written by the model at the user's request; the full chat is saved separately). Continue from it.";
+
+/// The text of the first message of a compacted chat: the fixed first sentence, then (when the
+/// old chat was saved) `[earlier chat: N]`, then the model's summary. The number lets the chat
+/// list warn before the chat it came from is deleted.
+pub fn summary_message(earlier: Option<i64>, summary: &str) -> String {
+    match earlier {
+        Some(id) => format!("{SUMMARY_MARK}\n\n{}\n\n{summary}", earlier_line(id)),
+        None => format!("{SUMMARY_MARK}\n\n{summary}"),
+    }
+}
+
+/// `[earlier chat: N]`, the line that names the chat a summary was made from.
+pub fn earlier_line(id: i64) -> String {
+    format!("[earlier chat: {id}]")
+}
+
+/// The summary text itself, without the fixed sentence and without the `[earlier chat: N]` line.
+pub fn summary_body(message: &str) -> &str {
+    let rest = message.strip_prefix(SUMMARY_MARK).unwrap_or(message).trim();
+    match rest.strip_prefix("[earlier chat: ") {
+        Some(after) => match after.split_once(']') {
+            Some((number, tail)) if number.parse::<i64>().is_ok() => tail.trim(),
+            _ => rest,
+        },
+        None => rest,
+    }
+}
+
+/// Added to the chat when nothing is active any more but an earlier block is.
+pub const NONE_ACTIVE: &str = "Active instructions (set in the program's settings, not written by the user): none are active now. Ignore any earlier \"Active instructions\" message.";
+
+fn sections(
+    prompts: &[Prompt],
+    state: &ChatPrompts,
+    personality: bool,
+    skills: &[String],
+) -> Vec<String> {
     let mut sections: Vec<String> = Vec::new();
-    if let Some(name) = &state.personality
+    if personality
+        && let Some(name) = &state.personality
         && let Some(p) = prompts
             .iter()
             .find(|p| &p.name == name && p.prompt_type == PromptType::Personality)
     {
         sections.push(format!("## Personality: {}\n{}", p.name, p.text.trim()));
     }
-    let mut skills: Vec<&Prompt> = prompts
+    let mut chosen: Vec<&Prompt> = prompts
         .iter()
-        .filter(|p| {
-            p.prompt_type == PromptType::Skill
-                && (state.on.contains(&p.name) || state.once.contains(&p.name))
-        })
+        .filter(|p| p.prompt_type == PromptType::Skill && skills.contains(&p.name))
         .collect();
-    skills.sort_by_key(|p| (p.position, p.id));
-    for p in skills {
+    chosen.sort_by_key(|p| (p.position, p.id));
+    for p in chosen {
         sections.push(format!("## Skill: {}\n{}", p.name, p.text.trim()));
     }
+    sections
+}
+
+/// The personality and the skills that are on, as one message to put in the chat before the user's
+/// message when it differs from the newest such message already there (issue 20). `None` when
+/// nothing is active. A name with no matching prompt of the right type is skipped.
+pub fn compose_persistent(prompts: &[Prompt], state: &ChatPrompts) -> Option<String> {
+    let sections = sections(prompts, state, true, &state.on);
     if sections.is_empty() {
         return None;
     }
     Some(format!(
-        "Active instructions for your next reply (they come from the program's settings, not from the user's message):\n\n{}",
+        "{ACTIVE_MARK}. They replace any earlier \"Active instructions\" message and stay in force until a newer one:\n\n{}",
+        sections.join("\n\n")
+    ))
+}
+
+/// The skills asked for one message only: added after the newest message on each call of that
+/// message and never kept in the chat. `None` when there are none.
+pub fn compose_once(prompts: &[Prompt], state: &ChatPrompts) -> Option<String> {
+    let sections = sections(prompts, state, false, &state.once);
+    if sections.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Active instructions for this message only (they come from the program's settings, not from the user's message):\n\n{}",
         sections.join("\n\n")
     ))
 }
@@ -379,73 +451,21 @@ impl Store {
         self.exists(changed, name)
     }
 
-    /// Switches a prompt on or off. What that means depends on its type (in the system prompt; on
-    /// by default as a skill; the default personality). Only one personality can be the default:
-    /// switching one on switches the others off.
+    /// Switches a system prompt on or off. Skills and personalities are never on in the library:
+    /// a chat chooses them (`ChatPrompts`), and a new chat starts with none.
     pub fn set_prompt_enabled(&mut self, name: &str, enabled: bool) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
-        let now = crate::store::now_secs();
-        if enabled {
-            tx.execute(
-                "UPDATE prompts SET enabled = 0 WHERE type = 'personality' AND name <> ?1 \
-                 AND EXISTS (SELECT 1 FROM prompts WHERE name = ?1 AND type = 'personality')",
-                [name],
-            )?;
+        let prompt = self.prompt(name)?;
+        if prompt.prompt_type != PromptType::System {
+            return Err(err(format!(
+                "{name} is a {}: it is chosen in a chat, not switched on here",
+                prompt.prompt_type.as_str()
+            )));
         }
-        let changed = tx.execute(
+        let changed = self.conn.execute(
             "UPDATE prompts SET enabled = ?2, updated_at = ?3 WHERE name = ?1",
-            params![name, i64::from(enabled), now],
+            params![name, i64::from(enabled), crate::store::now_secs()],
         )?;
-        if changed == 0 {
-            return Err(err(format!(
-                "there is no prompt named {name} (see /prompts)"
-            )));
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Changes what a prompt is for. It stops being on by default (the meaning of that differs by
-    /// type) and is removed from the saved states of chats.
-    pub fn set_prompt_type(
-        &mut self,
-        name: &str,
-        prompt_type: PromptType,
-    ) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM chat_prompt_state WHERE prompt_id IN (SELECT id FROM prompts WHERE name = ?1)",
-            [name],
-        )?;
-        let changed = tx.execute(
-            "UPDATE prompts SET type = ?2, enabled = 0, updated_at = ?3 WHERE name = ?1",
-            params![name, prompt_type.as_str(), crate::store::now_secs()],
-        )?;
-        if changed == 0 {
-            return Err(err(format!(
-                "there is no prompt named {name} (see /prompts)"
-            )));
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// The starting skills and personality of a new chat: the skills and the personality that are
-    /// switched on as defaults.
-    pub fn default_chat_prompts(&self) -> Result<ChatPrompts, StoreError> {
-        let all = self.list_prompts()?;
-        Ok(ChatPrompts {
-            personality: all
-                .iter()
-                .find(|p| p.enabled && p.prompt_type == PromptType::Personality)
-                .map(|p| p.name.clone()),
-            on: all
-                .iter()
-                .filter(|p| p.enabled && p.prompt_type == PromptType::Skill)
-                .map(|p| p.name.clone())
-                .collect(),
-            once: Vec::new(),
-        })
+        self.exists(changed, name)
     }
 
     /// The skills and personality a saved chat had.
@@ -596,6 +616,22 @@ mod tests {
             position,
             prompt_type: PromptType::System,
         }
+    }
+
+    #[test]
+    fn the_summary_message_names_its_chat_and_the_body_leaves_that_out() {
+        let with = summary_message(Some(7), "the text");
+        assert_eq!(
+            with,
+            format!("{SUMMARY_MARK}\n\n[earlier chat: 7]\n\nthe text")
+        );
+        assert_eq!(summary_body(&with), "the text");
+        let without = summary_message(None, "the text");
+        assert_eq!(without, format!("{SUMMARY_MARK}\n\nthe text"));
+        assert_eq!(summary_body(&without), "the text");
+        // A summary that merely starts with something like the line is left alone.
+        let odd = summary_message(None, "[earlier chat: x] more");
+        assert_eq!(summary_body(&odd), "[earlier chat: x] more");
     }
 
     #[test]
@@ -797,6 +833,112 @@ mod tests {
         assert_eq!(store.list_prompts().unwrap().len(), 1);
     }
 
+    // ---- the base prompt lists the tools (issue 16) ----
+
+    fn base_text_after_reopening(tag: &str, text: &str) -> String {
+        base_text_after_reopening_at(tag, text, 7)
+    }
+
+    fn base_text_after_reopening_at(tag: &str, text: &str, version: i64) -> String {
+        let dir = Scratch::new(tag);
+        let path = dir.path().join("harness.db");
+        drop(Store::open(&path).unwrap());
+        {
+            // Back to how an owner's database looked at an older schema.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute("UPDATE prompts SET text = ?1 WHERE name = 'base'", [text])
+                .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        store.prompt(BASE_NAME).unwrap().text
+    }
+
+    #[test]
+    fn an_unedited_base_gets_the_text_that_lists_the_tools() {
+        let text = base_text_after_reopening("prompt-v8-unedited", PREVIOUS_BUILTIN_PROMPT);
+        assert_eq!(text, BUILTIN_PROMPT);
+        assert_ne!(PREVIOUS_BUILTIN_PROMPT, BUILTIN_PROMPT);
+    }
+
+    #[test]
+    fn a_base_with_the_schema_8_text_gets_the_text_that_lists_edit_file() {
+        let text = base_text_after_reopening_at("prompt-v9-unedited", BUILTIN_PROMPT_V8, 8);
+        assert_eq!(text, BUILTIN_PROMPT);
+        assert_ne!(BUILTIN_PROMPT_V8, BUILTIN_PROMPT);
+        assert!(BUILTIN_PROMPT.contains("- edit_file("));
+        // An old database goes through both steps and ends on the newest text.
+        assert_eq!(
+            base_text_after_reopening("prompt-v9-from-7", PREVIOUS_BUILTIN_PROMPT),
+            BUILTIN_PROMPT
+        );
+        assert_eq!(
+            base_text_after_reopening_at("prompt-v9-edited", "Mine.", 8),
+            "Mine."
+        );
+    }
+
+    #[test]
+    fn a_base_with_the_schema_9_text_gets_the_rules_from_the_logs() {
+        let text = base_text_after_reopening_at("prompt-v10-unedited", BUILTIN_PROMPT_V9, 9);
+        assert_eq!(text, BUILTIN_PROMPT);
+        assert_ne!(BUILTIN_PROMPT_V9, BUILTIN_PROMPT);
+        assert_eq!(
+            base_text_after_reopening_at("prompt-v10-edited", "Mine.", 9),
+            "Mine."
+        );
+    }
+
+    #[test]
+    fn the_built_in_text_states_the_real_call_limit_and_stays_short() {
+        assert!(BUILTIN_PROMPT.contains(&format!(
+            "limited to {} model calls",
+            crate::agent::MAX_CALLS_PER_MESSAGE
+        )));
+        // Every call carries it: keep it under about 600 tokens.
+        assert!(estimated_tokens(BUILTIN_PROMPT.chars().count()) < 600);
+    }
+
+    #[test]
+    fn an_edited_base_is_left_alone() {
+        let text = base_text_after_reopening("prompt-v8-edited", "My own rules.");
+        assert_eq!(text, "My own rules.");
+    }
+
+    #[test]
+    fn the_built_in_text_names_every_tool_the_program_gives_the_model() {
+        use crate::tools::{
+            Answer, Approver, Ask, Bash, DEFAULT_TIMEOUT, Mode, ReadFile, Tool, file_tools,
+            shared_mode,
+        };
+        struct Never;
+        impl Approver for Never {
+            fn approve(&self, _ask: &Ask) -> Answer {
+                Answer::No
+            }
+        }
+        let dir = Scratch::new("prompt-names-tools");
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFile::new(dir.path()))];
+        tools.extend(file_tools(
+            dir.path(),
+            shared_mode(Mode::Manual),
+            std::rc::Rc::new(Never),
+        ));
+        tools.push(Box::new(Bash::new(
+            dir.path(),
+            DEFAULT_TIMEOUT,
+            Box::new(Never),
+        )));
+        assert_eq!(tools.len(), 6);
+        for tool in &tools {
+            let name = &tool.spec().name;
+            assert!(
+                BUILTIN_PROMPT.contains(&format!("- {name}(")),
+                "the built-in prompt does not list {name}"
+            );
+        }
+    }
+
     // ---- types, chat state and the injected text (issue 14) ----
 
     fn typed(name: &str, text: &str, kind: PromptType, position: i64) -> Prompt {
@@ -856,6 +998,33 @@ mod tests {
     }
 
     #[test]
+    fn a_version_six_database_loses_the_defaults_of_skills_and_personalities() {
+        let dir = Scratch::new("prompts-migrate-7");
+        let path = dir.path().join("harness.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{} {} {} {} {} {} PRAGMA user_version = 6;
+                 INSERT INTO prompts (name, description, text, enabled, position, created_at, updated_at, type)
+                     VALUES ('sys', '', 't', 1, 1, 1, 1, 'system'),
+                            ('skill', '', 't', 1, 2, 1, 1, 'skill'),
+                            ('pers', '', 't', 1, 3, 1, 1, 'personality');",
+                crate::store::SCHEMA_V1_FOR_TESTS,
+                crate::store::SCHEMA_V2_FOR_TESTS,
+                crate::store::SCHEMA_V3_FOR_TESTS,
+                crate::store::SCHEMA_V4_FOR_TESTS,
+                crate::store::SCHEMA_V5_FOR_TESTS,
+                crate::store::SCHEMA_V6_FOR_TESTS,
+            ))
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert!(store.prompt("sys").unwrap().enabled);
+        assert!(!store.prompt("skill").unwrap().enabled);
+        assert!(!store.prompt("pers").unwrap().enabled);
+    }
+
+    #[test]
     fn only_system_prompts_go_into_the_system_prompt() {
         let all = [
             typed("rules", "rules text", PromptType::System, 1),
@@ -872,54 +1041,38 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_is_added_with_its_type_and_the_type_can_change() {
+    fn a_prompt_is_added_with_its_type_and_only_system_prompts_are_switched() {
         let dir = Scratch::new("prompts-type");
         let mut store = open(&dir);
         store
             .add_prompt_of_type("tdd", "", "tests first", None, PromptType::Skill)
             .unwrap();
-        assert_eq!(store.prompt("tdd").unwrap().prompt_type, PromptType::Skill);
-        store.set_prompt_enabled("tdd", true).unwrap();
         store
-            .set_prompt_type("tdd", PromptType::Personality)
+            .add_prompt_of_type("pirate", "", "arr", None, PromptType::Personality)
             .unwrap();
-        let changed = store.prompt("tdd").unwrap();
-        assert_eq!(changed.prompt_type, PromptType::Personality);
-        // What "on" means differs by type, so a change of type starts from off.
-        assert!(!changed.enabled);
-        assert!(store.set_prompt_type("nope", PromptType::Skill).is_err());
-        // A plain add is a system prompt.
+        assert_eq!(store.prompt("tdd").unwrap().prompt_type, PromptType::Skill);
+        assert!(!store.prompt("tdd").unwrap().enabled);
+        // A plain add is a system prompt, and only those switch on and off.
         store.add_prompt("rules", "", "r", None).unwrap();
         assert_eq!(
             store.prompt("rules").unwrap().prompt_type,
             PromptType::System
         );
-    }
-
-    #[test]
-    fn switching_a_personality_on_switches_the_other_personalities_off() {
-        let dir = Scratch::new("prompts-exclusive");
-        let mut store = open(&dir);
-        for name in ["pirate", "caveman"] {
-            store
-                .add_prompt_of_type(name, "", "t", None, PromptType::Personality)
-                .unwrap();
+        store.set_prompt_enabled("rules", true).unwrap();
+        for name in ["tdd", "pirate"] {
+            let why = store
+                .set_prompt_enabled(name, true)
+                .unwrap_err()
+                .to_string();
+            assert!(why.contains("chosen in a chat"), "{why}");
+            assert!(!store.prompt(name).unwrap().enabled);
         }
-        store
-            .add_prompt_of_type("tdd", "", "t", None, PromptType::Skill)
-            .unwrap();
-        store.set_prompt_enabled("tdd", true).unwrap();
-        store.set_prompt_enabled("pirate", true).unwrap();
-        store.set_prompt_enabled("caveman", true).unwrap();
-        assert!(!store.prompt("pirate").unwrap().enabled);
-        assert!(store.prompt("caveman").unwrap().enabled);
-        // Skills and system prompts are untouched.
-        assert!(store.prompt("tdd").unwrap().enabled);
-        assert!(store.prompt("base").unwrap().enabled);
-        let defaults = store.default_chat_prompts().unwrap();
-        assert_eq!(defaults.personality.as_deref(), Some("caveman"));
-        assert_eq!(defaults.on, ["tdd"]);
-        assert!(defaults.once.is_empty());
+        // Names are shared by every kind.
+        assert!(
+            store
+                .add_prompt_of_type("tdd", "", "x", None, PromptType::Personality)
+                .is_err()
+        );
     }
 
     #[test]
@@ -976,15 +1129,12 @@ mod tests {
         };
         store.delete_prompt("tdd").unwrap();
         assert_eq!(count(&store), 1);
-        store.set_prompt_type("pirate", PromptType::Skill).unwrap();
-        assert_eq!(count(&store), 0);
-        store.set_chat_prompts(id, &state).unwrap();
         store.delete_session(id).unwrap();
         assert_eq!(count(&store), 0);
     }
 
     #[test]
-    fn the_injection_has_the_personality_first_then_the_active_skills_by_position() {
+    fn the_kept_text_has_the_personality_first_then_the_skills_that_are_on_by_position() {
         let all = [
             typed("late", "late skill\n", PromptType::Skill, 5),
             typed("early", "  early skill ", PromptType::Skill, 2),
@@ -994,27 +1144,49 @@ mod tests {
         ];
         let state = ChatPrompts {
             personality: Some("pirate".into()),
-            on: vec!["late".into(), "rules".into()],
-            once: vec!["early".into(), "gone".into()],
+            on: vec!["late".into(), "early".into(), "rules".into()],
+            once: vec!["off".into(), "gone".into()],
         };
-        let text = compose_injection(&all, &state).unwrap();
-        assert!(text.starts_with("Active instructions for your next reply"));
+        let text = compose_persistent(&all, &state).unwrap();
+        assert!(text.starts_with(ACTIVE_MARK));
+        assert!(text.contains("stay in force until a newer one"));
         let pirate = text
             .find("## Personality: pirate\ntalk like a pirate")
             .unwrap();
         let early = text.find("## Skill: early\nearly skill").unwrap();
         let late = text.find("## Skill: late\nlate skill").unwrap();
         assert!(pirate < early && early < late);
+        // The skill for this message only and the system prompt are not in it.
         assert!(!text.contains("never") && !text.contains("not a skill"));
         // The same input gives the same bytes.
-        assert_eq!(compose_injection(&all, &state).unwrap(), text);
-        // Nothing active, or only names that match nothing: no text.
-        assert_eq!(compose_injection(&all, &ChatPrompts::default()), None);
+        assert_eq!(compose_persistent(&all, &state).unwrap(), text);
+        // Nothing on, or only names that match nothing: no text.
+        assert_eq!(compose_persistent(&all, &ChatPrompts::default()), None);
         let only_gone = ChatPrompts {
             on: vec!["gone".into(), "rules".into()],
             ..ChatPrompts::default()
         };
-        assert_eq!(compose_injection(&all, &only_gone), None);
+        assert_eq!(compose_persistent(&all, &only_gone), None);
+    }
+
+    #[test]
+    fn the_text_for_one_message_holds_only_those_skills() {
+        let all = [
+            typed("a", "skill a", PromptType::Skill, 1),
+            typed("b", "skill b", PromptType::Skill, 2),
+            typed("pirate", "arr", PromptType::Personality, 3),
+        ];
+        let state = ChatPrompts {
+            personality: Some("pirate".into()),
+            on: vec!["a".into()],
+            once: vec!["b".into()],
+        };
+        let text = compose_once(&all, &state).unwrap();
+        assert!(text.starts_with("Active instructions for this message only"));
+        assert!(text.contains("## Skill: b\nskill b"));
+        assert!(!text.contains("skill a") && !text.contains("arr"));
+        assert!(!text.starts_with(ACTIVE_MARK));
+        assert_eq!(compose_once(&all, &ChatPrompts::default()), None);
     }
 
     #[test]

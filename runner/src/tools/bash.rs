@@ -14,7 +14,8 @@ use kernel::ToolSpec;
 use serde::Deserialize;
 
 use super::truncate::OutputCapture;
-use super::{Approver, Tool};
+use super::{Approver, Mode, SharedMode, Tool, always_for, is_free, shared_mode};
+use crate::cancel::Cancel;
 
 /// How long a command may run before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,6 +35,10 @@ pub struct Bash {
     // decided when the program runs: a terminal prompt in the REPL, a scripted
     // answer in tests.
     approver: Box<dyn Approver>,
+    /// Where an "always" is remembered. Standalone (tests) it is a private one.
+    approval: SharedMode,
+    /// Set when the user cancels the turn: a running command is killed (issue 18).
+    cancel: Cancel,
 }
 
 impl Bash {
@@ -49,7 +54,21 @@ impl Bash {
             cwd: cwd.into(),
             timeout,
             approver,
+            approval: shared_mode(Mode::Manual),
+            cancel: Cancel::new(),
         }
+    }
+
+    /// Watches this flag while a command runs; when it is set the command's group is killed.
+    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Remembers "always" answers in this shared state, so `/approve` can list and clear them.
+    pub fn with_approval(mut self, approval: SharedMode) -> Self {
+        self.approval = approval;
+        self
     }
 
     fn execute(&self, command: &str) -> String {
@@ -92,9 +111,16 @@ impl Bash {
 
         let started = Instant::now();
         let mut timed_out = false;
+        let mut cancelled = false;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
+                Ok(None) if self.cancel.is_cancelled() => {
+                    cancelled = true;
+                    kill_group(group);
+                    let _ = child.kill();
+                    break child.wait().ok();
+                }
                 Ok(None) if started.elapsed() >= self.timeout => {
                     timed_out = true;
                     kill_group(group);
@@ -111,7 +137,9 @@ impl Bash {
         kill_group(group);
 
         let output = reader.join().expect("reader thread panicked").finish();
-        let summary = if timed_out {
+        let summary = if cancelled {
+            "[cancelled by the user and killed]".to_owned()
+        } else if timed_out {
             format!("[timed out after {:?} and was killed]", self.timeout)
         } else {
             match status.and_then(|s| s.code()) {
@@ -149,7 +177,16 @@ impl Tool for Bash {
             Ok(args) => args,
             Err(e) => return format!("error: invalid arguments: {e}"),
         };
-        if !self.approver.approve(&args.command) {
+        // Looking commands (`ls`, `cd`, ...) run without a question; see `commands.rs`.
+        if !is_free(&args.command)
+            && !self.approval.confirm(
+                self.approver.as_ref(),
+                "run this command?",
+                &args.command,
+                always_for(&args.command),
+                None,
+            )
+        {
             return "denied by user: the command was not run".to_owned();
         }
         self.execute(&args.command)
@@ -165,8 +202,12 @@ mod tests {
 
     struct Fixed(bool);
     impl Approver for Fixed {
-        fn approve(&self, _command: &str) -> bool {
-            self.0
+        fn approve(&self, _ask: &crate::tools::Ask) -> crate::tools::Answer {
+            if self.0 {
+                crate::tools::Answer::Yes
+            } else {
+                crate::tools::Answer::No
+            }
         }
     }
 
@@ -234,9 +275,9 @@ mod tests {
         use std::sync::{Arc, Mutex};
         struct Recorder(Arc<Mutex<Vec<String>>>);
         impl Approver for Recorder {
-            fn approve(&self, command: &str) -> bool {
-                self.0.lock().unwrap().push(command.to_owned());
-                false
+            fn approve(&self, ask: &crate::tools::Ask) -> crate::tools::Answer {
+                self.0.lock().unwrap().push(ask.detail.to_owned());
+                crate::tools::Answer::No
             }
         }
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -246,8 +287,121 @@ mod tests {
             DEFAULT_TIMEOUT,
             Box::new(Recorder(Arc::clone(&seen))),
         );
-        run(&tool, "echo  hi   there");
-        assert_eq!(*seen.lock().unwrap(), vec!["echo  hi   there".to_owned()]);
+        run(&tool, "touch  hi   there");
+        assert_eq!(*seen.lock().unwrap(), vec!["touch  hi   there".to_owned()]);
+    }
+
+    /// What was asked: the detail line and the "always" label offered, if any.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+    /// Records every command asked about and answers as told.
+    struct Asked {
+        seen: Seen,
+        answer: crate::tools::Answer,
+    }
+
+    impl Approver for Asked {
+        fn approve(&self, ask: &crate::tools::Ask) -> crate::tools::Answer {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((ask.detail.to_owned(), ask.always.map(str::to_owned)));
+            self.answer
+        }
+    }
+
+    fn asked_tool(tag: &str, answer: crate::tools::Answer) -> (Bash, Seen, Scratch) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = Scratch::new(tag);
+        let tool = Bash::new(
+            dir.path(),
+            DEFAULT_TIMEOUT,
+            Box::new(Asked {
+                seen: std::sync::Arc::clone(&seen),
+                answer,
+            }),
+        );
+        (tool, seen, dir)
+    }
+
+    #[test]
+    fn looking_commands_run_without_a_question_even_when_every_answer_is_no() {
+        let (tool, seen, dir) = asked_tool("bash-free", crate::tools::Answer::No);
+        std::fs::write(dir.path().join("a.txt"), "text").unwrap();
+        assert!(run(&tool, "ls").contains("a.txt"));
+        assert!(run(&tool, "pwd; ls -a && cat a.txt").contains("text"));
+        assert!(run(&tool, "mkdir -p sub/deep").ends_with("[exit code: 0]"));
+        assert!(dir.path().join("sub/deep").is_dir());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_command_that_goes_beyond_looking_still_asks() {
+        let (tool, seen, dir) = asked_tool("bash-not-free", crate::tools::Answer::No);
+        for command in [
+            "touch ran",
+            "ls /",
+            "ls | sh",
+            "ls; touch ran",
+            "cd .. && ls",
+        ] {
+            assert_eq!(
+                run(&tool, command),
+                "denied by user: the command was not run"
+            );
+        }
+        assert!(!dir.path().join("ran").exists());
+        assert_eq!(seen.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn always_covers_the_same_program_for_the_rest_of_the_run() {
+        let (tool, seen, dir) = asked_tool("bash-always", crate::tools::Answer::Always);
+        assert!(run(&tool, "touch one").ends_with("[exit code: 0]"));
+        assert!(run(&tool, "touch two").ends_with("[exit code: 0]"));
+        assert!(dir.path().join("two").exists());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("touch one".to_owned(), Some("`touch` commands".to_owned()))],
+            "the second touch was not asked about"
+        );
+        // Another program still asks, and the answer "always" is not offered for a chain.
+        run(&tool, "rm one");
+        run(&tool, "touch three; touch four");
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[1],
+            ("rm one".to_owned(), Some("`rm` commands".to_owned()))
+        );
+        assert_eq!(seen[2], ("touch three; touch four".to_owned(), None));
+    }
+
+    #[test]
+    fn always_is_forgotten_on_request_and_is_listed() {
+        let approval = crate::tools::shared_mode(crate::tools::Mode::Manual);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = Scratch::new("bash-forget");
+        let tool = Bash::new(
+            dir.path(),
+            DEFAULT_TIMEOUT,
+            Box::new(Asked {
+                seen: std::sync::Arc::clone(&seen),
+                answer: crate::tools::Answer::Always,
+            }),
+        )
+        .with_approval(std::rc::Rc::clone(&approval));
+        run(&tool, "touch a");
+        assert_eq!(
+            approval.always_labels(),
+            vec!["`touch` commands".to_owned()]
+        );
+        assert_eq!(approval.forget_always(), 1);
+        run(&tool, "touch b");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "asked again after forgetting"
+        );
     }
 
     #[test]
@@ -311,6 +465,27 @@ mod tests {
             !Path::new(&format!("/proc/{pid}")).exists()
         });
         assert!(gone, "process {pid} is still running");
+    }
+
+    #[test]
+    fn a_cancel_kills_a_running_command_and_its_children_at_once() {
+        let dir = Scratch::new("bash-cancel");
+        let cancel = Cancel::new();
+        let tool = bash(dir.path(), DEFAULT_TIMEOUT, true).with_cancel(cancel.clone());
+        let flag = cancel.clone();
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            flag.cancel();
+        });
+        let started = Instant::now();
+        let out = run(&tool, "sleep 30 & sleep 30; echo not reached");
+        stopper.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(out, "[cancelled by the user and killed]");
     }
 
     #[test]

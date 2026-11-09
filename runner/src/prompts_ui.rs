@@ -1,16 +1,17 @@
-//! `/prompts` (issue 13): the prompts the owner keeps, which of them are switched on, and the
-//! screens to add, edit, reorder and delete them. The ones switched on are joined into the system
-//! prompt when a chat starts (`Agent::load_prompt`, `Agent::new_chat`); nothing here changes a chat
-//! that is already running.
+//! `/prompts`, `/skills config` and `/personality config`: the screens that add, edit, reorder and
+//! delete the prompts the owner keeps. A prompt has one type, chosen by where it is added
+//! (issue 14): a `system` prompt goes through `/prompts`, a `skill` through `/skills`, a
+//! `personality` through `/personality`, and each command only lists and changes its own kind.
 //!
-//! - `/prompts` in a terminal: a checklist, Enter switches a prompt on or off.
-//! - `/prompts config` (terminal only): the manager.
-//! - typed commands, terminal or not: `on`, `off`, `add`, `edit`, `delete`, `show`, `type`.
+//! System prompts (issue 13): the ones switched on are joined into the system prompt when a chat
+//! starts (`Agent::load_prompt`, `Agent::new_chat`); nothing here changes a chat that is already
+//! running.
 //!
-//! A prompt has a type (issue 14). Only `system` prompts go into the system prompt, so only they
-//! are in the checklist; skills and personalities are used after the user's message and are
-//! chosen per chat with `/skills` and `/personality` (here, "on" makes a skill start on and a
-//! personality the default of new chats).
+//! - `/prompts` in a terminal: a checklist, Enter switches a system prompt on or off.
+//! - `/prompts config`, `/skills config`, `/personality config` (terminal only): the manager.
+//! - typed commands, terminal or not: `add`, `edit`, `delete` for every kind; `on`, `off`, `show`
+//!   for system prompts. Skills and personalities are never "on" here: they are chosen per chat
+//!   with `/skills` and `/personality`, and a new chat starts without any.
 
 use std::io::{BufRead, Write};
 
@@ -45,38 +46,87 @@ fn with_store<R: BufRead, W: Write, T>(
     }
 }
 
-fn all_prompts<R: BufRead, W: Write>(
+/// The prompts of one kind, in order.
+fn prompts_of<R: BufRead, W: Write>(
     agent: &mut Agent,
     term: &Shared<R, W>,
+    kind: PromptType,
 ) -> Option<Vec<Prompt>> {
     with_store(agent, term, |s| s.list_prompts())
+        .map(|all| all.into_iter().filter(|p| p.prompt_type == kind).collect())
 }
 
-/// What "on" means for a prompt, in a word.
-fn state_word(p: &Prompt) -> &'static str {
-    match (p.prompt_type, p.enabled) {
-        (_, false) => "off",
-        (PromptType::System, true) => "on",
-        (PromptType::Skill, true) => "on by default",
-        (PromptType::Personality, true) => "default",
+fn noun(kind: PromptType) -> &'static str {
+    match kind {
+        PromptType::System => "system prompt",
+        PromptType::Skill => "skill",
+        PromptType::Personality => "personality",
     }
 }
 
-/// Menu rows; `with_type` puts the type in front of the size (the manager lists every type).
-fn rows(prompts: &[Prompt], with_type: bool) -> Vec<MenuItem> {
+fn plural(kind: PromptType) -> &'static str {
+    match kind {
+        PromptType::System => "system prompts",
+        PromptType::Skill => "skills",
+        PromptType::Personality => "personalities",
+    }
+}
+
+/// The command that manages a kind.
+fn command_of(kind: PromptType) -> &'static str {
+    match kind {
+        PromptType::System => "/prompts",
+        PromptType::Skill => "/skills",
+        PromptType::Personality => "/personality",
+    }
+}
+
+/// When a change shows.
+fn applies(kind: PromptType) -> &'static str {
+    match kind {
+        PromptType::System => NEXT_CHAT,
+        _ => "used from the next message that uses it",
+    }
+}
+
+/// The prompt called `name`, if it is of this kind; otherwise says which command manages it.
+fn require<R: BufRead, W: Write>(
+    agent: &mut Agent,
+    term: &Shared<R, W>,
+    name: &str,
+    kind: PromptType,
+) -> Option<Prompt> {
+    let prompt = with_store(agent, term, |s| s.prompt(name))?;
+    if prompt.prompt_type != kind {
+        error(
+            term,
+            &format!(
+                "{name} is a {}: manage it with {}",
+                noun(prompt.prompt_type),
+                command_of(prompt.prompt_type)
+            ),
+        );
+        return None;
+    }
+    Some(prompt)
+}
+
+/// Menu rows; only system prompts have an on/off mark.
+fn rows(prompts: &[Prompt], kind: PromptType) -> Vec<MenuItem> {
     prompts
         .iter()
         .map(|p| {
-            let mark = if p.enabled { "x" } else { " " };
+            let label = if kind == PromptType::System {
+                format!("[{}] {}", if p.enabled { "x" } else { " " }, p.name)
+            } else {
+                p.name.clone()
+            };
             let mut detail = size_label(p.chars());
-            if with_type {
-                detail = format!("{}  {detail}", p.prompt_type.as_str());
-            }
             if !p.description.is_empty() {
                 detail.push_str("  ");
                 detail.push_str(&p.description);
             }
-            MenuItem::new(format!("[{mark}] {}", p.name)).with_detail(detail)
+            MenuItem::new(label).with_detail(detail)
         })
         .collect()
 }
@@ -88,8 +138,7 @@ fn yes(answer: Option<String>) -> bool {
     )
 }
 
-/// What a new chat would start with: the system prompt, and the personality and skills that
-/// are switched on by default when there are any.
+/// What a new chat would start with.
 fn say_preview<R: BufRead, W: Write>(agent: &Agent, term: &Shared<R, W>) {
     let style = term.borrow().style();
     match agent.prompt_preview() {
@@ -99,53 +148,6 @@ fn say_preview<R: BufRead, W: Write>(agent: &Agent, term: &Shared<R, W>) {
         ),
         Err(why) => error(term, &why),
     }
-    if let Ok(extras) = agent.starting_chat_prompts()
-        && !extras.is_empty()
-    {
-        say_line(term, &style.dim(&format!("and with {}", extras.summary())));
-    }
-}
-
-/// Asks what kind of prompt it is. `None` when backed out.
-fn pick_type<R: BufRead, W: Write>(
-    term: &Shared<R, W>,
-    title: &str,
-    current: Option<PromptType>,
-) -> Option<PromptType> {
-    let kinds = [
-        (
-            PromptType::System,
-            "system prompt",
-            "rules and context, part of the system prompt of a new chat",
-        ),
-        (
-            PromptType::Skill,
-            "skill",
-            "added after your message: off, one message, or on (/skills)",
-        ),
-        (
-            PromptType::Personality,
-            "personality",
-            "a style of answering, one at a time (/personality)",
-        ),
-    ];
-    let items: Vec<MenuItem> = kinds
-        .iter()
-        .map(|(kind, label, detail)| {
-            let label = if Some(*kind) == current {
-                format!("{label} (current)")
-            } else {
-                (*label).to_owned()
-            };
-            MenuItem::new(label).with_detail(*detail)
-        })
-        .collect();
-    let start = kinds
-        .iter()
-        .position(|(kind, ..)| Some(*kind) == current)
-        .unwrap_or(0);
-    let chosen = term.borrow_mut().pick_from(title, &items, start);
-    chosen.map(|i| kinds[i].0)
 }
 
 /// Reads a prompt file the program was pointed at: UTF-8, not larger than the limit. Returns the
@@ -171,16 +173,16 @@ fn read_prompt_file(path: &str) -> Result<(String, String), String> {
 
 // ---- typed commands ----
 
-/// The plain list: one line per prompt.
+/// The plain list of system prompts: one line per prompt.
 fn show_list<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
     let style = term.borrow().style();
-    let Some(all) = all_prompts(agent, term) else {
+    let Some(all) = prompts_of(agent, term, PromptType::System) else {
         return;
     };
     if all.is_empty() {
         return say_line(
             term,
-            &style.yellow("no prompts: add one with /prompts add <name>"),
+            &style.yellow("no system prompts: add one with /prompts add <name>"),
         );
     }
     let width = all
@@ -190,17 +192,16 @@ fn show_list<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
         .unwrap_or(0);
     let mut text = format!(
         "{}\n",
-        style.bold("prompts (changes apply to the next chat):")
+        style.bold("system prompts (changes apply to the next chat):")
     );
     for p in &all {
-        let state = match (p.prompt_type, p.enabled) {
-            (_, false) => style.dim("off    "),
-            (PromptType::Personality, true) => style.green("default"),
-            (_, true) => style.green("on     "),
+        let state = if p.enabled {
+            style.green("on ")
+        } else {
+            style.dim("off")
         };
         text.push_str(&format!(
-            "  {state}  {:<11}  {:<width$}  {:>11}  {}\n",
-            p.prompt_type.as_str(),
+            "  {state}  {:<width$}  {:>11}  {}\n",
             p.name,
             size_label(p.chars()),
             style.dim(&p.description)
@@ -245,61 +246,40 @@ fn set_enabled<R: BufRead, W: Write>(
     name: &str,
     enabled: bool,
 ) {
-    let Some(kind) = with_store(agent, term, |s| s.prompt(name).map(|p| p.prompt_type)) else {
+    if require(agent, term, name, PromptType::System).is_none() {
         return;
-    };
+    }
     if with_store(agent, term, |s| s.set_prompt_enabled(name, enabled)).is_some() {
-        let said = match (kind, enabled) {
-            (PromptType::System, _) => format!(
+        done(
+            term,
+            &format!(
                 "{name} is {}; {NEXT_CHAT}",
                 if enabled { "on" } else { "off" }
             ),
-            (PromptType::Skill, true) => format!(
-                "{name} is on by default: new chats start with it on (/skills changes it for a chat)"
-            ),
-            (PromptType::Skill, false) => format!("{name} is off by default in new chats"),
-            (PromptType::Personality, true) => format!(
-                "{name} is the default personality: new chats start with it (/personality changes it for a chat)"
-            ),
-            (PromptType::Personality, false) => {
-                format!("{name} is no longer the default personality")
-            }
-        };
-        done(term, &said);
+        );
         say_preview(agent, term);
     }
 }
 
-/// Changes what a prompt is for; it starts the new type switched off.
-fn set_type<R: BufRead, W: Write>(
+fn delete_prompt<R: BufRead, W: Write>(
     agent: &mut Agent,
     term: &Shared<R, W>,
     name: &str,
     kind: PromptType,
 ) {
-    if with_store(agent, term, |s| s.set_prompt_type(name, kind)).is_some() {
-        agent.refresh_chat_prompts();
-        done(
-            term,
-            &format!(
-                "{name} is now a {}, switched off; chats already using it as another type stop using it",
-                kind.as_str()
-            ),
-        );
-    }
-}
-
-fn delete_prompt<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, name: &str) {
     let style = term.borrow().style();
+    if require(agent, term, name, kind).is_none() {
+        return;
+    }
     let answer = term
         .borrow_mut()
-        .ask(&format!("delete the prompt {name}? [y/N]"), None);
+        .ask(&format!("delete the {} {name}? [y/N]", noun(kind)), None);
     if !yes(answer) {
         return say_line(term, &style.yellow("[not deleted]"));
     }
     if with_store(agent, term, |s| s.delete_prompt(name)).is_some() {
         agent.refresh_chat_prompts();
-        done(term, &format!("deleted {name}; {NEXT_CHAT}"));
+        done(term, &format!("deleted {name}; {}", applies(kind)));
     }
 }
 
@@ -319,7 +299,23 @@ fn text_from_owner<R: BufRead, W: Write>(
     }
 }
 
-fn add_typed<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, tail: &str) {
+/// What to do next with a prompt that was just saved.
+fn after_save(kind: PromptType, name: &str) -> String {
+    match kind {
+        PromptType::System => format!("/prompts on {name} switches it on"),
+        PromptType::Skill => format!(
+            "/skills use {name} uses it for one message, /skills on {name} keeps it on in a chat"
+        ),
+        PromptType::Personality => format!("/personality {name} selects it"),
+    }
+}
+
+fn add_typed<R: BufRead, W: Write>(
+    agent: &mut Agent,
+    term: &Shared<R, W>,
+    tail: &str,
+    kind: PromptType,
+) {
     let style = term.borrow().style();
     let tail = tail.trim();
     let (name, file) = match tail.split_once(char::is_whitespace) {
@@ -347,30 +343,83 @@ fn add_typed<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, tail:
         },
     };
     let saved = with_store(agent, term, |s| {
-        s.add_prompt(&name, "", &text, source.as_deref())
+        s.add_prompt_of_type(&name, "", &text, source.as_deref(), kind)
     });
     if saved.is_some() {
+        let tail = if kind == PromptType::System {
+            format!("switched off: {}", after_save(kind, &name))
+        } else {
+            after_save(kind, &name)
+        };
         done(
             term,
             &format!(
-                "saved system prompt {name} ({}), switched off: /prompts on {name} switches it on; /prompts type {name} skill|personality changes what it is",
+                "saved {} {name} ({}), {tail}",
+                noun(kind),
                 size_label(text.chars().count())
             ),
         );
     }
 }
 
-fn edit_typed<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, name: &str) {
+fn edit_typed<R: BufRead, W: Write>(
+    agent: &mut Agent,
+    term: &Shared<R, W>,
+    name: &str,
+    kind: PromptType,
+) {
     let style = term.borrow().style();
-    let Some(current) = with_store(agent, term, |s| s.prompt(name)) else {
+    let Some(current) = require(agent, term, name, kind) else {
         return;
     };
     let Some(text) = text_from_owner(term, name, &current.text) else {
         return say_line(term, &style.yellow("[cancelled: nothing changed]"));
     };
     if with_store(agent, term, |s| s.set_prompt_text(name, &text, None)).is_some() {
-        done(term, &format!("saved {name}; {NEXT_CHAT}"));
+        done(term, &format!("saved {name}; {}", applies(kind)));
     }
+}
+
+fn one_name(tail: &str) -> Option<String> {
+    let mut words = tail.split_whitespace();
+    match (words.next(), words.next()) {
+        (Some(name), None) => Some(name.to_owned()),
+        _ => None,
+    }
+}
+
+/// The commands every kind has: `config`, `add`, `edit`, `delete`. `false` when `word` is none
+/// of them, so the caller can try its own.
+pub fn manage<R: BufRead, W: Write>(
+    agent: &mut Agent,
+    term: &Shared<R, W>,
+    kind: PromptType,
+    word: &str,
+    tail: &str,
+) -> bool {
+    let style = term.borrow().style();
+    let menus = term.borrow().menus_enabled();
+    let command = command_of(kind);
+    match word {
+        "config" if menus => manager(agent, term, kind),
+        "config" => say_line(
+            term,
+            &style.yellow(&format!(
+                "{command} config needs a terminal: it is an arrow-key menu"
+            )),
+        ),
+        "add" => add_typed(agent, term, tail, kind),
+        "edit" | "delete" => match one_name(tail) {
+            None => say_line(
+                term,
+                &style.yellow(&format!("usage: {command} {word} <name>")),
+            ),
+            Some(name) if word == "edit" => edit_typed(agent, term, &name, kind),
+            Some(name) => delete_prompt(agent, term, &name, kind),
+        },
+        _ => return false,
+    }
+    true
 }
 
 /// `/prompts ...`.
@@ -380,51 +429,19 @@ pub fn command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, res
     let (word, tail) = rest
         .split_once(char::is_whitespace)
         .map_or((rest, ""), |(word, tail)| (word, tail.trim()));
-    let one_name = |tail: &str| -> Option<String> {
-        let mut words = tail.split_whitespace();
-        match (words.next(), words.next()) {
-            (Some(name), None) => Some(name.to_owned()),
-            _ => None,
-        }
-    };
     match word {
         "" if menus => checklist(agent, term),
         "" => show_list(agent, term),
-        "config" if menus => config_menu(agent, term),
-        "config" => say_line(
-            term,
-            &style.yellow("/prompts config needs a terminal: it is an arrow-key menu"),
-        ),
         "show" => show_assembled(agent, term),
-        "add" => add_typed(agent, term, tail),
-        "type" => {
-            let mut words = tail.split_whitespace();
-            let parsed = (
-                words.next(),
-                words.next().and_then(PromptType::parse),
-                words.next(),
-            );
-            match parsed {
-                (Some(name), Some(kind), None) => set_type(agent, term, name, kind),
-                _ => say_line(
-                    term,
-                    &style.yellow("usage: /prompts type <name> <system|skill|personality>"),
-                ),
-            }
-        }
-        "on" | "off" | "edit" | "delete" => match one_name(tail) {
+        "on" | "off" => match one_name(tail) {
             None => say_line(term, &style.yellow(&format!("usage: /prompts {word} <name>"))),
-            Some(name) => match word {
-                "on" => set_enabled(agent, term, &name, true),
-                "off" => set_enabled(agent, term, &name, false),
-                "edit" => edit_typed(agent, term, &name),
-                _ => delete_prompt(agent, term, &name),
-            },
+            Some(name) => set_enabled(agent, term, &name, word == "on"),
         },
+        _ if manage(agent, term, PromptType::System, word, tail) => {}
         _ => say_line(
             term,
             &style.yellow(
-                "usage: /prompts [config | show | on <name> | off <name> | add [name [file]] | type <name> <system|skill|personality> | edit <name> | delete <name>]",
+                "usage: /prompts [config | show | on <name> | off <name> | add [name [file]] | edit <name> | delete <name>]",
             ),
         ),
     }
@@ -432,38 +449,24 @@ pub fn command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, res
 
 // ---- menus ----
 
-/// `/prompts` in a terminal: Enter switches the highlighted prompt on or off; Esc finishes.
+/// `/prompts` in a terminal: Enter switches the highlighted system prompt on or off; Esc finishes.
 pub fn checklist<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
     let style = term.borrow().style();
     let mut start = 0;
     let mut changed = false;
     loop {
-        let Some(everything) = all_prompts(agent, term) else {
+        let Some(all) = prompts_of(agent, term, PromptType::System) else {
             return;
         };
-        if everything.is_empty() {
-            return say_line(
-                term,
-                &style.yellow("no prompts: use /prompts config, then + add new"),
-            );
-        }
-        // Only system prompts are in the system prompt; skills and personalities are chosen per
-        // chat (/skills, /personality) and listed in /prompts config.
-        let all: Vec<Prompt> = everything
-            .into_iter()
-            .filter(|p| p.prompt_type == PromptType::System)
-            .collect();
         if all.is_empty() {
             return say_line(
                 term,
-                &style.yellow(
-                    "no system prompts: skills and personalities are in /skills and /personality; /prompts config manages every prompt",
-                ),
+                &style.yellow("no system prompts: use /prompts config, then + add new"),
             );
         }
         let chosen = term.borrow_mut().pick_from(
             "system prompts: Enter switches on or off, Esc finishes",
-            &rows(&all, false),
+            &rows(&all, PromptType::System),
             start,
         );
         let Some(index) = chosen else {
@@ -486,22 +489,23 @@ pub fn checklist<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
     }
 }
 
-/// `/prompts config`: the manager.
-pub fn config_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
+/// `/prompts config`, `/skills config`, `/personality config`: the manager of one kind.
+fn manager<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, kind: PromptType) {
     loop {
-        let Some(all) = all_prompts(agent, term) else {
+        let Some(all) = prompts_of(agent, term, kind) else {
             return;
         };
-        let base_missing = !all.iter().any(|p| p.name == BASE_NAME);
-        let mut items = rows(&all, true);
+        let base_missing = kind == PromptType::System
+            && with_store(agent, term, |s| Ok(s.prompt(BASE_NAME).is_err())) == Some(true);
+        let mut items = rows(&all, kind);
         items.push(MenuItem::action("+ add new"));
         if base_missing {
             items.push(MenuItem::action("+ restore built-in base"));
         }
-        let chosen = term.borrow_mut().pick("prompts", &items);
+        let chosen = term.borrow_mut().pick(plural(kind), &items);
         match chosen {
             None => return,
-            Some(i) if i == all.len() => add_new(agent, term),
+            Some(i) if i == all.len() => add_new(agent, term, kind),
             Some(i) if i == all.len() + 1 => {
                 let restored = with_store(agent, term, |s| {
                     s.add_prompt(BASE_NAME, BASE_DESCRIPTION, BUILTIN_PROMPT, None)?;
@@ -511,7 +515,7 @@ pub fn config_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>)
                     done(term, &format!("restored {BASE_NAME}; {NEXT_CHAT}"));
                 }
             }
-            Some(i) => prompt_screen(agent, term, &all[i].name),
+            Some(i) => prompt_screen(agent, term, &all[i].name, kind),
         }
     }
 }
@@ -519,7 +523,6 @@ pub fn config_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>)
 #[derive(Clone, Copy)]
 enum Action {
     Toggle,
-    Type,
     View,
     Edit,
     Up,
@@ -530,51 +533,41 @@ enum Action {
     Delete,
 }
 
-fn prompt_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, name: &str) {
+fn prompt_screen<R: BufRead, W: Write>(
+    agent: &mut Agent,
+    term: &Shared<R, W>,
+    name: &str,
+    kind: PromptType,
+) {
     let style = term.borrow().style();
     let mut name = name.to_owned();
+    let (earlier, later) = match kind {
+        PromptType::System => ("earlier in the system prompt", "later in the system prompt"),
+        _ => ("earlier in the list", "later in the list"),
+    };
     loop {
         let Some(p) = with_store(agent, term, |s| s.prompt(&name)) else {
             return;
         };
-        let (toggle_detail, earlier, later) = match p.prompt_type {
-            PromptType::System => (
-                "whether new chats start with it",
-                "earlier in the system prompt",
-                "later in the system prompt",
-            ),
-            PromptType::Skill => (
-                "whether new chats start with it on",
-                "earlier among the skills",
-                "later among the skills",
-            ),
-            PromptType::Personality => (
-                "whether it is the default personality of new chats",
-                "earlier in the list",
-                "later in the list",
-            ),
-        };
-        let mut actions = vec![
-            (
+        let mut actions = Vec::new();
+        if kind == PromptType::System {
+            actions.push((
                 if p.enabled { "switch off" } else { "switch on" },
-                toggle_detail,
+                "whether new chats start with it",
                 Action::Toggle,
-            ),
+            ));
+        }
+        actions.extend([
             ("view", "show the whole text", Action::View),
             ("edit", "change the text", Action::Edit),
-            (
-                "change type",
-                "system prompt, skill or personality",
-                Action::Type,
-            ),
             ("move up", earlier, Action::Up),
             ("move down", later, Action::Down),
             ("rename", "", Action::Rename),
-        ];
+        ]);
         if p.source_path.is_some() {
             actions.push(("reload from file", "read the file again", Action::Reload));
         }
-        if p.name == BASE_NAME {
+        if p.name == BASE_NAME && kind == PromptType::System {
             actions.push((
                 "restore built-in text",
                 "put the program's own text back",
@@ -586,25 +579,22 @@ fn prompt_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, n
             .iter()
             .map(|(label, detail, _)| MenuItem::new(*label).with_detail(*detail))
             .collect();
-        let title = format!(
-            "{} ({}, {}, {})",
-            p.name,
-            p.prompt_type.as_str(),
-            state_word(&p),
-            size_label(p.chars())
-        );
+        let title = if kind == PromptType::System {
+            format!(
+                "{} ({}, {})",
+                p.name,
+                if p.enabled { "on" } else { "off" },
+                size_label(p.chars())
+            )
+        } else {
+            format!("{} ({})", p.name, size_label(p.chars()))
+        };
         let chosen = term.borrow_mut().pick(&title, &items);
         let Some(chosen) = chosen else {
             return;
         };
         match actions[chosen].2 {
             Action::Toggle => set_enabled(agent, term, &name, !p.enabled),
-            Action::Type => {
-                let picked = pick_type(term, "what is it?", Some(p.prompt_type));
-                if let Some(kind) = picked.filter(|k| *k != p.prompt_type) {
-                    set_type(agent, term, &name, kind);
-                }
-            }
             Action::View => say_line(
                 term,
                 &format!(
@@ -626,7 +616,7 @@ fn prompt_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, n
                 if let Some(text) = compose(agent, term, &name, &p.text)
                     && with_store(agent, term, |s| s.set_prompt_text(&name, &text, None)).is_some()
                 {
-                    done(term, &format!("saved {name}; {NEXT_CHAT}"));
+                    done(term, &format!("saved {name}; {}", applies(kind)));
                 }
             }
             Action::Up | Action::Down => {
@@ -636,7 +626,7 @@ fn prompt_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, n
                     1
                 };
                 match with_store(agent, term, |s| s.move_prompt(&name, delta)) {
-                    Some(true) => done(term, &format!("moved {name}; {NEXT_CHAT}")),
+                    Some(true) => done(term, &format!("moved {name}; {}", applies(kind))),
                     Some(false) => say_line(
                         term,
                         &style.yellow(if delta < 0 {
@@ -672,7 +662,7 @@ fn prompt_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, n
                         {
                             done(
                                 term,
-                                &format!("reloaded {name} from {absolute}; {NEXT_CHAT}"),
+                                &format!("reloaded {name} from {absolute}; {}", applies(kind)),
                             );
                         }
                     }
@@ -693,11 +683,11 @@ fn prompt_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, n
             Action::Delete => {
                 let answer = term
                     .borrow_mut()
-                    .ask(&format!("delete the prompt {name}? [y/N]"), None);
+                    .ask(&format!("delete the {} {name}? [y/N]", noun(kind)), None);
                 if yes(answer) {
                     if with_store(agent, term, |s| s.delete_prompt(&name)).is_some() {
                         agent.refresh_chat_prompts();
-                        done(term, &format!("deleted {name}; {NEXT_CHAT}"));
+                        done(term, &format!("deleted {name}; {}", applies(kind)));
                     }
                     return;
                 }
@@ -707,7 +697,7 @@ fn prompt_screen<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, n
     }
 }
 
-fn add_new<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
+fn add_new<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, kind: PromptType) {
     let style = term.borrow().style();
     let cancelled = || say_line(term, &style.yellow("[cancelled: nothing saved]"));
     let asked = term.borrow_mut().ask("name (empty cancels)", None);
@@ -724,14 +714,13 @@ fn add_new<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
         }
         return;
     }
-    let Some(kind) = pick_type(term, "what is it?", None) else {
-        return cancelled();
-    };
     let ways = [
         MenuItem::new("write it here").with_detail("in your editor, or typed lines"),
         MenuItem::new("read it from a file").with_detail("a copy is stored"),
     ];
-    let way = term.borrow_mut().pick("the text of the prompt", &ways);
+    let way = term
+        .borrow_mut()
+        .pick(&format!("the text of the {}", noun(kind)), &ways);
     let (text, source) = match way {
         None => return cancelled(),
         Some(0) => match compose(agent, term, &name, "") {
@@ -768,20 +757,17 @@ fn add_new<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
         term,
         &format!(
             "saved {} {name} ({})",
-            kind.as_str(),
+            noun(kind),
             size_label(text.chars().count())
         ),
     );
-    let question = match kind {
-        PromptType::System => format!("switch {name} on, so new chats start with it? [Y/n]"),
-        PromptType::Skill => {
-            format!("switch {name} on by default, so new chats start with it on? [Y/n]")
-        }
-        PromptType::Personality => {
-            format!("make {name} the default personality of new chats? [Y/n]")
-        }
-    };
-    let on = term.borrow_mut().ask(&question, None);
+    if kind != PromptType::System {
+        return say_line(term, &style.dim(&after_save(kind, &name)));
+    }
+    let on = term.borrow_mut().ask(
+        &format!("switch {name} on, so new chats start with it? [Y/n]"),
+        None,
+    );
     if !matches!(
         on.as_deref().map(str::to_ascii_lowercase).as_deref(),
         Some("n" | "no")
@@ -897,6 +883,10 @@ mod tests {
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::rc::Rc;
+
+    fn config_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
+        manager(agent, term, PromptType::System);
+    }
 
     const DOWN: &str = "\x1b[B";
     const ENTER: &str = "\r";
@@ -1024,7 +1014,7 @@ mod tests {
         store(&dir).delete_prompt("base").unwrap();
         let (mut agent, term, _) = rig(&dir, "", &[], true);
         checklist(&mut agent, &term);
-        assert!(screen(&term).contains("no prompts: use /prompts config"));
+        assert!(screen(&term).contains("no system prompts: use /prompts config"));
     }
 
     // ---- the manager: adding ----
@@ -1036,7 +1026,6 @@ mod tests {
             DOWN,
             ENTER,
             "myprompt\n",
-            ENTER, // system prompt
             ENTER, // write it here
             "line one\nline two\n.\n",
             ENTER, // save
@@ -1072,7 +1061,6 @@ mod tests {
             DOWN,
             ENTER,
             "fromfile\n",
-            ENTER, // system prompt
             DOWN,
             ENTER, // read it from a file
             &format!("{}\n", file.display()),
@@ -1123,18 +1111,7 @@ mod tests {
         let dir = Scratch::new("pu-editor");
         let script = dir.path().join("ed.sh");
         std::fs::write(&script, "printf 'written by the editor\\n' > \"$1\"\n").unwrap();
-        let typed = [
-            DOWN,
-            ENTER,
-            "viaeditor\n",
-            ENTER,
-            ENTER,
-            ENTER,
-            "\n",
-            "n\n",
-            ESC,
-        ]
-        .concat();
+        let typed = [DOWN, ENTER, "viaeditor\n", ENTER, ENTER, "\n", "n\n", ESC].concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
         term.borrow_mut()
             .set_editor(Some(format!("sh {}", script.display())));
@@ -1145,7 +1122,7 @@ mod tests {
         );
         assert!(screen(&term).contains("opening sh "), "{}", screen(&term));
         // An editor that fails: an error, nothing saved.
-        let typed = [&downs(2), ENTER, "broken\n", ENTER, ENTER, ESC].concat();
+        let typed = [&downs(2), ENTER, "broken\n", ENTER, ESC].concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
         term.borrow_mut().set_editor(Some("false".to_owned()));
         config_menu(&mut agent, &term);
@@ -1159,7 +1136,7 @@ mod tests {
     fn backing_out_of_an_add_saves_nothing() {
         let dir = Scratch::new("pu-add-cancel");
         // Esc at the text-ready menu discards the whole add.
-        let typed = [DOWN, ENTER, "x\n", ENTER, ENTER, "some text\n.\n", ESC, ESC].concat();
+        let typed = [DOWN, ENTER, "x\n", ENTER, "some text\n.\n", ESC, ESC].concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
         config_menu(&mut agent, &term);
         assert!(screen(&term).contains("[cancelled: nothing saved]"));
@@ -1181,7 +1158,7 @@ mod tests {
     fn an_empty_text_is_not_saved() {
         let dir = Scratch::new("pu-add-empty");
         // Empty text: the text-ready menu offers save, which refuses; then Esc discards.
-        let typed = [DOWN, ENTER, "x\n", ENTER, ENTER, ".\n", ENTER, ESC, ESC].concat();
+        let typed = [DOWN, ENTER, "x\n", ENTER, ".\n", ENTER, ESC, ESC].concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
         config_menu(&mut agent, &term);
         assert!(screen(&term).contains("the prompt is empty"));
@@ -1197,7 +1174,6 @@ mod tests {
             DOWN,
             ENTER,
             "imp\n",
-            ENTER, // system prompt
             ENTER,
             "draft text\n.\n",
             DOWN,
@@ -1248,7 +1224,6 @@ mod tests {
             DOWN,
             ENTER,
             "imp\n",
-            ENTER, // system prompt
             ENTER,
             "my draft\n.\n",
             DOWN,
@@ -1289,7 +1264,6 @@ mod tests {
             DOWN,
             ENTER,
             "imp\n",
-            ENTER, // system prompt
             ENTER,
             "my draft\n.\n",
             DOWN,
@@ -1321,7 +1295,6 @@ mod tests {
             DOWN,
             ENTER,
             "imp\n",
-            ENTER, // system prompt
             ENTER,
             "my draft\n.\n",
             DOWN,
@@ -1365,14 +1338,14 @@ mod tests {
         let typed = [
             &downs(2),
             ENTER, // b
-            &downs(4),
+            &downs(3),
             ENTER, // move up
-            &downs(4),
+            &downs(3),
             ENTER, // move up again: b is first
-            &downs(6),
+            &downs(5),
             ENTER,
             "bb\n", // rename
-            &downs(7),
+            &downs(6),
             ENTER,
             "y\n", // delete
             ESC,
@@ -1394,9 +1367,9 @@ mod tests {
         let typed = [
             DOWN,
             ENTER, // a (last)
-            &downs(5),
+            &downs(4),
             ENTER, // move down: already last
-            &downs(7),
+            &downs(6),
             ENTER,
             "n\n", // delete: no
             ESC,
@@ -1466,7 +1439,7 @@ mod tests {
             .unwrap();
         std::fs::write(&file, "version two").unwrap();
         assert_eq!(store(&dir).prompt("f").unwrap().text, "version one");
-        let typed = [DOWN, ENTER, &downs(7), ENTER, ESC, ESC].concat();
+        let typed = [DOWN, ENTER, &downs(6), ENTER, ESC, ESC].concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
         config_menu(&mut agent, &term);
         assert_eq!(store(&dir).prompt("f").unwrap().text, "version two");
@@ -1486,7 +1459,7 @@ mod tests {
     fn the_built_in_text_can_be_restored_and_a_deleted_base_can_be_recreated() {
         let dir = Scratch::new("pu-restore");
         store(&dir).set_prompt_text("base", "ruined", None).unwrap();
-        let typed = [ENTER, &downs(7), ENTER, ESC, ESC].concat();
+        let typed = [ENTER, &downs(6), ENTER, ESC, ESC].concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
         config_menu(&mut agent, &term);
         assert_eq!(store(&dir).prompt("base").unwrap().text, BUILTIN_PROMPT);
@@ -1521,7 +1494,7 @@ mod tests {
         run(&mut agent, &term).unwrap();
         let out = screen(&term);
         assert!(
-            out.contains("prompts (changes apply to the next chat):\n  on       system       base"),
+            out.contains("system prompts (changes apply to the next chat):\n  on   base"),
             "{out}"
         );
         assert!(
@@ -1546,7 +1519,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("delete the prompt rules? [y/N]: deleted rules"),
+            out.contains("delete the system prompt rules? [y/N]: deleted rules"),
             "{out}"
         );
         assert!(out.contains("/prompts config needs a terminal"), "{out}");
@@ -1554,41 +1527,37 @@ mod tests {
         assert!(!store(&dir).prompt("base").unwrap().enabled);
     }
 
-    // ---- types (issue 14) ----
+    // ---- one manager per kind (issue 14) ----
 
-    fn add_typed_prompt(dir: &Scratch, name: &str, kind: PromptType) {
+    fn add_of_kind(dir: &Scratch, name: &str, kind: PromptType) {
         store(dir)
             .add_prompt_of_type(name, "", &format!("{name} text"), None, kind)
             .unwrap();
     }
 
     #[test]
-    fn a_skill_is_added_through_the_type_question_and_can_start_on() {
+    fn a_skill_is_added_from_the_skills_manager_and_is_not_switched_on() {
         let dir = Scratch::new("pu-add-skill");
         let typed = [
-            DOWN,
-            ENTER,
+            ENTER, // + add new (the only row)
             "tdd\n",
-            DOWN,
-            ENTER, // skill
             ENTER, // write it here
             "tests first\n.\n",
             ENTER, // save
             "\n",  // no description
-            "\n",  // switch on by default: yes
             ESC,
         ]
         .concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
-        config_menu(&mut agent, &term);
+        manager(&mut agent, &term, PromptType::Skill);
         let p = store(&dir).prompt("tdd").unwrap();
         assert_eq!(p.prompt_type, PromptType::Skill);
-        assert!(p.enabled);
+        assert!(!p.enabled);
         let out = screen(&term);
         assert!(out.contains("saved skill tdd"), "{out}");
-        assert!(out.contains("switch tdd on by default"), "{out}");
-        assert!(out.contains("tdd is on by default"), "{out}");
-        // The system prompt of a new chat is untouched.
+        assert!(out.contains("/skills use tdd"), "{out}");
+        // No "switch on" question and no change to the system prompt of a new chat.
+        assert!(!out.contains("[Y/n]"), "{out}");
         assert!(
             !agent
                 .assembled_prompt()
@@ -1596,126 +1565,143 @@ mod tests {
                 .text
                 .contains("tests first")
         );
-        assert!(out.contains("and with skills on: tdd"), "{out}");
     }
 
     #[test]
-    fn backing_out_at_the_type_question_saves_nothing() {
-        let dir = Scratch::new("pu-add-type-esc");
-        let typed = [DOWN, ENTER, "x\n", ESC, ESC].concat();
+    fn a_personality_is_added_from_its_own_manager() {
+        let dir = Scratch::new("pu-add-personality");
+        let typed = [ENTER, "pirate\n", ENTER, "arr\n.\n", ENTER, "\n", ESC].concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
-        config_menu(&mut agent, &term);
-        assert!(screen(&term).contains("[cancelled: nothing saved]"));
-        assert_eq!(names(&dir), ["base"]);
+        manager(&mut agent, &term, PromptType::Personality);
+        let p = store(&dir).prompt("pirate").unwrap();
+        assert_eq!(p.prompt_type, PromptType::Personality);
+        assert!(screen(&term).contains("saved personality pirate"));
+        assert!(screen(&term).contains("/personality pirate selects it"));
     }
 
     #[test]
-    fn the_manager_lists_every_type_and_the_checklist_only_system_prompts() {
-        let dir = Scratch::new("pu-types-listed");
-        add_typed_prompt(&dir, "tdd", PromptType::Skill);
-        add_typed_prompt(&dir, "pirate", PromptType::Personality);
-        let (mut agent, term, _) = rig(&dir, ESC, &[], true);
-        config_menu(&mut agent, &term);
-        let out = screen(&term);
-        assert!(out.contains("tdd  skill"), "{out}");
-        assert!(out.contains("pirate  personality"), "{out}");
+    fn each_manager_and_the_checklist_list_only_their_own_kind() {
+        let dir = Scratch::new("pu-kinds-listed");
+        add_of_kind(&dir, "tdd", PromptType::Skill);
+        add_of_kind(&dir, "pirate", PromptType::Personality);
+        let shown = |kind: PromptType| {
+            let (mut agent, term, _) = rig(&dir, ESC, &[], true);
+            manager(&mut agent, &term, kind);
+            screen(&term)
+        };
+        let system = shown(PromptType::System);
+        assert!(system.contains("base") && !system.contains("tdd") && !system.contains("pirate"));
+        let skills = shown(PromptType::Skill);
+        assert!(skills.contains("tdd") && !skills.contains("base") && !skills.contains("pirate"));
+        assert!(!skills.contains("[ ]"), "{skills}");
+        let personalities = shown(PromptType::Personality);
+        assert!(personalities.contains("pirate") && !personalities.contains("tdd"));
         let (mut agent, term, _) = rig(&dir, ESC, &[], true);
         checklist(&mut agent, &term);
         let out = screen(&term);
         assert!(out.contains("[x] base"), "{out}");
         assert!(!out.contains("tdd") && !out.contains("pirate"), "{out}");
-        // With nothing but other types the checklist says where they are.
-        store(&dir).delete_prompt("base").unwrap();
-        let (mut agent, term, _) = rig(&dir, "", &[], true);
-        checklist(&mut agent, &term);
-        assert!(screen(&term).contains("no system prompts: skills and personalities"));
     }
 
     #[test]
-    fn a_prompt_changes_type_from_its_screen_and_starts_off() {
-        let dir = Scratch::new("pu-change-type");
-        add(&dir, "x", "X");
-        store(&dir).set_prompt_enabled("x", true).unwrap();
-        // x, change type (row 3), the picker opens on system; Down to skill; Esc, Esc.
-        let typed = [DOWN, ENTER, &downs(3), ENTER, DOWN, ENTER, ESC, ESC].concat();
+    fn a_skill_screen_has_no_switch_and_edits_in_place() {
+        let dir = Scratch::new("pu-skill-screen");
+        add_of_kind(&dir, "tdd", PromptType::Skill);
+        // The skill, then "edit" (rows: view, edit, ...), typed text, save, back out.
+        let typed = [ENTER, DOWN, ENTER, "new text\n.\n", ENTER, ESC, ESC].concat();
         let (mut agent, term, _) = rig(&dir, &typed, &[], true);
-        config_menu(&mut agent, &term);
-        let p = store(&dir).prompt("x").unwrap();
-        assert_eq!(p.prompt_type, PromptType::Skill);
-        assert!(!p.enabled);
+        manager(&mut agent, &term, PromptType::Skill);
         let out = screen(&term);
-        assert!(out.contains("x is now a skill, switched off"), "{out}");
-        assert!(out.contains("system prompt (current)"), "{out}");
-        // The picker opens on the current type: Enter there changes nothing and says nothing.
-        let typed = [DOWN, ENTER, &downs(3), ENTER, ENTER, ESC, ESC].concat();
-        let (mut agent, term, _) = rig(&dir, &typed, &[], true);
-        config_menu(&mut agent, &term);
-        assert_eq!(
-            store(&dir).prompt("x").unwrap().prompt_type,
-            PromptType::Skill
+        assert!(
+            !out.contains("switch on") && !out.contains("switch off"),
+            "{out}"
         );
-        assert!(!screen(&term).contains("is now a"), "{}", screen(&term));
-        // From skill, Down is personality.
-        let typed = [DOWN, ENTER, &downs(3), ENTER, DOWN, ENTER, ESC, ESC].concat();
-        let (mut agent, term, _) = rig(&dir, &typed, &[], true);
-        config_menu(&mut agent, &term);
-        assert_eq!(
-            store(&dir).prompt("x").unwrap().prompt_type,
-            PromptType::Personality
+        assert!(
+            out.contains("saved tdd; used from the next message that uses it"),
+            "{out}"
         );
-        assert!(screen(&term).contains("x is now a personality"));
+        assert_eq!(store(&dir).prompt("tdd").unwrap().text, "new text");
     }
 
     #[test]
-    fn typed_type_changes_and_the_list_shows_types() {
-        let dir = Scratch::new("pu-typed-type");
-        add(&dir, "x", "X");
-        let typed = "/prompts type x skill\n\
-            /prompts on x\n\
-            /prompts type x personality\n\
-            /prompts on x\n\
-            /prompts type x\n\
-            /prompts type x robot\n\
-            /prompts type nope skill\n\
-            /prompts\n\
+    fn typed_commands_manage_skills_and_personalities_and_refuse_the_wrong_kind() {
+        let dir = Scratch::new("pu-typed-kinds");
+        let typed = "/skills add tdd\nWrite tests first.\n.\n\
+            /personality add pirate\nArr.\n.\n\
+            /skills edit tdd\nTests first, always.\n.\n\
+            /prompts on tdd\n\
+            /prompts edit pirate\n\
+            /prompts delete tdd\n\
+            /skills delete pirate\n\
+            /personality edit base\n\
+            /skills delete tdd\ny\n\
+            /prompts type tdd skill\n\
             /exit\n";
         let (mut agent, term, _) = rig(&dir, typed, &[], false);
         run(&mut agent, &term).unwrap();
         let out = screen(&term);
-        assert!(out.contains("x is now a skill, switched off"), "{out}");
+        assert!(out.contains("saved skill tdd"), "{out}");
+        assert!(out.contains("saved personality pirate"), "{out}");
         assert!(
-            out.contains("x is on by default: new chats start with it on"),
+            out.contains("saved tdd; used from the next message that uses it"),
             "{out}"
         );
         assert!(
-            out.contains("x is now a personality, switched off"),
+            out.contains("tdd is a skill: manage it with /skills"),
             "{out}"
         );
-        assert!(out.contains("x is the default personality"), "{out}");
-        assert_eq!(out.matches("usage: /prompts type").count(), 2, "{out}");
-        assert!(out.contains("no prompt named nope"), "{out}");
-        assert!(out.contains("  default  personality  x "), "{out}");
-        assert!(out.contains("and with personality x"), "{out}");
-        assert!(out.contains("  on       system       base"), "{out}");
+        assert!(
+            out.contains("pirate is a personality: manage it with /personality"),
+            "{out}"
+        );
+        assert!(
+            out.contains("base is a system prompt: manage it with /prompts"),
+            "{out}"
+        );
+        assert!(out.contains("deleted tdd"), "{out}");
+        assert!(out.contains("usage: /prompts"), "{out}");
+        assert_eq!(names(&dir), ["base", "pirate"]);
     }
 
     #[test]
-    fn changing_the_type_of_a_prompt_the_chat_uses_stops_using_it() {
-        let dir = Scratch::new("pu-type-in-chat");
-        add_typed_prompt(&dir, "tdd", PromptType::Skill);
-        let typed = "/skills on tdd\nhello\n/prompts type tdd personality\nagain\n/exit\n";
+    fn a_new_skill_does_not_show_in_prompts() {
+        let dir = Scratch::new("pu-prompts-clean");
+        add_of_kind(&dir, "tdd", PromptType::Skill);
+        add_of_kind(&dir, "pirate", PromptType::Personality);
+        let (mut agent, term, _) = rig(&dir, "/prompts\n/exit\n", &[], false);
+        run(&mut agent, &term).unwrap();
+        let out = screen(&term);
+        assert!(out.contains("base"), "{out}");
+        assert!(!out.contains("tdd") && !out.contains("pirate"), "{out}");
+    }
+
+    #[test]
+    fn deleting_a_skill_a_chat_has_on_stops_it_being_sent() {
+        let dir = Scratch::new("pu-delete-in-chat");
+        add_of_kind(&dir, "tdd", PromptType::Skill);
+        let typed = "/skills on tdd\nhello\n/skills delete tdd\ny\nagain\n/exit\n";
         let (mut agent, term, requests) = rig(&dir, typed, &["one", "two"], false);
         run(&mut agent, &term).unwrap();
         let requests = requests.borrow();
-        let last = |i: usize| {
+        let texts = |i: usize| -> Vec<String> {
             let v: serde_json::Value = serde_json::from_slice(&requests[i]).unwrap();
-            v["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
+            v["messages"]
+                .as_array()
                 .unwrap()
-                .to_owned()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap_or("").to_owned())
+                .collect()
         };
-        assert!(last(0).contains("Skill: tdd"));
-        assert_eq!(last(1), "again");
+        // The skill went into the chat with the first message; once it is deleted the chat is
+        // told that nothing is active, and the newest message is the user's.
+        assert!(texts(0)[1].contains("Skill: tdd"));
+        assert_eq!(texts(0).last().unwrap(), "hello");
+        assert!(
+            texts(1)
+                .iter()
+                .any(|t| t.starts_with(crate::store_prompts::NONE_ACTIVE))
+        );
+        assert_eq!(texts(1).last().unwrap(), "again");
     }
 
     #[test]

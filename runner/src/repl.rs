@@ -10,15 +10,17 @@ use std::rc::Rc;
 use kernel::{Message, ToolCall};
 
 use crate::agent::{Agent, Observer, Outcome};
+use crate::cancel::{Cancel, asks_to_cancel};
 use crate::menu::{DEFAULT_WIDTH, Key, MenuItem, MenuState, Step, parse_key};
 use crate::provider::router_host;
 use crate::providers::ProviderDef;
+use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, summary_body};
 use crate::style::Style;
-use crate::tools::Approver;
+use crate::tools::{Answer, Approver, Ask, Mode};
 use crate::turn_log::utc_label;
 
-/// Longest tool-call arguments shown on screen (the log keeps them whole).
-const SHOWN_ARGUMENT_CHARS: usize = 200;
+/// How wide a collapsed tool line may be when the terminal's width is not known.
+const DEFAULT_LINE_WIDTH: usize = 100;
 
 /// How many of the user's messages a resumed chat shows again (with everything after each).
 const REPLAYED_USER_MESSAGES: usize = 10;
@@ -69,7 +71,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/prompts",
-        "the system prompts: switch them on or off (a checklist in a terminal; skills and personalities are in /prompts config)",
+        "the system prompts: switch them on or off (a checklist in a terminal)",
     ),
     (
         "/prompts config",
@@ -84,10 +86,6 @@ const COMMANDS: &[(&str, &str)] = &[
         "save a new prompt, typed here or copied from a file",
     ),
     (
-        "/prompts type <name> <system|skill|personality>",
-        "change what a prompt is for (it starts the new type switched off)",
-    ),
-    (
         "/prompts show",
         "print the system prompt a new chat would start with",
     ),
@@ -100,8 +98,32 @@ const COMMANDS: &[(&str, &str)] = &[
         "the same by typing; use is for the next message only",
     ),
     (
+        "/skills config",
+        "add, edit, reorder and delete skills (terminal only); typed: /skills add [name [file]], edit <name>, delete <name>",
+    ),
+    (
         "/personality [name|none]",
         "choose the personality of this chat, one at a time (a menu in a terminal)",
+    ),
+    (
+        "/personality config",
+        "add, edit, reorder and delete personalities (terminal only); typed: /personality add [name [file]], edit <name>, delete <name>",
+    ),
+    (
+        "/approve [manual|auto|forget]",
+        "show or choose how file changes are approved: manual asks every time, auto lets the file tools run (bash still asks); remembered (a menu in a terminal); forget clears the \"always\" answers given in this run",
+    ),
+    (
+        "/expand [N|list]",
+        "show a tool call in full (the last one, call #N, or a list of this run's calls)",
+    ),
+    (
+        "/info",
+        "show the line under the input box: model, approval mode, tokens and context",
+    ),
+    (
+        "/compact [auto [tokens|off]]",
+        "have the model summarise this chat and continue in a new chat that starts with the summary (the old chat stays saved); it also happens before a message when the last request was 80,000 prompt tokens or more: /compact auto shows the limit, /compact auto <tokens> or off changes it",
     ),
     (
         "/new",
@@ -118,22 +140,48 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "quit (also /quit; Ctrl-D works too)"),
 ];
 
-/// Tool-call arguments as shown on screen: cut off after [`SHOWN_ARGUMENT_CHARS`].
-fn shorten(arguments: &str) -> String {
-    let mut shown: String = arguments.chars().take(SHOWN_ARGUMENT_CHARS).collect();
-    if arguments.chars().count() > SHOWN_ARGUMENT_CHARS {
-        shown.push_str("...");
-    }
-    shown
+/// Whether `word` is shaped like a chat command: a slash and then letters, digits, `-` or `_`
+/// only. A path (`/etc/hosts`) has another slash and is a message.
+fn looks_like_command(word: &str) -> bool {
+    word.strip_prefix('/').is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
 }
 
-/// One `[tool] name arguments` line, the same live and in a replay.
-fn tool_line(style: Style, name: &str, arguments: &str) -> String {
+/// One collapsed tool line, the same live and in a replay: `▸ #3 write_file notes/a.txt · 5 bytes`
+/// (a replay has no number). `width` is how many columns the line may use.
+fn tool_line(
+    style: Style,
+    number: Option<usize>,
+    name: &str,
+    arguments: &str,
+    width: usize,
+) -> String {
+    let head = match number {
+        Some(n) => format!("▸ #{n} {name}"),
+        None => format!("▸ {name}"),
+    };
+    let room = width.saturating_sub(head.chars().count() + 1).max(20);
     format!(
-        "{} {name} {}\n",
-        style.yellow("[tool]"),
-        style.dim(&shorten(arguments))
+        "{}\n",
+        style.dim(&format!(
+            "{head} {}",
+            crate::toolview::summary(name, arguments, room)
+        ))
     )
+}
+
+/// The line after a tool has run: `  ✓ created a.txt (5 bytes)` or, for a failure, `  ✗ error: ...`.
+fn result_line(style: Style, result: &str, width: usize) -> String {
+    let text = crate::toolview::result_summary(result, width.saturating_sub(4).max(20));
+    if crate::toolview::failed(result) {
+        format!("{}\n", style.red(&format!("  ✗ {text}")))
+    } else {
+        format!("{}\n", style.dim(&format!("  ✓ {text}")))
+    }
 }
 
 pub const PROMPT: &str = "> ";
@@ -157,6 +205,28 @@ pub struct Terminal<R, W> {
     col: usize,
     /// The lines typed at the main prompt, oldest first, for Up and Down.
     history: Vec<String>,
+    /// The tool calls of this run, for `/expand` (issue 17).
+    tools: Vec<crate::toolview::ToolRecord>,
+    /// The box kept at the bottom while the model works (issue 17).
+    sticky: Option<Sticky>,
+    /// A cancelled message, put back in the box at the next prompt to be edited and sent again.
+    restore: Option<String>,
+    /// The flag Esc and Ctrl-C set while the model works (issue 18); `None` until the REPL gives it.
+    cancel: Option<Cancel>,
+    /// Reads the keyboard while the model works, to see a cancel.
+    watcher: Option<Watcher>,
+    /// The working directory: the `@file` list is made from it and `@path` words are read from it.
+    root: std::path::PathBuf,
+}
+
+/// The box at the bottom of the screen while the model works: output is printed above it.
+struct Sticky {
+    /// The info line, made when the work started.
+    info: String,
+    /// How many rows the box takes on screen.
+    rows: usize,
+    /// Whether it is on screen now (it is taken off while an approval question is shown).
+    visible: bool,
 }
 
 /// How many columns the cursor is at after printing `text` from column `col`: escape sequences
@@ -206,6 +276,12 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
             editor: None,
             col: 0,
             history: Vec::new(),
+            tools: Vec::new(),
+            sticky: None,
+            restore: None,
+            cancel: None,
+            watcher: None,
+            root: std::env::current_dir().unwrap_or_default(),
         }))
     }
 
@@ -225,6 +301,15 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
         self.menus
     }
 
+    /// How many columns a collapsed tool line may use.
+    fn line_width(&self) -> usize {
+        if self.menu_stty {
+            terminal_width()
+        } else {
+            DEFAULT_LINE_WIDTH
+        }
+    }
+
     /// From now on [`Terminal::ask_secret`] tries to keep what is typed off the screen.
     pub fn hide_secrets(&mut self) {
         self.hide_secrets = true;
@@ -240,10 +325,99 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
 
     /// Prints text and flushes, so a prompt without a newline appears at once.
     pub fn say(&mut self, text: &str) {
+        // While the model works, the box stays at the bottom: take it off, print, put it back.
+        if let Some(rows) = self.sticky.as_ref().filter(|s| s.visible).map(|s| s.rows) {
+            let _ = self
+                .output
+                .write_all(crate::inputbox::erase(rows).as_bytes());
+            let _ = self.output.write_all(text.as_bytes());
+            if !text.ends_with('\n') {
+                let _ = self.output.write_all(b"\r\n");
+            }
+            self.draw_sticky();
+            self.col = 0;
+            return;
+        }
         // A closed screen is not worth stopping for here.
         let _ = self.output.write_all(text.as_bytes());
         let _ = self.output.flush();
         self.col = advance_col(self.col, text);
+    }
+
+    /// Draws the working box where the cursor is (a fresh row) and leaves the cursor below it.
+    fn draw_sticky(&mut self) {
+        let Some(sticky) = &mut self.sticky else {
+            return;
+        };
+        let (shown, rows) =
+            crate::inputbox::static_box(self.style, terminal_size(), "working…", &sticky.info);
+        sticky.rows = rows;
+        sticky.visible = true;
+        let _ = self.output.write_all(shown.as_bytes());
+        let _ = self.output.flush();
+    }
+
+    /// Sets the folder `@file` works in (the program's working directory unless told otherwise).
+    pub fn set_root(&mut self, root: std::path::PathBuf) {
+        self.root = root;
+    }
+
+    /// Gives the flag that Esc and Ctrl-C set while the model works.
+    pub fn set_cancel(&mut self, cancel: Cancel) {
+        self.cancel = Some(cancel);
+    }
+
+    fn start_watching(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            self.watcher = Watcher::start(cancel.clone());
+        }
+    }
+
+    /// Starts keeping a box at the bottom while the model works (a real terminal only).
+    pub fn begin_working(&mut self, info: impl Fn(Option<usize>) -> String) {
+        if !self.menu_stty {
+            return;
+        }
+        let info = info(Some(terminal_size().1.saturating_sub(3)));
+        self.sticky = Some(Sticky {
+            info,
+            rows: 0,
+            visible: false,
+        });
+        self.draw_sticky();
+        self.start_watching();
+    }
+
+    /// Takes the working box off the screen for good.
+    pub fn end_working(&mut self) {
+        self.watcher = None;
+        if let Some(sticky) = self.sticky.take()
+            && sticky.visible
+        {
+            let _ = self
+                .output
+                .write_all(crate::inputbox::erase(sticky.rows).as_bytes());
+            let _ = self.output.flush();
+        }
+    }
+
+    /// Takes the working box off the screen until [`Terminal::resume_sticky`] (a question is shown).
+    fn suspend_sticky(&mut self) {
+        if let Some(sticky) = &mut self.sticky
+            && sticky.visible
+        {
+            sticky.visible = false;
+            let _ = self
+                .output
+                .write_all(crate::inputbox::erase(sticky.rows).as_bytes());
+            let _ = self.output.flush();
+        }
+    }
+
+    fn resume_sticky(&mut self) {
+        if self.sticky.as_ref().is_some_and(|s| !s.visible) {
+            self.draw_sticky();
+        }
     }
 
     /// Reads one line without its line ending. `None` at end of input. On a real terminal the
@@ -256,6 +430,81 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
     /// typed there earlier in this run.
     pub fn read_command(&mut self) -> Option<String> {
         self.read_edited_line(true)
+    }
+
+    /// Draws the main prompt and reads the next line. At a real terminal the line is typed inside
+    /// a box with `info` under it (issue 17); otherwise it follows a plain `> `.
+    pub fn read_prompt(&mut self, info: impl Fn(Option<usize>) -> String) -> Option<String> {
+        let raw = if self.menu_stty {
+            RawMode::enter()
+        } else {
+            None
+        };
+        let Some(raw) = raw else {
+            let accent = self.style.accent(PROMPT);
+            self.say(&accent);
+            return self.read_command();
+        };
+        let root = self.root.clone();
+        let restored = self.restore.take().unwrap_or_default();
+        let (line, row) = crate::inputbox::read_boxed_from(
+            &restored,
+            &mut self.input,
+            &mut self.output,
+            self.style,
+            terminal_size(),
+            &self.history.clone(),
+            &info,
+            &mut || crate::attach::files_under(&root),
+        );
+        drop(raw);
+        // The box goes; what was sent stays in the scrollback as a line of its own, in cyan.
+        let _ = self
+            .output
+            .write_all(crate::inputbox::erase(row).as_bytes());
+        let _ = self.output.flush();
+        self.col = 0;
+        if let Some(sent) = &line
+            && !sent.trim().is_empty()
+        {
+            let echoed = format!("\n{}\n", self.style.cyan(sent));
+            self.say(&echoed);
+        }
+        if let Some(line) = &line
+            && !line.trim().is_empty()
+            && self.history.last() != Some(line)
+        {
+            self.history.push(line.clone());
+        }
+        line
+    }
+
+    /// Keeps what is typed while the model works off the screen (a real terminal only).
+    fn quiet(&self) -> Option<EchoOff> {
+        if self.menu_stty && self.watcher.is_none() {
+            EchoOff::enter()
+        } else {
+            None
+        }
+    }
+
+    /// Throws away keys that were pressed before now, so a stray Enter typed while the model
+    /// worked cannot answer the question about to be shown (a real terminal only).
+    fn discard_pending(&mut self) {
+        if !self.menu_stty {
+            return;
+        }
+        let Some(raw) = RawMode::enter_with_min(0) else {
+            return;
+        };
+        while let Ok(buffer) = self.input.fill_buf() {
+            let n = buffer.len();
+            if n == 0 {
+                break;
+            }
+            self.input.consume(n);
+        }
+        drop(raw);
     }
 
     fn read_edited_line(&mut self, with_history: bool) -> Option<String> {
@@ -316,6 +565,11 @@ struct RawMode {
 
 impl RawMode {
     fn enter() -> Option<Self> {
+        Self::enter_with_min(1)
+    }
+
+    /// `min` is how many bytes a read waits for: 1 waits for a key, 0 returns at once.
+    fn enter_with_min(min: u8) -> Option<Self> {
         let output = std::process::Command::new("stty")
             .arg("-g")
             .stdin(std::process::Stdio::inherit())
@@ -327,7 +581,15 @@ impl RawMode {
         }
         let saved = String::from_utf8(output.stdout).ok()?.trim().to_owned();
         let set = std::process::Command::new("stty")
-            .args(["-icanon", "-echo", "-isig", "min", "1", "time", "0"])
+            .args([
+                "-icanon",
+                "-echo",
+                "-isig",
+                "min",
+                &min.to_string(),
+                "time",
+                "0",
+            ])
             .stdin(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::null())
             .status()
@@ -337,6 +599,92 @@ impl RawMode {
 }
 
 impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("stty")
+            .arg(&self.saved)
+            .stdin(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Watches the keyboard while the model works (issue 18). The terminal is in raw mode, so Ctrl-C
+/// arrives as a key and nothing typed is drawn; Esc on its own or Ctrl-C sets the cancel flag.
+/// Dropping it stops the thread and puts the terminal back.
+struct Watcher {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    // Dropped after the thread has been joined (fields drop after `drop` runs).
+    _raw: RawMode,
+}
+
+impl Watcher {
+    fn start(cancel: Cancel) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let raw = RawMode::enter_with_min(0)?;
+        let mut tty = std::fs::File::open("/dev/tty").ok()?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buffer = [0u8; 64];
+            while !seen.load(Ordering::SeqCst) {
+                match tty.read(&mut buffer) {
+                    Ok(n) if n > 0 => {
+                        if asks_to_cancel(&buffer[..n]) {
+                            cancel.cancel();
+                        }
+                    }
+                    _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        });
+        Some(Self {
+            stop,
+            thread: Some(thread),
+            _raw: raw,
+        })
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// No echo of what is typed while this is alive (the model is working). The keys are not lost: they
+/// wait to be read. Puts the terminal back as it was when dropped.
+struct EchoOff {
+    saved: String,
+}
+
+impl EchoOff {
+    fn enter() -> Option<Self> {
+        let output = std::process::Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let saved = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+        let set = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        set.success().then_some(Self { saved })
+    }
+}
+
+impl Drop for EchoOff {
     fn drop(&mut self) {
         let _ = std::process::Command::new("stty")
             .arg(&self.saved)
@@ -384,17 +732,29 @@ fn edit_in_editor(editor: &str, initial: &str) -> Result<String, String> {
 
 /// The terminal's width in columns, from `stty size`.
 fn terminal_width() -> usize {
-    std::process::Command::new("stty")
+    terminal_size().1
+}
+
+/// The terminal's `(rows, columns)`; 24 by [`DEFAULT_WIDTH`] when it cannot say.
+fn terminal_size() -> (usize, usize) {
+    let numbers: Vec<usize> = std::process::Command::new("stty")
         .arg("size")
         .stdin(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| text.split_whitespace().nth(1)?.parse::<usize>().ok())
-        // A terminal that does not know its size reports 0.
-        .filter(|width| *width > 0)
-        .unwrap_or(DEFAULT_WIDTH)
+        .map(|text| {
+            text.split_whitespace()
+                .filter_map(|n| n.parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    // A terminal that does not know its size reports 0.
+    match numbers[..] {
+        [rows, cols] if rows > 0 && cols > 0 => (rows, cols),
+        _ => (24, DEFAULT_WIDTH),
+    }
 }
 
 impl<R: BufRead, W: Write> Terminal<R, W> {
@@ -540,22 +900,102 @@ fn set_echo(on: bool) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Asks on the terminal before `bash` runs a command. Only `y` or `yes` approves;
-/// anything else, or end of input, denies.
+/// Asks on the terminal before `bash` runs a command or a file tool changes a file. In a terminal
+/// the answer is picked from a menu (yes, always, no; Esc is no); typed, `y` or `yes` approves,
+/// `a` or `always` approves and remembers (only when offered), and anything else, or end of input,
+/// denies.
 pub struct TerminalApprover<R, W>(pub Shared<R, W>);
 
 impl<R: BufRead, W: Write> Approver for TerminalApprover<R, W> {
-    fn approve(&self, command: &str) -> bool {
+    fn approve(&self, ask: &Ask) -> Answer {
+        // The working box is out of the way while the question is on screen, and the key watcher
+        // stops so that the question gets every key.
+        let watching = {
+            let mut term = self.0.borrow_mut();
+            term.suspend_sticky();
+            term.watcher.take().is_some()
+        };
+        let answer = self.ask_inner(ask);
+        let mut term = self.0.borrow_mut();
+        term.resume_sticky();
+        if watching {
+            term.start_watching();
+        }
+        answer
+    }
+}
+
+impl<R: BufRead, W: Write> TerminalApprover<R, W> {
+    fn ask_inner(&self, ask: &Ask) -> Answer {
         let mut term = self.0.borrow_mut();
         let style = term.style();
         term.say(&format!(
-            "\n{}\n  {}\n{} ",
-            style.bold("run this command?"),
-            style.yellow(command),
-            style.bold("[y/N]")
+            "\n{}\n  {}\n",
+            style.bold(ask.question),
+            style.yellow(ask.detail)
         ));
-        let answer = term.read_line().unwrap_or_default();
-        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        if term.menus_enabled() {
+            term.discard_pending();
+            loop {
+                let mut rows = vec![(Some(Answer::Yes), MenuItem::new("yes"))];
+                if let Some(what) = ask.always {
+                    rows.push((
+                        Some(Answer::Always),
+                        MenuItem::new("always").with_detail(format!("allow {what} until you quit")),
+                    ));
+                }
+                if ask.full.is_some() {
+                    rows.push((
+                        None,
+                        MenuItem::new("view").with_detail("show the whole text first"),
+                    ));
+                }
+                rows.push((Some(Answer::No), MenuItem::new("no")));
+                let items: Vec<MenuItem> = rows.iter().map(|(_, item)| item.clone()).collect();
+                // The cursor starts on "no": Enter alone never approves.
+                let picked = term.pick_from("allow it?", &items, items.len() - 1);
+                let answer = match picked {
+                    None => Some(Answer::No),
+                    Some(index) => rows[index].0,
+                };
+                let Some(answer) = answer else {
+                    // "view": show the text, then ask again.
+                    let text = ask.full.unwrap_or("");
+                    term.say(&format!("{}\n", style.dim(text.trim_end_matches('\n'))));
+                    continue;
+                };
+                let shown = match answer {
+                    Answer::Yes => style.green("  yes"),
+                    Answer::Always => style.green(&format!(
+                        "  always: {} are allowed until you quit",
+                        ask.always.unwrap_or("these")
+                    )),
+                    Answer::No => style.red("  no"),
+                };
+                term.say(&format!("{shown}\n"));
+                return answer;
+            }
+        }
+        if let Some(what) = ask.always {
+            term.say(&format!(
+                "{}\n",
+                style.dim(&format!("  a = always allow {what} until you quit"))
+            ));
+        }
+        term.say(&format!(
+            "{} ",
+            style.bold(if ask.always.is_some() {
+                "[y/a/N]"
+            } else {
+                "[y/N]"
+            })
+        ));
+        let line = term.read_line().unwrap_or_default();
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => Answer::Yes,
+            "a" | "always" if ask.always.is_some() => Answer::Always,
+            _ => Answer::No,
+        }
     }
 }
 
@@ -564,10 +1004,31 @@ pub struct PrintObserver<R, W>(pub Shared<R, W>);
 
 impl<R: BufRead, W: Write> Observer for PrintObserver<R, W> {
     fn tool_call(&mut self, call: &ToolCall) {
-        let style = self.0.borrow().style();
-        self.0
-            .borrow_mut()
-            .say(&tool_line(style, &call.name, &call.arguments));
+        let mut term = self.0.borrow_mut();
+        let style = term.style();
+        term.tools.push(crate::toolview::ToolRecord {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            result: None,
+        });
+        let line = tool_line(
+            style,
+            Some(term.tools.len()),
+            &call.name,
+            &call.arguments,
+            term.line_width(),
+        );
+        term.say(&line);
+    }
+
+    fn tool_result(&mut self, _call: &ToolCall, result: &str) {
+        let mut term = self.0.borrow_mut();
+        let style = term.style();
+        if let Some(record) = term.tools.last_mut() {
+            record.result = Some(result.to_owned());
+        }
+        let line = result_line(style, result, term.line_width());
+        term.say(&line);
     }
 
     fn warning(&mut self, text: &str) {
@@ -579,8 +1040,31 @@ impl<R: BufRead, W: Write> Observer for PrintObserver<R, W> {
     }
 }
 
+/// A saved "active instructions" message as one line: which personality and skills it holds.
+fn instructions_line(block: &str) -> String {
+    let personality = block
+        .lines()
+        .find_map(|l| l.strip_prefix("## Personality: "));
+    let skills: Vec<&str> = block
+        .lines()
+        .filter_map(|l| l.strip_prefix("## Skill: "))
+        .collect();
+    let mut parts = Vec::new();
+    if let Some(name) = personality {
+        parts.push(format!("personality {name}"));
+    }
+    if !skills.is_empty() {
+        parts.push(format!("skills {}", skills.join(", ")));
+    }
+    if parts.is_empty() {
+        "[instructions: none active]".to_owned()
+    } else {
+        format!("[instructions: {}]", parts.join("; "))
+    }
+}
+
 /// Shows a resumed chat on screen the way the live chat showed it: your lines after `> `, the
-/// model's answers, and a `[tool]` line for each tool call. Tool results and the system prompt
+/// model's answers, and a collapsed `▸` line for each tool call. Tool results and the system prompt
 /// are not shown (they were not on screen live either). Only the last
 /// [`REPLAYED_USER_MESSAGES`] of your messages, with what followed each, are shown.
 pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Message]) {
@@ -594,7 +1078,9 @@ pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Messag
     let user_positions: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m, Message::User(_)))
+        .filter(|(_, m)| {
+            matches!(m, Message::User(t) if !t.starts_with(ACTIVE_MARK) && !t.starts_with(SUMMARY_MARK))
+        })
         .map(|(position, _)| position)
         .collect();
     let start = user_positions
@@ -603,6 +1089,7 @@ pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Messag
         .map_or(0, |first| user_positions[first]);
 
     let style = term.borrow().style();
+    let width = term.borrow().line_width();
     let mut text = String::new();
     if start > 0 {
         text.push_str(&format!(
@@ -612,6 +1099,16 @@ pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Messag
     }
     for message in &messages[start..] {
         match message {
+            Message::User(content) if content.starts_with(ACTIVE_MARK) => {
+                text.push_str(&format!("{}\n", style.dim(&instructions_line(content))));
+            }
+            Message::User(content) if content.starts_with(SUMMARY_MARK) => {
+                let chars = summary_body(content).chars().count();
+                text.push_str(&format!(
+                    "{}\n",
+                    style.dim(&format!("[summary of an earlier chat: {chars} characters]"))
+                ));
+            }
             Message::User(content) => {
                 text.push_str(&format!("{}{content}\n", style.accent(PROMPT)));
             }
@@ -626,7 +1123,7 @@ pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Messag
                     text.push_str(&format!("{content}\n"));
                 }
                 for call in tool_calls {
-                    text.push_str(&tool_line(style, &call.name, &call.arguments));
+                    text.push_str(&tool_line(style, None, &call.name, &call.arguments, width));
                 }
             }
             Message::Tool { .. } | Message::System(_) => {}
@@ -634,6 +1131,85 @@ pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Messag
     }
     text.push_str(&format!("{}\n", style.dim("[end of saved chat]")));
     term.borrow_mut().say(&text);
+}
+
+/// `/compact`, `/compact auto`, `/compact auto <tokens>` and `/compact auto off` (issue 24).
+fn compact_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, rest: &str) {
+    let style = term.borrow().style();
+    let mut words = rest.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (None, ..) => run_compact(agent, term, true),
+        (Some("auto"), None, _) => {
+            let said = match agent.auto_compact_at() {
+                Some(limit) => format!(
+                    "automatic compaction: before a message when the last request was {} prompt tokens or more",
+                    crate::usage::thousands(limit)
+                ),
+                None => "automatic compaction: off".to_owned(),
+            };
+            say_line(term, &said);
+        }
+        (Some("auto"), Some(value), None) => {
+            let limit = if value == "off" {
+                Ok(None)
+            } else {
+                value
+                    .replace(',', "")
+                    .parse::<u64>()
+                    .map(Some)
+                    .map_err(|_| format!("'{value}' is not a number of tokens or off"))
+            };
+            let done = limit.and_then(|limit| {
+                agent.set_auto_compact(limit)?;
+                Ok(limit)
+            });
+            match done {
+                Ok(Some(limit)) => say_line(
+                    term,
+                    &style.green(&format!(
+                        "automatic compaction at {} prompt tokens",
+                        crate::usage::thousands(limit)
+                    )),
+                ),
+                Ok(None) => say_line(term, &style.green("automatic compaction is off")),
+                Err(why) => say_line(term, &style.yellow(&why)),
+            }
+        }
+        _ => say_line(
+            term,
+            &style.yellow(
+                "usage: /compact | /compact auto | /compact auto <tokens> | /compact auto off",
+            ),
+        ),
+    }
+}
+
+/// Runs one compaction with the working box up and says what happened. `Esc` cancels it.
+fn run_compact<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, asked: bool) {
+    let style = term.borrow().style();
+    term.borrow_mut()
+        .begin_working(|width| info_text(agent, width));
+    let quiet = term.borrow().quiet();
+    let done = agent.compact();
+    drop(quiet);
+    term.borrow_mut().end_working();
+    match done {
+        Ok(report) => say_line(
+            term,
+            &style.green(&format!(
+                "[compacted: {} messages became a summary of {} characters; the earlier chat is saved]",
+                report.messages, report.summary_chars
+            )),
+        ),
+        Err(why) => {
+            let note = if asked {
+                format!("[not compacted: {why}]")
+            } else {
+                format!("[not compacted: {why}; sending the message as it is]")
+            };
+            say_line(term, &style.yellow(&note));
+        }
+    }
 }
 
 /// The start of a chat's first message on one line, in quotes, to recognise it by.
@@ -649,6 +1225,17 @@ pub(crate) fn preview(first_message: Option<&str>) -> String {
         shown.push_str("...");
     }
     format!("\"{shown}\"")
+}
+
+/// What identifies a saved chat in a list: the first thing the user typed, in quotes, with
+/// `(continued)` first when the chat began from a compaction summary.
+pub(crate) fn chat_label(chat: &crate::store::SessionSummary) -> String {
+    let text = preview(chat.first_message.as_deref());
+    match (chat.continued, text.is_empty()) {
+        (false, _) => text,
+        (true, true) => "(continued)".to_owned(),
+        (true, false) => format!("(continued) {text}"),
+    }
 }
 
 /// `/sessions`: lists the newest saved chats.
@@ -672,7 +1259,7 @@ fn show_sessions<R: BufRead, W: Write>(agent: &Agent, term: &Shared<R, W>) {
                     style.dim(&utc_label(u64::try_from(chat.updated_at).unwrap_or(0))),
                     chat.message_count,
                     chat.model,
-                    preview(chat.first_message.as_deref()),
+                    chat_label(chat),
                 ));
             }
             text.push_str(&format!(
@@ -747,7 +1334,7 @@ fn help_text(style: Style) -> String {
     text.push_str(&format!(
         "{}\n",
         style.dim(
-            "anything else you type, including other lines that start with /, goes to the model"
+            "anything else you type goes to the model; a word like /foo that is not a command is refused (a path such as /etc/hosts is fine)"
         )
     ));
     text
@@ -811,6 +1398,162 @@ fn model_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, a
     }
     let switched = agent.switch_model(argument);
     report_model_switch(agent, term, switched);
+}
+
+/// The info line under the input box (also `/info`): model, provider, approval mode, tokens.
+fn info_text(agent: &Agent, width: Option<usize>) -> String {
+    let mode = agent.approval_mode();
+    crate::usage::info_line(
+        &crate::usage::Info {
+            model: agent.ready().then(|| agent.model()),
+            provider: &agent.target().name,
+            approve: mode.name(),
+            always: agent.always_labels().len(),
+            usage: agent.usage(),
+        },
+        width,
+    )
+}
+
+/// `/expand [N|list]`: the full text of a tool call of this run.
+fn expand_command<R: BufRead, W: Write>(term: &Shared<R, W>, argument: &str) {
+    let style = term.borrow().style();
+    let count = term.borrow().tools.len();
+    if count == 0 {
+        say_line(
+            term,
+            &style.yellow(
+                "no tool calls in this run yet (calls from before a /resume cannot be expanded)",
+            ),
+        );
+        return;
+    }
+    let text = if argument == "list" {
+        let width = term.borrow().line_width();
+        let lines: Vec<String> = term
+            .borrow()
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(i, record)| {
+                let head = format!("#{} {}", i + 1, record.name);
+                let room = width.saturating_sub(head.chars().count() + 1).max(20);
+                format!(
+                    "{head} {}",
+                    crate::toolview::summary(&record.name, &record.arguments, room)
+                )
+            })
+            .collect();
+        format!("{}\n", lines.join("\n"))
+    } else {
+        let number = if argument.is_empty() {
+            Some(count)
+        } else {
+            argument.parse::<usize>().ok()
+        };
+        match number {
+            Some(n) if (1..=count).contains(&n) => {
+                crate::toolview::full(n, &term.borrow().tools[n - 1])
+            }
+            Some(_) => {
+                say_line(
+                    term,
+                    &style.yellow(&format!(
+                        "there is no call #{argument}; this run has #1 to #{count}"
+                    )),
+                );
+                return;
+            }
+            None => {
+                say_line(term, &style.yellow("usage: /expand [N|list]"));
+                return;
+            }
+        }
+    };
+    term.borrow_mut().say(&text);
+}
+
+/// `/approve`: shows or chooses how the file tools are approved (issue 16).
+fn approve_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, argument: &str) {
+    let style = term.borrow().style();
+    let current = agent.approval_mode();
+    if argument == "forget" {
+        let count = agent.forget_always();
+        say_line(
+            term,
+            &format!(
+                "forgot {count} \"always\" permission{}",
+                if count == 1 { "" } else { "s" }
+            ),
+        );
+        return;
+    }
+    let chosen = if argument.is_empty() {
+        let always = agent.always_labels();
+        if !always.is_empty() {
+            say_line(
+                term,
+                &format!(
+                    "{} {} (/approve forget clears them)",
+                    style.dim("allowed until you quit:"),
+                    always.join(", ")
+                ),
+            );
+        }
+        if !term.borrow().menus_enabled() {
+            say_line(
+                term,
+                &format!("approval mode: {} ({})", current.name(), current.describe()),
+            );
+            return;
+        }
+        let items: Vec<MenuItem> = Mode::ALL
+            .iter()
+            .map(|mode| {
+                let marker = if *mode == current { " (now)" } else { "" };
+                MenuItem::new(format!("{}{marker}", mode.name())).with_detail(mode.describe())
+            })
+            .collect();
+        let start = Mode::ALL.iter().position(|m| *m == current).unwrap_or(0);
+        let picked = term.borrow_mut().pick_from("approval mode", &items, start);
+        match picked {
+            Some(index) => Mode::ALL[index],
+            None => {
+                say_line(term, &style.dim("unchanged"));
+                return;
+            }
+        }
+    } else {
+        match Mode::parse(argument) {
+            Some(mode) => mode,
+            None => {
+                say_line(term, &style.yellow("usage: /approve [manual|auto|forget]"));
+                return;
+            }
+        }
+    };
+    if chosen == current {
+        say_line(
+            term,
+            &format!(
+                "approval mode stays {}: {}",
+                current.name(),
+                current.describe()
+            ),
+        );
+        return;
+    }
+    match agent.set_approval_mode(chosen) {
+        Ok(()) => say_line(
+            term,
+            &style.green(&format!(
+                "approval mode is now {}: {}",
+                chosen.name(),
+                chosen.describe()
+            )),
+        ),
+        Err(why) => say_line(term, &style.yellow(&format!("[{why}]"))),
+    }
 }
 
 /// Says what a model switch did: the new model and the warnings, or why it did not happen.
@@ -1053,11 +1796,14 @@ fn provider_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>
 pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::Result<()> {
     let mut observer = PrintObserver(Rc::clone(term));
     let style = term.borrow().style();
+    term.borrow_mut().set_cancel(agent.cancel_handle());
     loop {
         // Each borrow ends at the semicolon, before `agent.send` runs: the
         // approver and observer borrow the terminal again while it works.
-        term.borrow_mut().say(&style.accent(PROMPT));
-        let Some(line) = term.borrow_mut().read_command() else {
+        let Some(line) = term
+            .borrow_mut()
+            .read_prompt(|width| info_text(agent, width))
+        else {
             term.borrow_mut().say("\n");
             return Ok(());
         };
@@ -1100,6 +1846,18 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                 provider_command(agent, term, rest);
                 continue;
             }
+            "/approve" => {
+                approve_command(agent, term, rest);
+                continue;
+            }
+            "/expand" => {
+                expand_command(term, rest);
+                continue;
+            }
+            "/info" if rest.is_empty() => {
+                say_line(term, &info_text(agent, None));
+                continue;
+            }
             "/prompts" => {
                 crate::prompts_ui::command(agent, term, rest);
                 continue;
@@ -1112,30 +1870,81 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                 crate::skills_ui::personality_command(agent, term, rest);
                 continue;
             }
+            "/compact" => {
+                compact_command(agent, term, rest);
+                continue;
+            }
             "/new" if rest.is_empty() => {
+                let cleared = !agent.chat_prompts().is_empty();
                 match agent.new_chat() {
-                    Ok(info) => {
-                        let extras = agent.chat_prompts().summary();
-                        let extras = if extras.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; {extras}")
-                        };
-                        say_line(
-                            term,
-                            &style.green(&format!(
-                                "new chat; system prompt: {}{extras}",
-                                info.summary()
-                            )),
-                        );
-                    }
+                    Ok(info) => say_line(
+                        term,
+                        &style.green(&format!(
+                            "new chat; system prompt: {}{}",
+                            info.summary(),
+                            if cleared {
+                                "; personality and skills cleared"
+                            } else {
+                                ""
+                            }
+                        )),
+                    ),
                     Err(why) => say_line(term, &style.red(&format!("[error: {why}]"))),
                 }
                 continue;
             }
             _ => {}
         }
-        let report = match agent.send(line, &mut observer) {
+        // A command that is misspelled or has arguments it does not take is not a message: sending
+        // it would cost a model call for nothing.
+        if looks_like_command(word) {
+            let known = COMMANDS
+                .iter()
+                .filter_map(|(command, _)| command.split_whitespace().next())
+                .any(|command| command == word);
+            let said = if known {
+                format!("{word} does not take that; /help shows how to use it")
+            } else {
+                format!("unknown command {word}; /help lists the commands")
+            };
+            say_line(term, &style.yellow(&said));
+            continue;
+        }
+        // `@path` words bring the files' text along; what was typed is what the screen showed.
+        let root = term.borrow().root.clone();
+        let attachment = crate::attach::attach(&root, line);
+        for file in &attachment.files {
+            let cut = if file.cut { ", cut" } else { "" };
+            let what = match file.listed {
+                Some(count) => format!("{count} files listed{cut}"),
+                None => format!("{} bytes{cut}", file.bytes),
+            };
+            say_line(term, &style.dim(&format!("  + {} ({what})", file.path)));
+        }
+        for warning in &attachment.warnings {
+            say_line(term, &style.yellow(&format!("[{warning}]")));
+        }
+        if agent.needs_compacting() {
+            let used = agent
+                .usage()
+                .last
+                .and_then(|t| t.prompt)
+                .unwrap_or_default();
+            say_line(
+                term,
+                &style.yellow(&format!(
+                    "[the last request was {} prompt tokens; compacting first]",
+                    crate::usage::thousands(used)
+                )),
+            );
+            run_compact(agent, term, false);
+        }
+        term.borrow_mut()
+            .begin_working(|width| info_text(agent, width));
+        let quiet = term.borrow().quiet();
+        let sent = agent.send(&attachment.message, &mut observer);
+        drop(quiet);
+        let report = match sent {
             Outcome::Answer(text) => format!("{text}\n"),
             Outcome::CapReached { calls } => format!(
                 "{}\n",
@@ -1143,9 +1952,34 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                     "[stopped: reached the limit of {calls} model calls for this message]"
                 ))
             ),
+            Outcome::LoopStopped { calls } => format!(
+                "{}\n",
+                style.yellow(&format!(
+                    "[stopped: the last tool calls failed or repeated one another (after {calls} model calls); say what to do next]"
+                ))
+            ),
             Outcome::Failed(why) => format!("{}\n", style.red(&format!("[error: {why}]"))),
+            Outcome::Cancelled => {
+                // At the box the typed text comes back in it; a plain prompt cannot show it.
+                let boxed = term.borrow().menu_stty;
+                if boxed {
+                    term.borrow_mut().restore = Some(line.to_owned());
+                }
+                let back = if boxed {
+                    "; the text is back in the box"
+                } else {
+                    ""
+                };
+                format!(
+                    "{}\n",
+                    style.yellow(&format!(
+                        "[cancelled: nothing of this message was kept{back}]"
+                    ))
+                )
+            }
         };
         term.borrow_mut().say(&report);
+        term.borrow_mut().end_working();
     }
 }
 
@@ -1154,7 +1988,7 @@ mod tests {
     use super::*;
     use crate::agent::ScriptedProvider;
     use crate::tools::testutil::Scratch;
-    use crate::tools::{Bash, DEFAULT_TIMEOUT, ReadFile, Tool};
+    use crate::tools::{Bash, DEFAULT_TIMEOUT, Mode, ReadFile, Tool, file_tools, shared_mode};
     use crate::turn_log::TurnLog;
     use std::io::Cursor;
 
@@ -1203,17 +2037,25 @@ mod tests {
         let term =
             Terminal::shared_styled(Cursor::new(typed.as_bytes().to_vec()), Vec::new(), style);
         let requests = provider.requests();
-        let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(ReadFile::new(dir.path())),
-            Box::new(Bash::new(
+        let approval = shared_mode(Mode::Manual);
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFile::new(dir.path()))];
+        tools.extend(file_tools(
+            dir.path(),
+            Rc::clone(&approval),
+            Rc::new(TerminalApprover(Rc::clone(&term))),
+        ));
+        tools.push(Box::new(
+            Bash::new(
                 dir.path(),
                 DEFAULT_TIMEOUT,
                 Box::new(TerminalApprover(Rc::clone(&term))),
-            )),
-        ];
+            )
+            .with_approval(Rc::clone(&approval)),
+        ));
         let log = TurnLog::create(&dir.path().join("logs")).unwrap();
-        let agent =
-            Agent::new("m", Box::new(provider), tools, log).with_target("test", "http://x/v1");
+        let agent = Agent::new("m", Box::new(provider), tools, log)
+            .with_target("test", "http://x/v1")
+            .with_approval(approval);
         Rig {
             agent,
             term,
@@ -1231,15 +2073,160 @@ mod tests {
     }
 
     #[test]
+    fn compact_summarises_the_chat_and_the_next_message_goes_into_the_new_one() {
+        let dir = Scratch::new("repl-compact");
+        let mut r = rig_stored(
+            &dir,
+            "hello\n/compact\n/compact\nnext\n/exit\n",
+            vec![
+                ScriptedProvider::text("hi"),
+                ScriptedProvider::text("The user said hello."),
+                ScriptedProvider::text("answer"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("[compacted: 2 messages became a summary of 20 characters; the earlier chat is saved]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[not compacted: there is nothing to compact yet]"),
+            "{out}"
+        );
+        let requests = r.requests.borrow();
+        assert_eq!(requests.len(), 3);
+        let sent: serde_json::Value = serde_json::from_slice(&requests[2]).unwrap();
+        let messages = sent["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("The user said hello.")
+        );
+        assert_eq!(messages[2]["content"], "next");
+    }
+
+    #[test]
+    fn compact_auto_shows_sets_and_refuses() {
+        let dir = Scratch::new("repl-compact-auto");
+        let mut r = rig_stored(
+            &dir,
+            "/compact auto\n/compact auto 20,000\n/compact auto\n/compact auto 5\n/compact auto many\n/compact auto off\n/compact auto\n/compact now\n/exit\n",
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        for expected in [
+            "before a message when the last request was 80,000 prompt tokens or more",
+            "automatic compaction at 20,000 prompt tokens",
+            "was 20,000 prompt tokens or more",
+            "the limit must be at least 10000 tokens",
+            "'many' is not a number of tokens or off",
+            "automatic compaction is off",
+            "automatic compaction: off",
+            "usage: /compact | /compact auto",
+        ] {
+            assert!(out.contains(expected), "missing {expected:?} in {out}");
+        }
+    }
+
+    #[test]
+    fn a_large_context_is_compacted_before_the_next_message_is_sent() {
+        let dir = Scratch::new("repl-compact-before-send");
+        let mut r = rig_stored(
+            &dir,
+            "first\nsecond\n/exit\n",
+            vec![
+                ScriptedProvider::with_usage(
+                    ScriptedProvider::text("one"),
+                    r#"{"prompt_tokens":90000}"#,
+                ),
+                ScriptedProvider::text("Summary text."),
+                ScriptedProvider::text("two"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("[the last request was 90,000 prompt tokens; compacting first]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[compacted: 2 messages became a summary"),
+            "{out}"
+        );
+        let requests = r.requests.borrow();
+        assert_eq!(requests.len(), 3);
+        let sent: serde_json::Value = serde_json::from_slice(&requests[2]).unwrap();
+        let texts: Vec<&str> = sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or(""))
+            .collect();
+        assert!(texts[1].starts_with(SUMMARY_MARK));
+        assert_eq!(texts[2], "second");
+    }
+
+    #[test]
+    fn a_failed_automatic_compaction_still_sends_the_message() {
+        let dir = Scratch::new("repl-compact-fails");
+        let mut r = rig_stored(
+            &dir,
+            "first\nsecond\n/exit\n",
+            vec![
+                ScriptedProvider::with_usage(
+                    ScriptedProvider::text("one"),
+                    r#"{"prompt_tokens":90000}"#,
+                ),
+                ScriptedProvider::failure("boom"),
+                ScriptedProvider::text("two"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("[not compacted: boom; sending the message as it is]"),
+            "{out}"
+        );
+        assert!(out.contains("two"), "{out}");
+    }
+
+    #[test]
+    fn a_saved_summary_is_replayed_as_one_line() {
+        let dir = Scratch::new("repl-summary-line");
+        let r = rig(&dir, "", vec![]);
+        let history = vec![
+            Message::System("s".to_owned()),
+            Message::User(format!("{SUMMARY_MARK}\n\nlong text of the summary")),
+            Message::User("go on".to_owned()),
+        ];
+        show_history(&r.term, &history);
+        let out = screen(&r.term);
+        assert!(
+            out.contains("[summary of an earlier chat: 24 characters]"),
+            "{out}"
+        );
+        assert!(!out.contains("long text"), "{out}");
+        assert!(out.contains("go on"), "{out}");
+    }
+
+    #[test]
     fn a_multi_turn_chat_with_an_approved_command() {
         let dir = Scratch::new("repl-e2e");
         std::fs::write(dir.path().join("a.txt"), "file text\n").unwrap();
         // The approval answer "y" is the line right after the request that needs it.
         let mut r = rig(
             &dir,
-            "run echo hi\ny\nnow read a.txt\n/exit\n",
+            "run echo hi && touch hi.txt\ny\nnow read a.txt\n/exit\n",
             vec![
-                ScriptedProvider::tool_call("c1", "bash", r#"{"command":"echo hi"}"#),
+                ScriptedProvider::tool_call(
+                    "c1",
+                    "bash",
+                    r#"{"command":"echo hi && touch hi.txt"}"#,
+                ),
                 ScriptedProvider::text("It printed hi."),
                 ScriptedProvider::tool_call("c2", "read_file", r#"{"path":"a.txt"}"#),
                 ScriptedProvider::text("The file says: file text."),
@@ -1248,16 +2235,14 @@ mod tests {
         run(&mut r.agent, &r.term).unwrap();
 
         let out = screen(&r.term);
+        assert!(out.contains("▸ #1 bash echo hi && touch hi.txt\n"), "{out}");
+        assert!(out.contains("  ✓ hi\n"), "{out}");
         assert!(
-            out.contains(r#"[tool] bash {"command":"echo hi"}"#),
-            "{out}"
-        );
-        assert!(
-            out.contains("run this command?\n  echo hi\n[y/N] "),
+            out.contains("run this command?\n  echo hi && touch hi.txt\n[y/N] "),
             "{out}"
         );
         assert!(out.contains("It printed hi.\n"), "{out}");
-        assert!(out.contains("[tool] read_file"), "{out}");
+        assert!(out.contains("▸ #2 read_file a.txt\n"), "{out}");
         assert!(out.contains("The file says: file text.\n"), "{out}");
 
         let requests = r.requests.borrow();
@@ -1269,6 +2254,92 @@ mod tests {
 
         let log = std::fs::read_to_string(r.agent.log_path()).unwrap();
         assert_eq!(log.lines().count(), 4);
+    }
+
+    #[test]
+    fn an_at_file_in_a_message_is_attached_and_listed_under_the_echo() {
+        let dir = Scratch::new("repl-at-file");
+        std::fs::write(dir.path().join("a.txt"), "file text\n").unwrap();
+        let mut r = rig(
+            &dir,
+            "explain @a.txt and @missing.txt\nplain words\n/exit\n",
+            vec![
+                ScriptedProvider::text("It says file text."),
+                ScriptedProvider::text("ok"),
+            ],
+        );
+        r.term.borrow_mut().set_root(dir.path().to_path_buf());
+        run(&mut r.agent, &r.term).unwrap();
+
+        let out = screen(&r.term);
+        assert!(out.contains("  + a.txt (10 bytes)\n"), "{out}");
+        assert!(
+            !out.contains("missing.txt (") && !out.contains("not attached"),
+            "{out}"
+        );
+        let requests = r.requests.borrow();
+        let first: serde_json::Value = serde_json::from_slice(&requests[0]).unwrap();
+        assert_eq!(
+            first["messages"][1]["content"],
+            "explain @a.txt and @missing.txt\n\nAttached files:\n\n--- a.txt ---\nfile text\n--- end of a.txt ---\n"
+        );
+        // A message without @ words goes out exactly as typed.
+        let second: serde_json::Value = serde_json::from_slice(&requests[1]).unwrap();
+        assert_eq!(second["messages"][3]["content"], "plain words");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_attached_is_said_and_the_message_still_goes() {
+        let dir = Scratch::new("repl-at-bad");
+        std::fs::write(dir.path().join("bin.dat"), [0xff, 0xfe, 0x01]).unwrap();
+        let mut r = rig(
+            &dir,
+            "look at @bin.dat\n/exit\n",
+            vec![ScriptedProvider::text("ok")],
+        );
+        r.term.borrow_mut().set_root(dir.path().to_path_buf());
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("[@bin.dat: not attached (it is not UTF-8 text)]"),
+            "{out}"
+        );
+        let first: serde_json::Value = serde_json::from_slice(&r.requests.borrow()[0]).unwrap();
+        assert_eq!(first["messages"][1]["content"], "look at @bin.dat");
+    }
+
+    #[test]
+    fn a_saved_instructions_block_is_shown_as_one_dim_line_in_a_replay() {
+        let dir = Scratch::new("repl-block-replay");
+        let r = rig(&dir, "", vec![]);
+        let block = format!(
+            "{ACTIVE_MARK}. They replace any earlier message:\n\n## Personality: pirate\nArr.\n\n## Skill: tdd\nTest.\n\n## Skill: ui\nPretty."
+        );
+        show_history(
+            &r.term,
+            &[
+                Message::System("s".into()),
+                Message::User(block),
+                Message::User("hello".into()),
+                Message::Assistant {
+                    content: Some("hi".into()),
+                    tool_calls: vec![],
+                },
+                Message::User(crate::store_prompts::NONE_ACTIVE.into()),
+                Message::User("bye".into()),
+            ],
+        );
+        let out = screen(&r.term);
+        assert!(
+            out.contains("[instructions: personality pirate; skills tdd, ui]\n"),
+            "{out}"
+        );
+        assert!(out.contains("[instructions: none active]\n"), "{out}");
+        assert!(
+            out.contains("> hello\nhi\n") && out.contains("> bye\n"),
+            "{out}"
+        );
+        assert!(!out.contains("Arr.") && !out.contains("Pretty."), "{out}");
     }
 
     #[test]
@@ -1377,10 +2448,13 @@ mod tests {
         // so the prompt shares the line.)
         let tool_line = out
             .lines()
-            .find_map(|l| l.find("[tool]").map(|i| &l[i..]))
+            .find_map(|l| l.find("▸").map(|i| &l[i..]))
             .unwrap();
-        assert!(tool_line.ends_with("..."));
-        assert!(tool_line.len() < 300);
+        assert!(tool_line.ends_with('…'), "{tool_line}");
+        assert!(
+            tool_line.chars().count() <= DEFAULT_LINE_WIDTH,
+            "{tool_line}"
+        );
         // The model still got the full command.
         let requests = r.requests.borrow();
         assert!(String::from_utf8_lossy(&requests[1]).contains(&long));
@@ -1426,7 +2500,7 @@ mod tests {
         show_history(&term, &history);
         assert_eq!(
             screen(&term),
-            "> hi\nHello!\n> read it\n[tool] read_file {\"path\":\"a.txt\"}\nIt says x.\n[end of saved chat]\n"
+            "> hi\nHello!\n> read it\n▸ read_file a.txt\nIt says x.\n[end of saved chat]\n"
         );
     }
 
@@ -1471,9 +2545,9 @@ mod tests {
         ];
         show_history(&term, &history);
         let out = screen(&term);
-        let tool_line = out.lines().find(|l| l.starts_with("[tool]")).unwrap();
+        let tool_line = out.lines().find(|l| l.starts_with('▸')).unwrap();
         assert!(
-            tool_line.ends_with("...") && tool_line.len() < 300,
+            tool_line.ends_with('…') && tool_line.chars().count() <= DEFAULT_LINE_WIDTH,
             "{tool_line}"
         );
     }
@@ -1722,10 +2796,15 @@ mod tests {
 
     #[test]
     fn a_coloured_chat_is_the_plain_chat_plus_colour_codes() {
-        let typed = "run echo hi\ny\nnow read a.txt\nfail please\n/sessions\n/exit\n";
+        let typed =
+            "run echo hi && touch hi.txt\ny\nnow read a.txt\nfail please\n/sessions\n/exit\n";
         let replies = || {
             vec![
-                ScriptedProvider::tool_call("c1", "bash", r#"{"command":"echo hi"}"#),
+                ScriptedProvider::tool_call(
+                    "c1",
+                    "bash",
+                    r#"{"command":"echo hi && touch hi.txt"}"#,
+                ),
                 ScriptedProvider::text("It printed hi."),
                 ScriptedProvider::tool_call("c2", "read_file", r#"{"path":"a.txt"}"#),
                 ScriptedProvider::text("The file says: file text."),
@@ -1746,7 +2825,11 @@ mod tests {
         assert_eq!(strip_ansi(&coloured), plain);
         // The pieces that should stand out do: prompt, tool lines, the question, errors.
         assert!(coloured.contains("\x1b[1;36m> \x1b[0m"), "{coloured}");
-        assert!(coloured.contains("\x1b[33m[tool]\x1b[0m"), "{coloured}");
+        assert!(
+            coloured.contains("\x1b[2m▸ #1 bash echo hi && touch hi.txt\x1b[0m"),
+            "{coloured}"
+        );
+        assert!(coloured.contains("\x1b[2m  ✓ hi\x1b[0m"), "{coloured}");
         assert!(
             coloured.contains("\x1b[1mrun this command?\x1b[0m"),
             "{coloured}"
@@ -1817,15 +2900,493 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_slash_line_still_goes_to_the_model() {
+    fn approve_shows_and_sets_the_mode_by_typing() {
+        let dir = Scratch::new("repl-approve-typed");
+        let mut r = rig(
+            &dir,
+            "/approve\n/approve auto\n/approve auto\n/approve tools\n/approve manual\n/exit\n",
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("approval mode: manual (ask before every file change"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "approval mode is now auto: file changes run without asking; bash still asks"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("approval mode stays auto"), "{out}");
+        assert!(
+            out.contains("usage: /approve [manual|auto|forget]"),
+            "{out}"
+        );
+        assert!(out.contains("approval mode is now manual"), "{out}");
+        assert_eq!(r.agent.approval_mode(), Mode::Manual);
+        assert!(r.requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn approve_menu_picks_a_mode_and_escape_leaves_it() {
+        let dir = Scratch::new("repl-approve-menu");
+        // Down, Enter picks "auto"; then Esc leaves it alone.
+        let mut r = rig(&dir, "/approve\n\x1b[B\r/approve\n\x1b/exit\n", vec![]);
+        r.term.borrow_mut().enable_menus(false);
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("approval mode is now auto"), "{out}");
+        assert!(out.contains("unchanged"), "{out}");
+        assert_eq!(r.agent.approval_mode(), Mode::Auto);
+    }
+
+    #[test]
+    fn the_mode_is_remembered_between_runs_and_unknown_text_means_manual() {
+        let dir = Scratch::new("repl-approve-saved");
+        let mut r = rig_stored(&dir, "/approve auto\n/exit\n", vec![]);
+        run(&mut r.agent, &r.term).unwrap();
+        drop(r);
+
+        let mut again = rig_stored(&dir, "/exit\n", vec![]);
+        assert_eq!(again.agent.approval_mode(), Mode::Manual, "before loading");
+        again.agent.load_approval_mode();
+        assert_eq!(again.agent.approval_mode(), Mode::Auto);
+        drop(again);
+
+        let mut store = Store::open(&dir.path().join("harness.db")).unwrap();
+        store
+            .set_setting(crate::store::APPROVE_MODE, "tools")
+            .unwrap();
+        drop(store);
+        let mut third = rig_stored(&dir, "/exit\n", vec![]);
+        third.agent.load_approval_mode();
+        assert_eq!(third.agent.approval_mode(), Mode::Manual);
+    }
+
+    #[test]
+    fn manual_asks_before_a_file_change_and_auto_does_not() {
+        let dir = Scratch::new("repl-approve-e2e");
+        let create = |path: &str| {
+            ScriptedProvider::tool_call(
+                "c1",
+                "create_file",
+                &format!(r#"{{"path":"{path}","content":"hi"}}"#),
+            )
+        };
+        let mut r = rig(
+            &dir,
+            "make a\ny\nmake b\nn\n/approve auto\nmake c\n/exit\n",
+            vec![
+                create("a.txt"),
+                ScriptedProvider::text("done a"),
+                create("b.txt"),
+                ScriptedProvider::text("done b"),
+                create("c.txt"),
+                ScriptedProvider::text("done c"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert_eq!(out.matches("create this file?").count(), 2, "{out}");
+        assert!(out.contains("a.txt (2 bytes)"), "{out}");
+        assert!(dir.path().join("a.txt").is_file());
+        assert!(!dir.path().join("b.txt").exists(), "a no changes nothing");
+        assert!(
+            dir.path().join("c.txt").is_file(),
+            "auto runs without asking"
+        );
+    }
+
+    fn touch(path: &str) -> Result<crate::provider::Reply, Box<crate::provider::ProviderError>> {
+        ScriptedProvider::tool_call("c1", "bash", &format!(r#"{{"command":"touch {path}"}}"#))
+    }
+
+    #[test]
+    fn typed_answers_are_yes_always_or_no_and_always_is_listed_and_forgotten() {
+        let dir = Scratch::new("repl-always-typed");
+        let mut r = rig(
+            &dir,
+            "m1\na\nm2\nm3\n/approve\n/approve forget\n/approve forget\nm4\nn\n/exit\n",
+            vec![
+                touch("one"),
+                ScriptedProvider::text("ok1"),
+                touch("two"),
+                ScriptedProvider::text("ok2"),
+                touch("three"),
+                ScriptedProvider::text("ok3"),
+                touch("four"),
+                ScriptedProvider::text("ok4"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        // m1 is asked and answered "a"; m2 and m3 are not asked; after /approve forget m4 is.
+        assert_eq!(out.matches("run this command?").count(), 2, "{out}");
+        assert!(out.contains("[y/a/N] "), "{out}");
+        assert!(
+            out.contains("a = always allow `touch` commands until you quit"),
+            "{out}"
+        );
+        assert!(
+            out.contains("allowed until you quit: `touch` commands"),
+            "{out}"
+        );
+        assert!(out.contains("forgot 1 \"always\" permission\n"), "{out}");
+        assert!(out.contains("forgot 0 \"always\" permissions"), "{out}");
+        assert!(dir.path().join("three").exists());
+        assert!(
+            !dir.path().join("four").exists(),
+            "the last question was answered no"
+        );
+    }
+
+    #[test]
+    fn a_chain_is_asked_without_the_always_answer_and_a_typed_a_is_then_no() {
+        let dir = Scratch::new("repl-always-chain");
+        let mut r = rig(
+            &dir,
+            "go\na\n/exit\n",
+            vec![
+                ScriptedProvider::tool_call("c1", "bash", r#"{"command":"touch x; touch y"}"#),
+                ScriptedProvider::text("ok"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("[y/N] "), "{out}");
+        assert!(!out.contains("always allow"), "{out}");
+        assert!(!dir.path().join("x").exists());
+    }
+
+    #[test]
+    fn the_selector_answers_yes_always_and_no_and_escape_is_no() {
+        let dir = Scratch::new("repl-selector");
+        // The cursor starts on "no", so Enter alone is no. Keys after each question:
+        // Up Up Enter = yes; Enter = no; Up Enter = always (a chain has no such row); Esc = no.
+        let mut r = rig(
+            &dir,
+            "m1\n\x1b[A\x1b[A\rm2\n\rm3\n\x1b[A\rm4\nm5\n\x1b/exit\n",
+            vec![
+                touch("one"),
+                ScriptedProvider::text("ok1"),
+                ScriptedProvider::tool_call("c1", "bash", r#"{"command":"touch two; true"}"#),
+                ScriptedProvider::text("ok2"),
+                touch("three"),
+                ScriptedProvider::text("ok3"),
+                touch("four"),
+                ScriptedProvider::text("ok4"),
+                ScriptedProvider::tool_call("c1", "bash", r#"{"command":"cp one five"}"#),
+                ScriptedProvider::text("ok5"),
+            ],
+        );
+        r.term.borrow_mut().enable_menus(false);
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(dir.path().join("one").exists(), "yes: {out}");
+        assert!(!dir.path().join("two").exists(), "Enter alone is no: {out}");
+        assert!(dir.path().join("three").exists(), "always: {out}");
+        assert!(
+            dir.path().join("four").exists(),
+            "covered by the earlier always: {out}"
+        );
+        assert!(!dir.path().join("five").exists(), "Esc is no: {out}");
+        assert!(out.contains("allow it?"), "{out}");
+        assert!(
+            out.contains("always: `touch` commands are allowed until you quit"),
+            "{out}"
+        );
+        assert_eq!(out.matches("run this command?").count(), 4, "{out}");
+    }
+
+    #[test]
+    fn the_view_row_shows_what_would_be_written_and_then_asks_again() {
+        let dir = Scratch::new("repl-view");
+        let create = |path: &str| {
+            ScriptedProvider::tool_call(
+                "c1",
+                "create_file",
+                &format!(r#"{{"path":"{path}","content":"SECRET\nBODY"}}"#),
+            )
+        };
+        // Rows: yes, always, view, no (the cursor starts on no).
+        // m1: Up Enter = view, then Esc = no. m2: view, then Up x3 Enter = yes.
+        let mut r = rig(
+            &dir,
+            "m1\n\x1b[A\r\x1bm2\n\x1b[A\r\x1b[A\x1b[A\x1b[A\r/exit\n",
+            vec![
+                create("one.txt"),
+                ScriptedProvider::text("ok1"),
+                create("two.txt"),
+                ScriptedProvider::text("ok2"),
+            ],
+        );
+        r.term.borrow_mut().enable_menus(false);
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert_eq!(out.matches("SECRET\nBODY").count(), 2, "{out}");
+        assert!(
+            !out.contains("▸ #1 create_file one.txt · 11 bytes\n  SECRET"),
+            "{out}"
+        );
+        assert!(!dir.path().join("one.txt").exists(), "{out}");
+        assert!(dir.path().join("two.txt").exists(), "{out}");
+        assert!(out.matches("allow it?").count() > 2, "{out}");
+    }
+
+    #[test]
+    fn manual_remembers_always_per_file_tool() {
+        let dir = Scratch::new("repl-always-files");
+        let create = |path: &str| {
+            ScriptedProvider::tool_call(
+                "c1",
+                "create_file",
+                &format!(r#"{{"path":"{path}","content":"x"}}"#),
+            )
+        };
+        let mut r = rig(
+            &dir,
+            "m1\na\nm2\nm3\nn\n/exit\n",
+            vec![
+                create("a.txt"),
+                ScriptedProvider::text("1"),
+                create("b.txt"),
+                ScriptedProvider::text("2"),
+                ScriptedProvider::tool_call("c1", "delete_file", r#"{"path":"a.txt"}"#),
+                ScriptedProvider::text("3"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert_eq!(out.matches("create this file?").count(), 1, "{out}");
+        assert!(
+            out.contains("a = always allow create_file calls until you quit"),
+            "{out}"
+        );
+        assert!(dir.path().join("b.txt").exists());
+        assert!(
+            dir.path().join("a.txt").exists(),
+            "delete asked and was refused"
+        );
+    }
+
+    #[test]
+    fn the_working_box_stays_under_the_output_and_goes_when_the_work_ends() {
+        let term = blank_term();
+        term.borrow_mut().enable_menus(true);
+        term.borrow_mut().begin_working(|_| "the info".to_owned());
+        let after_begin = screen(&term);
+        assert!(after_begin.contains("│ working…"), "{after_begin:?}");
+        assert!(after_begin.ends_with(" the info\r\n"), "{after_begin:?}");
+
+        term.borrow_mut().say("a tool line\n");
+        term.borrow_mut().say("no newline");
+        let out = screen(&term);
+        let added = &out[after_begin.len()..];
+        // Each line: the box is erased, the line printed, the box drawn again below it.
+        let erase = crate::inputbox::erase(4);
+        assert!(
+            added.starts_with(&format!("{erase}a tool line\n╭")),
+            "{added:?}"
+        );
+        assert!(
+            added.contains(&format!("{erase}no newline\r\n╭")),
+            "{added:?}"
+        );
+
+        // While a question is shown the box is off the screen; afterwards it is back.
+        term.borrow_mut().suspend_sticky();
+        let mark = screen(&term).len();
+        term.borrow_mut().say("question\n");
+        assert_eq!(&screen(&term)[mark..], "question\n");
+        term.borrow_mut().resume_sticky();
+        assert!(screen(&term).ends_with(" the info\r\n"));
+
+        let before_end = screen(&term).len();
+        term.borrow_mut().end_working();
+        assert_eq!(&screen(&term)[before_end..], erase);
+        // With nothing kept at the bottom, output is printed as it always was.
+        term.borrow_mut().say("plain\n");
+        assert!(screen(&term).ends_with(&format!("{erase}plain\n")));
+    }
+
+    #[test]
+    fn without_a_real_terminal_no_box_is_kept() {
+        let term = blank_term();
+        term.borrow_mut().begin_working(|_| "info".to_owned());
+        term.borrow_mut().say("x\n");
+        term.borrow_mut().end_working();
+        assert_eq!(screen(&term), "x\n");
+    }
+
+    #[test]
+    fn expand_shows_a_call_in_full_and_lists_and_refuses_bad_numbers() {
+        let dir = Scratch::new("repl-expand");
+        let mut r = rig(
+            &dir,
+            "go\ny\n/expand\n/expand 1\n/expand list\n/expand 9\n/expand x\n/exit\n",
+            vec![
+                ScriptedProvider::tool_call(
+                    "c1",
+                    "create_file",
+                    r#"{"path":"a.txt","content":"hello\nworld"}"#,
+                ),
+                ScriptedProvider::text("done"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        // The call itself is one collapsed line; the content is not on screen until expanded.
+        assert!(out.contains("▸ #1 create_file a.txt · 11 bytes\n"), "{out}");
+        assert!(out.contains("  ✓ created a.txt (11 bytes)\n"), "{out}");
+        let full = "#1 create_file\npath: a.txt\ncontent (11 bytes):\nhello\nworld\nresult:\ncreated a.txt (11 bytes)\n";
+        assert_eq!(out.matches(full).count(), 2, "{out}");
+        assert!(out.contains("#1 create_file a.txt · 11 bytes\n"), "{out}");
+        assert!(
+            out.contains("there is no call #9; this run has #1 to #1"),
+            "{out}"
+        );
+        assert!(out.contains("usage: /expand [N|list]"), "{out}");
+    }
+
+    #[test]
+    fn expand_before_any_call_says_so_and_calls_are_numbered_across_messages() {
+        let dir = Scratch::new("repl-expand-none");
+        let mut r = rig(
+            &dir,
+            "/expand\none\ntwo\n/expand 1\n/expand\n/exit\n",
+            vec![
+                ScriptedProvider::tool_call("c1", "read_file", r#"{"path":"a.txt"}"#),
+                ScriptedProvider::text("1"),
+                ScriptedProvider::tool_call("c2", "read_file", r#"{"path":"b.txt"}"#),
+                ScriptedProvider::text("2"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("no tool calls in this run yet"), "{out}");
+        assert!(out.contains("▸ #1 read_file a.txt"), "{out}");
+        assert!(out.contains("▸ #2 read_file b.txt"), "{out}");
+        assert!(
+            out.contains("#1 read_file\npath: a.txt\nresult:\nerror:"),
+            "{out}"
+        );
+        assert!(
+            out.contains("#2 read_file\npath: b.txt\nresult:\nerror:"),
+            "{out}"
+        );
+        assert!(out.contains("  ✗ error: cannot read 'a.txt'"), "{out}");
+    }
+
+    #[test]
+    fn info_shows_the_numbers_of_the_calls_made_so_far() {
+        let dir = Scratch::new("repl-info");
+        let usage1 = r#"{"prompt_tokens":1200,"completion_tokens":30,"prompt_tokens_details":{"cached_tokens":1000}}"#;
+        let usage2 = r#"{"prompt_tokens":1300,"completion_tokens":20}"#;
+        let mut r = rig(
+            &dir,
+            "/info\none\ntwo\n/info\n/approve auto\n/info\n/info extra\n/exit\n",
+            vec![
+                ScriptedProvider::with_usage(ScriptedProvider::text("a"), usage1),
+                ScriptedProvider::with_usage(ScriptedProvider::text("b"), usage2),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("m · test │ approve: manual │ last call: none yet │ chat: 0 in · 0 out │ context: not sent yet\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("m · test │ approve: manual │ last call: 1,300 in · 20 out │ chat: 2,500 in · 50 out │ context ≈ 1,300\n"),
+            "{out}"
+        );
+        assert!(out.contains("approve: auto │"), "{out}");
+        assert!(out.contains("/info does not take that"), "{out}");
+    }
+
+    #[test]
+    fn the_totals_start_again_with_a_new_chat_and_come_back_with_a_resume() {
+        let dir = Scratch::new("repl-info-resume");
+        let usage = r#"{"prompt_tokens":10,"completion_tokens":2}"#;
+        let mut r = rig_stored(
+            &dir,
+            "hello\n/new\n/info\n/resume\n/info\n/exit\n",
+            vec![ScriptedProvider::with_usage(
+                ScriptedProvider::text("a"),
+                usage,
+            )],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        let infos: Vec<&str> = out.lines().filter(|l| l.contains("m · test │")).collect();
+        assert_eq!(infos.len(), 2, "{out}");
+        assert!(infos[0].contains("chat: 0 in · 0 out"), "{out}");
+        assert!(infos[1].contains("chat: 10 in · 2 out"), "{out}");
+        assert!(infos[1].contains("last call: 10 in · 2 out"), "{out}");
+    }
+
+    #[test]
+    fn bash_still_asks_in_auto_mode() {
+        let dir = Scratch::new("repl-approve-bash");
+        let mut r = rig(
+            &dir,
+            "/approve auto\nrun it\nn\n/exit\n",
+            vec![
+                ScriptedProvider::tool_call("c1", "bash", r#"{"command":"touch ran"}"#),
+                ScriptedProvider::text("ok"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("run this command?"), "{out}");
+        assert!(!dir.path().join("ran").exists());
+    }
+
+    #[test]
+    fn a_misspelled_command_is_refused_and_not_sent_to_the_model() {
         let dir = Scratch::new("repl-unknown-slash");
         let mut r = rig(
             &dir,
-            "/foo bar\n/exit\n",
+            "/foo bar\n/skill\n/new extra\n/exit\n",
             vec![ScriptedProvider::text("ok")],
         );
         run(&mut r.agent, &r.term).unwrap();
-        assert_eq!(r.requests.borrow().len(), 1);
+        let out = screen(&r.term);
+        assert!(
+            out.contains("unknown command /foo; /help lists the commands"),
+            "{out}"
+        );
+        assert!(out.contains("unknown command /skill;"), "{out}");
+        assert!(out.contains("/new does not take that"), "{out}");
+        assert!(r.requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_path_or_a_plain_message_still_goes_to_the_model() {
+        let dir = Scratch::new("repl-slash-path");
+        let mut r = rig(
+            &dir,
+            "/etc/hosts what is this\n//x\nhello /foo\n/exit\n",
+            vec![
+                ScriptedProvider::text("1"),
+                ScriptedProvider::text("2"),
+                ScriptedProvider::text("3"),
+            ],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        assert_eq!(r.requests.borrow().len(), 3);
+    }
+
+    #[test]
+    fn looking_like_a_command_means_a_slash_and_a_plain_word() {
+        for yes in ["/foo", "/a-b_c1", "/Skill"] {
+            assert!(looks_like_command(yes), "{yes}");
+        }
+        for no in ["/", "//x", "/etc/hosts", "foo", "/a.b", ""] {
+            assert!(!looks_like_command(no), "{no}");
+        }
     }
 
     #[test]

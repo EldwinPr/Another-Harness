@@ -18,9 +18,10 @@ use sha2::{Digest, Sha256};
 use crate::cache_check::parse_usage;
 use crate::provider::{ProviderError, Reply};
 use crate::providers::ProviderDef;
+use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, earlier_line};
 
 /// The schema version this program writes. It is kept in SQLite's `user_version`.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// How long a write waits for another writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -162,6 +163,10 @@ CREATE TABLE chat_prompt_state (
 ) STRICT;
 ";
 
+// Issue 14, second round: skills and personalities are no longer "on by default"; a new chat starts
+// with none. The column stays and means "switched on" for system prompts only.
+const SCHEMA_V7: &str = "UPDATE prompts SET enabled = 0 WHERE type <> 'system';";
+
 #[cfg(test)]
 pub(crate) const SCHEMA_V1_FOR_TESTS: &str = SCHEMA_V1;
 #[cfg(test)]
@@ -172,9 +177,18 @@ pub(crate) const SCHEMA_V3_FOR_TESTS: &str = SCHEMA_V3;
 pub(crate) const SCHEMA_V4_FOR_TESTS: &str = SCHEMA_V4;
 #[cfg(test)]
 pub(crate) const SCHEMA_V5_FOR_TESTS: &str = SCHEMA_V5;
+#[cfg(test)]
+pub(crate) const SCHEMA_V6_FOR_TESTS: &str = SCHEMA_V6;
 
 /// The `settings` key holding the name of the provider the chat last switched to.
 pub const LAST_PROVIDER: &str = "last_provider";
+
+/// The `settings` key holding the approval mode (`manual` or `auto`, issue 16).
+pub const APPROVE_MODE: &str = "approve_mode";
+
+/// The `settings` key holding the prompt-token limit for automatic compaction (`off` or a number,
+/// issue 24).
+pub const AUTO_COMPACT: &str = "auto_compact";
 
 /// Anything that went wrong talking to the database, as one line of text.
 #[derive(Debug)]
@@ -337,8 +351,11 @@ pub struct SessionSummary {
     pub model: String,
     /// Usable messages (failed ones are not counted).
     pub message_count: i64,
-    /// The text of the first usable user message, to recognise the chat by.
+    /// The first usable message the user typed, to recognise the chat by. The "Active
+    /// instructions" and summary blocks are not it.
     pub first_message: Option<String>,
+    /// The chat began from a compaction summary.
+    pub continued: bool,
 }
 
 pub struct Store {
@@ -597,14 +614,24 @@ impl Store {
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id AND m.status = 'ok'), \
                     (SELECT m.text FROM messages m \
                       WHERE m.session_id = s.id AND m.status = 'ok' AND m.role = 'user' \
-                      ORDER BY m.seq LIMIT 1) \
+                        AND substr(m.text, 1, length(?3)) <> ?3 \
+                        AND substr(m.text, 1, length(?4)) <> ?4 \
+                      ORDER BY m.seq LIMIT 1), \
+                    EXISTS (SELECT 1 FROM messages m \
+                      WHERE m.session_id = s.id AND m.status = 'ok' AND m.role = 'user' \
+                        AND substr(m.text, 1, length(?4)) = ?4) \
              FROM sessions s \
              WHERE s.kind = ?1 \
                AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id AND m.status = 'ok') \
              ORDER BY s.updated_at DESC, s.id DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(
-            params![kind.as_str(), i64::try_from(limit).unwrap_or(i64::MAX)],
+            params![
+                kind.as_str(),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                ACTIVE_MARK,
+                SUMMARY_MARK
+            ],
             |row| {
                 Ok(SessionSummary {
                     id: row.get(0)?,
@@ -612,9 +639,22 @@ impl Store {
                     model: row.get(2)?,
                     message_count: row.get(3)?,
                     first_message: row.get(4)?,
+                    continued: row.get(5)?,
                 })
             },
         )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The saved chats that began from a summary made from chat `id`, oldest first.
+    pub fn chats_continuing(&self, id: i64) -> Result<Vec<i64>, StoreError> {
+        let prefix = format!("{SUMMARY_MARK}\n\n{}", earlier_line(id));
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT session_id FROM messages \
+             WHERE role = 'user' AND status = 'ok' AND substr(text, 1, length(?1)) = ?1 \
+             ORDER BY session_id",
+        )?;
+        let rows = statement.query_map([prefix], |row| row.get::<_, i64>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -683,6 +723,33 @@ impl Store {
         })
     }
 
+    /// What the answered calls of a chat reported, for the info line (issue 17).
+    pub fn chat_usage(&self, session_id: i64) -> Result<crate::usage::ChatUsage, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT prompt_tokens, completion_tokens, cached_tokens FROM calls \
+             WHERE session_id = ?1 AND error IS NULL AND http_status BETWEEN 200 AND 299 \
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            Ok(crate::usage::Tokens {
+                prompt: row
+                    .get::<_, Option<i64>>(0)?
+                    .and_then(|n| u64::try_from(n).ok()),
+                completion: row
+                    .get::<_, Option<i64>>(1)?
+                    .and_then(|n| u64::try_from(n).ok()),
+                cached: row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|n| u64::try_from(n).ok()),
+            })
+        })?;
+        let mut usage = crate::usage::ChatUsage::default();
+        for tokens in rows {
+            usage.add(tokens?);
+        }
+        Ok(usage)
+    }
+
     /// The open connection, for tests that look at the tables directly.
     #[cfg(test)]
     pub(crate) fn conn(&self) -> &Connection {
@@ -748,6 +815,50 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 6 {
         conn.execute_batch(&format!(
             "BEGIN; {SCHEMA_V6} PRAGMA user_version = 6; COMMIT;"
+        ))?;
+    }
+    if version < 7 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V7} PRAGMA user_version = 7; COMMIT;"
+        ))?;
+    }
+    if version < 8 {
+        // Issue 16: the built-in prompt now lists the tools. Only a `base` that still holds the
+        // previous built-in text is rewritten; one the owner edited is theirs.
+        conn.execute_batch(&format!(
+            "BEGIN; \
+             UPDATE prompts SET text = '{new}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{base}' AND text = '{old}'; \
+             PRAGMA user_version = 8; COMMIT;",
+            new = crate::store_prompts::BUILTIN_PROMPT.replace('\'', "''"),
+            old = crate::store_prompts::PREVIOUS_BUILTIN_PROMPT.replace('\'', "''"),
+            base = crate::store_prompts::BASE_NAME,
+        ))?;
+    }
+    if version < 9 {
+        // Issue 20: the built-in prompt now lists `edit_file`. Only a `base` that still holds the
+        // schema 8 text is rewritten.
+        conn.execute_batch(&format!(
+            "BEGIN; \
+             UPDATE prompts SET text = '{new}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{base}' AND text = '{old}'; \
+             PRAGMA user_version = 9; COMMIT;",
+            new = crate::store_prompts::BUILTIN_PROMPT.replace('\'', "''"),
+            old = crate::store_prompts::BUILTIN_PROMPT_V8.replace('\'', "''"),
+            base = crate::store_prompts::BASE_NAME,
+        ))?;
+    }
+    if version < 10 {
+        // The built-in prompt gained rules drawn from the logs (stay inside the working directory,
+        // no heredoc patches, batch requests, stop searching). Only an unedited `base` changes.
+        conn.execute_batch(&format!(
+            "BEGIN; \
+             UPDATE prompts SET text = '{new}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{base}' AND text = '{old}'; \
+             PRAGMA user_version = 10; COMMIT;",
+            new = crate::store_prompts::BUILTIN_PROMPT.replace('\'', "''"),
+            old = crate::store_prompts::BUILTIN_PROMPT_V9.replace('\'', "''"),
+            base = crate::store_prompts::BASE_NAME,
         ))?;
     }
     Ok(())
@@ -1625,6 +1736,36 @@ mod tests {
             store.list_sessions(Kind::Orchestrator, 10).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn the_list_names_a_chat_by_what_was_typed_and_finds_chats_made_from_it() {
+        use crate::store_prompts::{ACTIVE_MARK, summary_message};
+        let dir = Scratch::new("store-list-names");
+        let mut store = open(&dir);
+        let router = RouterOptions::default();
+        let a = store.create_session(&new_session(&router, "p")).unwrap();
+        save_answer(&mut store, a, 1, &format!("{ACTIVE_MARK}: skills"), "ok");
+        save_answer(&mut store, a, 2, "typed question", "a");
+        let b = store.create_session(&new_session(&router, "p")).unwrap();
+        save_answer(&mut store, b, 1, &summary_message(Some(a), "S"), "ok");
+        save_answer(&mut store, b, 2, "next", "b");
+        let c = store.create_session(&new_session(&router, "p")).unwrap();
+        save_answer(&mut store, c, 1, &summary_message(None, "S"), "ok");
+
+        let list = store.list_sessions(Kind::Worker, 10).unwrap();
+        let of = |id: i64| list.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(of(a).first_message.as_deref(), Some("typed question"));
+        assert!(!of(a).continued);
+        assert_eq!(of(b).first_message.as_deref(), Some("next"));
+        assert!(of(b).continued);
+        assert_eq!(of(c).first_message, None);
+        assert!(of(c).continued);
+
+        assert_eq!(store.chats_continuing(a).unwrap(), [b]);
+        assert!(store.chats_continuing(b).unwrap().is_empty());
+        // Chat 1 is not mistaken for chat 10 and the like: the number is closed by "]".
+        assert!(store.chats_continuing(a * 10).unwrap().is_empty());
     }
 
     #[test]

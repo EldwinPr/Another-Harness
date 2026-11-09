@@ -35,7 +35,7 @@ use runner::providers::Catalog;
 use runner::repl::{self, Terminal, TerminalApprover};
 use runner::store::Store;
 use runner::style::Style;
-use runner::tools::{Bash, DEFAULT_TIMEOUT, ReadFile, Tool};
+use runner::tools::{Bash, DEFAULT_TIMEOUT, Mode, ReadFile, Tool, file_tools, shared_mode};
 use runner::turn_log::TurnLog;
 
 /// How long to wait for the router to answer one call.
@@ -110,14 +110,25 @@ fn start(
             .or_else(|| std::env::var("EDITOR").ok());
         term.borrow_mut().set_editor(editor);
     }
-    let tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(ReadFile::new(&cwd)),
-        Box::new(Bash::new(
+    // The mode is read from the database once the agent has it; until then every change asks.
+    let approval = shared_mode(Mode::Manual);
+    term.borrow_mut().set_root(cwd.clone());
+    let cancel = runner::cancel::Cancel::new();
+    let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFile::new(&cwd))];
+    tools.extend(file_tools(
+        &cwd,
+        Rc::clone(&approval),
+        Rc::new(TerminalApprover(Rc::clone(&term))),
+    ));
+    tools.push(Box::new(
+        Bash::new(
             &cwd,
             DEFAULT_TIMEOUT,
             Box::new(TerminalApprover(Rc::clone(&term))),
-        )),
-    ];
+        )
+        .with_approval(Rc::clone(&approval))
+        .with_cancel(cancel.clone()),
+    ));
     let build = |def: &runner::providers::ProviderDef| -> Box<dyn Provider> {
         Box::new(HttpProvider::new(
             &def.base_url,
@@ -162,7 +173,10 @@ fn start(
         None => Agent::new("", Box::new(NoProvider), tools, log),
     }
     .with_catalog(catalog)
+    .with_approval(approval)
+    .with_cancel(cancel)
     .with_store(store, store_context);
+    agent.load_approval_mode();
 
     let mut notes = String::new();
     // Profile files are copied into the database once, so the menus can edit them.
@@ -236,6 +250,14 @@ fn start(
     banner.push_str(&row("working dir:", &cwd.display().to_string()));
     banner.push_str(&row("chat:", &chat_line));
     banner.push_str(&row("prompt:", &prompt_line));
+    banner.push_str(&row(
+        "approve:",
+        &format!(
+            "{} ({}; /approve changes it)",
+            agent.approval_mode().name(),
+            agent.approval_mode().describe()
+        ),
+    ));
     // Only when something is active: a personality and skills are added after each message.
     if let Some(personality) = &agent.chat_prompts().personality {
         banner.push_str(&row("personality:", personality));
@@ -250,10 +272,6 @@ fn start(
         &format!("{MAX_CALLS_PER_MESSAGE} model calls per message"),
     ));
     banner.push_str(&style.dim(&"─".repeat(60)));
-    banner.push('\n');
-    banner.push_str(
-        &style.dim("commands: /help lists them all; /model, /provider, /sessions, /resume, /prompts, /skills, /personality, /new, /exit"),
-    );
     banner.push('\n');
     if !notes.is_empty() {
         banner.push_str(&style.yellow(notes.trim_end_matches('\n')));

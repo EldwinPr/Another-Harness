@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 use crate::agent::Agent;
 use crate::config_ui::{done, error};
 use crate::menu::MenuItem;
-use crate::repl::{Shared, preview, report_resume, say_line};
+use crate::repl::{Shared, chat_label, report_resume, say_line};
 use crate::turn_log::utc_label;
 
 /// How many chats the menu offers (search narrows them).
@@ -45,7 +45,7 @@ fn chat_rows<R: BufRead, W: Write>(
                 utc_label(u64::try_from(chat.updated_at).unwrap_or(0)),
                 chat.message_count,
                 chat.model,
-                preview(chat.first_message.as_deref()),
+                chat_label(chat),
             ))
         })
         .collect();
@@ -106,7 +106,30 @@ pub fn sessions_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W
                     );
                     continue;
                 }
-                let question = format!("delete chat {id} ({} messages)? [y/N]", chat.message_count);
+                // Chats whose summary came from this one: deleting it leaves the summary as the
+                // only record of what was said.
+                if let Ok(list) = agent.chats_continuing(id)
+                    && !list.is_empty()
+                {
+                    let names: Vec<String> = list.iter().map(i64::to_string).collect();
+                    let (noun, verb) = if list.len() == 1 {
+                        ("chat", "was")
+                    } else {
+                        ("chats", "were")
+                    };
+                    say_line(
+                        term,
+                        &style.yellow(&format!(
+                            "{noun} {} {verb} started from this chat's summary; deleting it leaves the summary as the only record",
+                            names.join(", ")
+                        )),
+                    );
+                }
+                let question = format!(
+                    "delete chat {id} ({}, {} messages)? [y/N]",
+                    chat_label(chat),
+                    chat.message_count
+                );
                 let sure = term.borrow_mut().ask(&question, None);
                 if !matches!(
                     sure.as_deref().map(str::to_ascii_lowercase).as_deref(),
@@ -220,6 +243,35 @@ mod tests {
     }
 
     #[test]
+    fn deleting_the_chat_a_summary_came_from_warns_first() {
+        let dir = Scratch::new("sessions-delete-warns");
+        // Chat 1 is saved, compacted, and chat 2 starts from its summary.
+        let (mut agent, _term, _) = rig(&dir, "", &["answer", "the summary", "next answer"]);
+        agent.send("origin question", &mut NoObserver);
+        agent.compact().unwrap();
+        agent.send("what now", &mut NoObserver);
+        assert_eq!(agent.current_session(), Some(2));
+        drop(agent);
+
+        // Newest first: chat 2, then chat 1. Pick chat 1, "delete", answer n; Esc leaves.
+        let typed = [DOWN, ENTER, DOWN, ENTER, "n\n", ESC].concat();
+        let (mut agent, term, _) = rig(&dir, &typed, &[]);
+        sessions_menu(&mut agent, &term);
+        let out = screen(&term);
+        assert!(out.contains("(continued) \"what now\""), "{out}");
+        assert!(
+            out.contains("chat 2 was started from this chat's summary"),
+            "{out}"
+        );
+        assert!(
+            out.contains("delete chat 1 (\"origin question\", 2 messages)? [y/N]"),
+            "{out}"
+        );
+        assert!(out.contains("[not deleted]"), "{out}");
+        assert_eq!(chats(&dir), [2, 1]);
+    }
+
+    #[test]
     fn delete_asks_first_and_a_yes_removes_the_chat_and_only_that_chat() {
         let dir = Scratch::new("sessions-delete");
         seed(&dir, &["keep me", "remove me"]);
@@ -228,7 +280,10 @@ mod tests {
         let (mut agent, term, _) = rig(&dir, &typed, &[]);
         sessions_menu(&mut agent, &term);
         let out = screen(&term);
-        assert!(out.contains("delete chat 2 (2 messages)? [y/N]"), "{out}");
+        assert!(
+            out.contains("delete chat 2 (\"remove me\", 2 messages)? [y/N]"),
+            "{out}"
+        );
         assert!(out.contains("deleted chat 2"), "{out}");
         assert_eq!(chats(&dir), [1]);
         for table in ["messages", "calls"] {

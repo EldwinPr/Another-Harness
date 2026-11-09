@@ -14,16 +14,23 @@ use std::time::{Duration, Instant};
 
 use kernel::{Config, Message, RouterOptions, ToolCall, assemble};
 
+use crate::cancel::Cancel;
+use crate::loop_guard::{self, LoopGuard, Verdict};
 use crate::provider::{CHOOSE_A_PROVIDER, Provider, ProviderError, Reply, ServedBy};
 use crate::providers::{self, Catalog, Listed, ProviderDef, Source};
-use crate::store::{Kind, LAST_PROVIDER, NewSession, Resumed, SaveCall, SessionSummary, Store};
+use crate::store::{
+    APPROVE_MODE, AUTO_COMPACT, Kind, LAST_PROVIDER, NewSession, Resumed, SaveCall, SessionSummary,
+    Store,
+};
 use crate::store_models::MergeReport;
 use crate::store_prompts::{
-    Assembled, ChatPrompts, PROMPT_WRITER_GUIDE, Prompt, PromptType, SkillState,
-    assemble as assemble_prompts, compose_injection, estimated_tokens, size_label,
+    ACTIVE_MARK, Assembled, ChatPrompts, NONE_ACTIVE, PROMPT_WRITER_GUIDE, Prompt, PromptType,
+    SUMMARY_MARK, SkillState, assemble as assemble_prompts, compose_once, compose_persistent,
+    estimated_tokens, size_label, summary_message,
 };
-use crate::tools::Tool;
+use crate::tools::{Mode, SharedMode, Tool, shared_mode};
 use crate::turn_log::{TurnLog, utc_label};
+use crate::usage::{ChatUsage, Tokens};
 
 /// The system prompt. A constant on purpose: no dates, paths or other volatile
 /// data, so every run starts with the same bytes (decision 01).
@@ -89,6 +96,22 @@ const COLD_CACHE: &str =
 /// Most calls to the model allowed for one thing the user types.
 pub const MAX_CALLS_PER_MESSAGE: u32 = 20;
 
+/// The prompt-token limit for automatic compaction until the owner sets another (issue 24).
+pub const DEFAULT_AUTO_COMPACT_AT: u64 = 80_000;
+/// The lowest limit that can be set: below this a chat would be compacted almost at once.
+pub const MIN_AUTO_COMPACT_AT: u64 = 10_000;
+
+/// The last message of the request that asks for a summary.
+const COMPACT_ASK: &str = "Write a summary of this conversation so far. It will be the only thing a new chat starts with, so another assistant must be able to carry on from it. Keep: what the user wants, what they said to do or not to do, decisions and the reasons for them, the files created or changed and what state they are in, what is done and what is left. Leave out tool output and file text that can be read again. Do not call any tools. Write plain text, under 600 words.";
+
+/// What a compaction did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactReport {
+    /// Messages of the chat that was summarised (not counting the system prompt).
+    pub messages: usize,
+    pub summary_chars: usize,
+}
+
 /// How one user message ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -99,11 +122,19 @@ pub enum Outcome {
     /// The call failed, or the chat could not be saved. The message that
     /// caused it has been removed from the in-memory history.
     Failed(String),
+    /// The model kept making failing or repeated calls (see [`crate::loop_guard`]) and the
+    /// program ended the message. What was done is kept, like at the call cap.
+    LoopStopped { calls: u32 },
+    /// The user cancelled while it worked. Handled like a failure: the message has been removed
+    /// from the history and its turn is marked failed in the database.
+    Cancelled,
 }
 
 /// Told about things as they happen, so the REPL can print them.
 pub trait Observer {
     fn tool_call(&mut self, _call: &ToolCall) {}
+    /// A tool has run; `result` is the text the model gets back.
+    fn tool_result(&mut self, _call: &ToolCall, _result: &str) {}
     /// Something went wrong that did not stop the chat (the turn log could not be written).
     fn warning(&mut self, _text: &str) {}
 }
@@ -194,6 +225,11 @@ pub struct Agent {
     catalog: Option<Catalog>,
     /// The skills and personality of the chat in use (issue 14).
     chat_prompts: ChatPrompts,
+    /// How the file tools are approved; shared with those tools (issue 16).
+    approval: SharedMode,
+    /// What the chat in use has cost so far (issue 17).
+    usage: ChatUsage,
+    cancel: Cancel,
 }
 
 /// Said when the personality changes in a chat that already has replies.
@@ -222,7 +258,63 @@ impl Agent {
             target: Target::default(),
             catalog: None,
             chat_prompts: ChatPrompts::default(),
+            approval: shared_mode(Mode::Manual),
+            usage: ChatUsage::default(),
+            cancel: Cancel::new(),
         }
+    }
+
+    /// What the chat in use has cost so far, from the replies' `usage`.
+    pub fn usage(&self) -> &ChatUsage {
+        &self.usage
+    }
+
+    /// Uses this shared mode, the one the file tools were built with.
+    pub fn with_approval(mut self, approval: SharedMode) -> Self {
+        self.approval = approval;
+        self
+    }
+
+    /// The "always" permissions given in this run, as labels.
+    pub fn always_labels(&self) -> Vec<String> {
+        self.approval.always_labels()
+    }
+
+    /// Forgets the "always" permissions; returns how many there were.
+    pub fn forget_always(&self) -> usize {
+        self.approval.forget_always()
+    }
+
+    pub fn approval_mode(&self) -> Mode {
+        self.approval.mode()
+    }
+
+    /// Switches the approval mode from the next tool call on and remembers it for later runs.
+    /// The mode is not part of any chat. Without a database it lasts for this run only.
+    pub fn set_approval_mode(&mut self, mode: Mode) -> Result<(), String> {
+        self.approval.set_mode(mode);
+        match &mut self.stored {
+            Some(stored) => stored
+                .store
+                .set_setting(APPROVE_MODE, mode.name())
+                .map_err(|e| {
+                    format!(
+                        "the mode is {} for this run but could not be saved: {e}",
+                        mode.name()
+                    )
+                }),
+            None => Ok(()),
+        }
+    }
+
+    /// At start-up: the saved mode, or `manual` when none is saved or the saved text is unknown.
+    pub fn load_approval_mode(&mut self) {
+        let saved = self
+            .stored
+            .as_ref()
+            .and_then(|s| s.store.setting(APPROVE_MODE).ok().flatten())
+            .and_then(|text| Mode::parse(&text));
+        self.approval.set_mode(saved.unwrap_or(Mode::Manual));
     }
 
     /// Says which provider the first request goes to. The base URL is saved with the chat and
@@ -278,6 +370,7 @@ impl Agent {
     /// was saved with (not the current one, so the request bytes stay what they were). Call
     /// after [`Agent::with_store`].
     pub fn restore(&mut self, resumed: Resumed) {
+        let resumed_id = resumed.info.id;
         if let Some(stored) = &self.stored {
             self.chat_prompts = stored
                 .store
@@ -292,6 +385,11 @@ impl Agent {
             stored.saved = self.history.len();
             stored.turn = resumed.last_turn;
         }
+        self.usage = self
+            .stored
+            .as_ref()
+            .and_then(|s| s.store.chat_usage(resumed_id).ok())
+            .unwrap_or_default();
     }
 
     /// The router options in use, as the text the store compares against a saved chat.
@@ -317,7 +415,7 @@ impl Agent {
         }
         let assembled = self.fresh_prompt()?;
         self.history[0] = Message::System(assembled.text.clone());
-        self.chat_prompts = self.default_chat_prompts()?;
+        self.chat_prompts = ChatPrompts::default();
         Ok(PromptInfo::of(&assembled))
     }
 
@@ -326,7 +424,8 @@ impl Agent {
     pub fn new_chat(&mut self) -> Result<PromptInfo, String> {
         let assembled = self.fresh_prompt()?;
         self.history = vec![Message::System(assembled.text.clone())];
-        self.chat_prompts = self.default_chat_prompts()?;
+        self.chat_prompts = ChatPrompts::default();
+        self.usage = ChatUsage::default();
         if let Some(stored) = &mut self.stored {
             stored.session_id = None;
             stored.saved = 1;
@@ -335,25 +434,9 @@ impl Agent {
         Ok(PromptInfo::of(&assembled))
     }
 
-    fn default_chat_prompts(&self) -> Result<ChatPrompts, String> {
-        match &self.stored {
-            Some(stored) => stored
-                .store
-                .default_chat_prompts()
-                .map_err(|e| e.to_string()),
-            None => Ok(ChatPrompts::default()),
-        }
-    }
-
     /// The skills and personality of the chat in use.
     pub fn chat_prompts(&self) -> &ChatPrompts {
         &self.chat_prompts
-    }
-
-    /// The skills and personality a chat started now would begin with (what is switched on in
-    /// `/prompts`).
-    pub fn starting_chat_prompts(&self) -> Result<ChatPrompts, String> {
-        self.default_chat_prompts()
     }
 
     /// Every skill, with what it is doing in this chat.
@@ -478,16 +561,40 @@ impl Agent {
         Ok(())
     }
 
-    /// The text that would go after the next message: the personality and the skills active now.
-    pub fn injection(&self) -> Result<Option<String>, String> {
-        if self.chat_prompts.is_empty() {
-            return Ok(None);
-        }
+    /// What the skills and the personality add to the next message: the text that is kept in the
+    /// chat (personality and the skills that are on) and the text for this message only.
+    pub fn injections(&self) -> Result<(Option<String>, Option<String>), String> {
         let Some(stored) = &self.stored else {
-            return Ok(None);
+            return Ok((None, None));
         };
+        // A chat that never had any needs no look at the prompts.
+        if self.chat_prompts.is_empty() && self.current_block().is_none() {
+            return Ok((None, None));
+        }
         let prompts = stored.store.list_prompts().map_err(|e| e.to_string())?;
-        Ok(compose_injection(&prompts, &self.chat_prompts))
+        Ok((
+            compose_persistent(&prompts, &self.chat_prompts),
+            compose_once(&prompts, &self.chat_prompts),
+        ))
+    }
+
+    /// The newest "active instructions" message in the chat.
+    fn current_block(&self) -> Option<&str> {
+        self.history.iter().rev().find_map(|m| match m {
+            Message::User(text) if text.starts_with(ACTIVE_MARK) => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The message to add before the user's, if the wanted instructions differ from the newest
+    /// block in the chat.
+    fn block_to_add(&self, wanted: Option<&str>) -> Option<String> {
+        match (wanted, self.current_block()) {
+            (Some(wanted), Some(current)) if wanted == current => None,
+            (Some(wanted), _) => Some(wanted.to_owned()),
+            (None, Some(current)) if current != NONE_ACTIVE => Some(NONE_ACTIVE.to_owned()),
+            (None, _) => None,
+        }
     }
 
     /// What a chat started now would get as its system prompt (nothing is changed).
@@ -545,6 +652,105 @@ impl Agent {
         Ok(improved)
     }
 
+    /// The prompt-token limit for automatic compaction: `None` when it is off.
+    pub fn auto_compact_at(&self) -> Option<u64> {
+        let saved = self
+            .stored
+            .as_ref()
+            .and_then(|s| s.store.setting(AUTO_COMPACT).ok().flatten());
+        match saved.as_deref() {
+            Some("off") => None,
+            Some(text) => Some(
+                text.parse::<u64>()
+                    .ok()
+                    .filter(|n| *n >= MIN_AUTO_COMPACT_AT)
+                    .unwrap_or(DEFAULT_AUTO_COMPACT_AT),
+            ),
+            None => Some(DEFAULT_AUTO_COMPACT_AT),
+        }
+    }
+
+    /// Sets the limit (`None` turns it off) and remembers it for later runs.
+    pub fn set_auto_compact(&mut self, at: Option<u64>) -> Result<(), String> {
+        if let Some(n) = at
+            && n < MIN_AUTO_COMPACT_AT
+        {
+            return Err(format!(
+                "the limit must be at least {MIN_AUTO_COMPACT_AT} tokens"
+            ));
+        }
+        let stored = self.stored.as_mut().ok_or(NOT_SAVING)?;
+        let value = at.map_or("off".to_owned(), |n| n.to_string());
+        stored
+            .store
+            .set_setting(AUTO_COMPACT, &value)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Whether the newest call's prompt reached the automatic limit.
+    pub fn needs_compacting(&self) -> bool {
+        let prompt = self.usage.last.and_then(|t| t.prompt);
+        match (self.auto_compact_at(), prompt) {
+            (Some(limit), Some(prompt)) => prompt >= limit && self.has_messages(),
+            _ => false,
+        }
+    }
+
+    fn has_messages(&self) -> bool {
+        self.history
+            .iter()
+            .any(|m| matches!(m, Message::User(t) if !t.starts_with(ACTIVE_MARK) && !t.starts_with(SUMMARY_MARK)))
+    }
+
+    /// Asks the model for a summary of the chat and starts a new chat that begins with it. The
+    /// chat left behind stays saved. The skills and personality of the chat carry over. On any
+    /// failure, a cancel included, nothing changes.
+    pub fn compact(&mut self) -> Result<CompactReport, String> {
+        if !self.ready() {
+            return Err(CHOOSE_A_PROVIDER.to_owned());
+        }
+        if !self.has_messages() {
+            return Err("there is nothing to compact yet".to_owned());
+        }
+        self.cancel.reset();
+        let shortened = crate::trim::trimmed(&self.history);
+        let sent: &[Message] = shortened.as_deref().unwrap_or(&self.history);
+        let mut messages = sent.to_vec();
+        messages.push(Message::User(COMPACT_ASK.to_owned()));
+        let request = assemble(&self.config, &messages);
+        let result = self.provider.complete_cancellable(&request, &self.cancel);
+        let _ = self.log.record_timed(&request, &result, None);
+        if self.cancel.is_cancelled() {
+            return Err("cancelled".to_owned());
+        }
+        let reply = result.map_err(|error| describe(&error))?;
+        let summary = match &reply.message {
+            Message::Assistant {
+                content,
+                tool_calls,
+            } if tool_calls.is_empty() => content.clone().unwrap_or_default(),
+            Message::Assistant { .. } => {
+                return Err("the model asked for a tool instead of writing a summary".to_owned());
+            }
+            _ => return Err("the reply was not an assistant message".to_owned()),
+        };
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err("the model answered with nothing".to_owned());
+        }
+        let before = self.history.len() - 1;
+        let earlier = self.current_session();
+        let kept = self.chat_prompts.clone();
+        self.new_chat()?;
+        self.chat_prompts = kept;
+        self.history
+            .push(Message::User(summary_message(earlier, summary)));
+        Ok(CompactReport {
+            messages: before,
+            summary_chars: summary.chars().count(),
+        })
+    }
+
     /// The id of the chat being saved into, once its first message has been saved.
     pub fn current_session(&self) -> Option<i64> {
         self.stored.as_ref().and_then(|s| s.session_id)
@@ -557,6 +763,12 @@ impl Agent {
             .store
             .list_sessions(Kind::Worker, limit)
             .map_err(|e| e.to_string())
+    }
+
+    /// The saved chats that began from a summary of chat `id` (empty when none is known).
+    pub fn chats_continuing(&self, id: i64) -> Result<Vec<i64>, String> {
+        let stored = self.stored.as_ref().ok_or(NOT_SAVING)?;
+        stored.store.chats_continuing(id).map_err(|e| e.to_string())
     }
 
     /// Deletes a saved chat. The chat being saved into right now is refused: its next message
@@ -635,6 +847,18 @@ impl Agent {
     }
 
     /// Overrides the call cap (tests use a small one).
+    /// Uses this flag to cancel a message in progress (see [`Cancel`]); share it with the tools
+    /// that wait, such as `bash`.
+    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// The flag a cancel sets.
+    pub fn cancel_handle(&self) -> Cancel {
+        self.cancel.clone()
+    }
+
     pub fn with_max_calls(mut self, max_calls: u32) -> Self {
         self.max_calls = max_calls;
         self
@@ -648,21 +872,25 @@ impl Agent {
         self.log.path()
     }
 
-    /// Handles one thing the user typed. The personality and the skills that are active ride
-    /// along as one more message at the end of every request of this message (after the user's
-    /// message and after any tool results), never in the history: what came before in the
-    /// request stays the same bytes, so the router's cache still matches. Skills asked for one
-    /// message are used up when it is answered or stopped by the cap, not when it fails.
+    /// Handles one thing the user typed. The personality and the skills that are on are put in
+    /// the chat once, as a message before the user's, when they differ from the newest such
+    /// message already there; from then on they are part of the history, so the router's cache
+    /// covers them. Skills asked for one message ride along as one more message at the end of
+    /// every request of this message (after the user's message and after any tool results) and
+    /// are not kept; they are used up when it is answered or stopped by the cap, not when it
+    /// fails.
     pub fn send(&mut self, text: &str, observer: &mut dyn Observer) -> Outcome {
         if !self.ready() {
             return Outcome::Failed(CHOOSE_A_PROVIDER.to_owned());
         }
-        let extra = match self.injection() {
-            Ok(extra) => extra,
+        let (kept, extra) = match self.injections() {
+            Ok(both) => both,
             Err(why) => return Outcome::Failed(format!("could not read the skills: {why}")),
         };
-        let outcome = self.send_turn(text, extra.as_deref(), observer);
-        if !matches!(outcome, Outcome::Failed(_)) {
+        self.cancel.reset();
+        let block = self.block_to_add(kept.as_deref());
+        let outcome = self.send_turn(text, block, extra.as_deref(), observer);
+        if !matches!(outcome, Outcome::Failed(_) | Outcome::Cancelled) {
             self.chat_prompts.once.clear();
         }
         outcome
@@ -671,6 +899,7 @@ impl Agent {
     fn send_turn(
         &mut self,
         text: &str,
+        block: Option<String>,
         extra: Option<&str>,
         observer: &mut dyn Observer,
     ) -> Outcome {
@@ -678,21 +907,34 @@ impl Agent {
         // leaves no half-finished exchange in memory (the log still has it, and
         // the database keeps it marked as failed).
         let rollback = self.history.len();
+        if let Some(block) = block {
+            self.history.push(Message::User(block));
+        }
         self.history.push(Message::User(text.to_owned()));
         if let Some(stored) = &mut self.stored {
             stored.turn += 1;
         }
 
-        for _ in 0..self.max_calls {
+        let mut guard = LoopGuard::default();
+        for round in 1..=self.max_calls {
+            // Old file text is left out of what is sent (the history itself stays whole).
+            let shortened = crate::trim::trimmed(&self.history);
+            let sent: &[Message] = shortened.as_deref().unwrap_or(&self.history);
             let request = match extra {
-                None => assemble(&self.config, &self.history),
+                None => assemble(&self.config, sent),
                 Some(extra) => {
-                    let mut messages = self.history.clone();
+                    let mut messages = sent.to_vec();
                     messages.push(Message::User(extra.to_owned()));
                     assemble(&self.config, &messages)
                 }
             };
-            let result = self.provider.complete(&request);
+            let result = self.provider.complete_cancellable(&request, &self.cancel);
+            if self.cancel.is_cancelled() {
+                // The log keeps what was asked; nothing of this call is saved or used.
+                let _ = self.log.record_timed(&request, &result, None);
+                self.abandon(rollback);
+                return Outcome::Cancelled;
+            }
             // A failed call, or a reply that is not an assistant message, fails the turn.
             let turn_failed = match &result {
                 Ok(reply) => !matches!(reply.message, Message::Assistant { .. }),
@@ -731,6 +973,11 @@ impl Agent {
                 return Outcome::Failed("the reply was not an assistant message".to_owned());
             };
             let (content, tool_calls) = (content.clone(), tool_calls.clone());
+            if let Some(raw) = &reply.usage {
+                self.usage.add(Tokens::from_usage(raw));
+            } else {
+                self.usage.add(Tokens::default());
+            }
             self.history.push(reply.message);
             if let Some(stored) = &mut self.stored {
                 // The save above already included this reply.
@@ -740,13 +987,42 @@ impl Agent {
             if tool_calls.is_empty() {
                 return Outcome::Answer(content.unwrap_or_default());
             }
+            let mut stop = false;
             for call in &tool_calls {
+                if self.cancel.is_cancelled() {
+                    self.abandon(rollback);
+                    return Outcome::Cancelled;
+                }
                 observer.tool_call(call);
-                let output = self.run_tool(call);
+                let mut output = self.run_tool(call);
+                if self.cancel.is_cancelled() {
+                    self.abandon(rollback);
+                    return Outcome::Cancelled;
+                }
+                match guard.record(call, crate::toolview::failed(&output)) {
+                    Verdict::Fine => {}
+                    Verdict::Warn => {
+                        output.push('\n');
+                        output.push_str(loop_guard::NOTE);
+                    }
+                    Verdict::Stop => {
+                        output.push('\n');
+                        output.push_str(loop_guard::NOTE);
+                        stop = true;
+                    }
+                }
+                observer.tool_result(call, &output);
                 self.history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
                     content: output,
                 });
+            }
+            if stop {
+                if let Err(why) = self.flush() {
+                    self.abandon(rollback);
+                    return Outcome::Failed(format!("could not save the chat: {why}"));
+                }
+                return Outcome::LoopStopped { calls: round };
             }
         }
         // The last call's tool results are not carried by any further call, so save them now:
@@ -1284,6 +1560,17 @@ impl ScriptedProvider {
         Self::tool_calls(&[(id, name, arguments)])
     }
 
+    /// The same reply, reporting this `usage` object.
+    pub fn with_usage(
+        reply: Result<Reply, Box<ProviderError>>,
+        usage: &str,
+    ) -> Result<Reply, Box<ProviderError>> {
+        reply.map(|mut reply| {
+            reply.usage = Some(usage.to_owned());
+            reply
+        })
+    }
+
     /// A call that fails.
     pub fn failure(message: &str) -> Result<Reply, Box<ProviderError>> {
         Err(Box::new(ProviderError {
@@ -1408,6 +1695,192 @@ mod tests {
             assert!(after.len() > before.len());
             assert_eq!(&after[..before.len()], &before[..]);
         }
+    }
+
+    #[test]
+    fn old_file_text_is_left_out_of_requests_but_stays_in_the_history() {
+        let dir = Scratch::new("agent-trim");
+        let big = "z".repeat(1000);
+        let args = format!("{{\"path\":\"a.txt\",\"content\":\"{big}\"}}");
+        let mut replies = Vec::new();
+        for i in 0..crate::trim::KEEP + crate::trim::STEP {
+            replies.push(ScriptedProvider::tool_call(
+                &format!("c{i}"),
+                "write_file",
+                &args,
+            ));
+            replies.push(ScriptedProvider::text("done"));
+        }
+        let (mut agent, requests) = agent_in(&dir, replies);
+        for i in 0..crate::trim::KEEP + crate::trim::STEP {
+            agent.send(&format!("message {i}"), &mut NoObserver);
+        }
+        let requests = requests.borrow();
+        let last = String::from_utf8(requests.last().unwrap().clone()).unwrap();
+        let first_of_last_message =
+            String::from_utf8(requests[requests.len() - 2].clone()).unwrap();
+        // The newest message's own write is not in its first request yet.
+        for (request, whole) in [
+            (&last, crate::trim::KEEP),
+            (&first_of_last_message, crate::trim::KEEP - 1),
+        ] {
+            assert_eq!(
+                request.matches("bytes of text left out").count(),
+                crate::trim::STEP
+            );
+            assert_eq!(request.matches(&big).count(), whole);
+        }
+        // The earlier requests were sent whole.
+        let early = String::from_utf8(requests[0].clone()).unwrap();
+        assert_eq!(early.matches("bytes of text left out").count(), 0);
+    }
+
+    #[test]
+    fn compacting_starts_a_new_chat_with_the_summary_and_keeps_the_skills() {
+        let dir = Scratch::new("agent-compact");
+        let (mut agent, requests) = stored_agent(
+            &dir,
+            vec![
+                ScriptedProvider::text("one"),
+                ScriptedProvider::text("The user wants X. Done: Y."),
+                ScriptedProvider::text("two"),
+            ],
+        );
+        with_prompts(&mut agent);
+        agent.set_skill("tdd", SkillState::On).unwrap();
+        agent.send("a", &mut NoObserver);
+        let report = agent.compact().unwrap();
+        assert_eq!(report.messages, 3);
+        assert_eq!(report.summary_chars, "The user wants X. Done: Y.".len());
+        assert_eq!(agent.history().len(), 2);
+        assert!(matches!(&agent.history()[1], Message::User(t)
+            if t.starts_with(SUMMARY_MARK) && t.ends_with("Done: Y.")
+                && t.contains("\n\n[earlier chat: 1]\n\n")));
+        assert!(agent.chat_prompts().on.contains(&"tdd".to_owned()));
+        assert!(agent.usage().last.is_none());
+
+        // The request for the summary carried the whole chat and ended with the question.
+        {
+            let requests = requests.borrow();
+            let asked = texts(&requests[1]);
+            assert!(asked.iter().any(|t| t == "a"));
+            assert_eq!(asked.last().unwrap(), COMPACT_ASK);
+        }
+
+        // The next message goes into a new chat: summary, then the skill block, then the message.
+        agent.send("b", &mut NoObserver);
+        let requests = requests.borrow();
+        let sent = texts(&requests[2]);
+        assert!(sent[1].starts_with(SUMMARY_MARK));
+        assert!(sent[2].starts_with(ACTIVE_MARK));
+        assert_eq!(sent[3], "b");
+        assert_eq!(sent.len(), 4);
+        let store = peek(&dir);
+        assert_eq!(rows(&store, "SELECT COUNT(*) FROM sessions"), 2);
+        // The summary was saved with the new chat.
+        assert_eq!(
+            rows(
+                &store,
+                &format!(
+                    "SELECT COUNT(*) FROM messages WHERE text LIKE '{}%'",
+                    &SUMMARY_MARK[..20]
+                )
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_compaction_that_fails_changes_nothing() {
+        let dir = Scratch::new("agent-compact-fails");
+        let (mut agent, requests) = stored_agent(&dir, vec![]);
+        // Nothing to compact: no request is made.
+        assert!(agent.compact().unwrap_err().contains("nothing to compact"));
+        assert!(requests.borrow().is_empty());
+
+        let (mut agent, _) = stored_agent(
+            &dir,
+            vec![
+                ScriptedProvider::text("one"),
+                ScriptedProvider::failure("boom"),
+                ScriptedProvider::tool_call("c1", "read_file", READ_A),
+                ScriptedProvider::text("   "),
+            ],
+        );
+        agent.send("a", &mut NoObserver);
+        let before = agent.history().to_vec();
+        assert!(agent.compact().unwrap_err().contains("boom"));
+        assert!(agent.compact().unwrap_err().contains("asked for a tool"));
+        assert!(agent.compact().unwrap_err().contains("nothing"));
+        assert_eq!(agent.history(), &before[..]);
+    }
+
+    #[test]
+    fn automatic_compaction_has_a_remembered_limit_and_fires_only_when_it_is_reached() {
+        let dir = Scratch::new("agent-compact-auto");
+        let (mut agent, _) = stored_agent(
+            &dir,
+            vec![
+                ScriptedProvider::with_usage(
+                    ScriptedProvider::text("one"),
+                    r#"{"prompt_tokens":30000}"#,
+                ),
+                ScriptedProvider::with_usage(
+                    ScriptedProvider::text("two"),
+                    r#"{"prompt_tokens":90000}"#,
+                ),
+            ],
+        );
+        assert_eq!(agent.auto_compact_at(), Some(DEFAULT_AUTO_COMPACT_AT));
+        assert!(!agent.needs_compacting());
+        agent.send("a", &mut NoObserver);
+        assert!(!agent.needs_compacting());
+        assert!(agent.set_auto_compact(Some(500)).is_err());
+        agent.set_auto_compact(Some(20_000)).unwrap();
+        assert_eq!(agent.auto_compact_at(), Some(20_000));
+        assert!(agent.needs_compacting());
+        agent.set_auto_compact(None).unwrap();
+        assert_eq!(agent.auto_compact_at(), None);
+        assert!(!agent.needs_compacting());
+        agent
+            .set_auto_compact(Some(DEFAULT_AUTO_COMPACT_AT))
+            .unwrap();
+        assert!(!agent.needs_compacting());
+        agent.send("b", &mut NoObserver);
+        assert!(agent.needs_compacting());
+        // A second look at the database sees the saved limit.
+        assert_eq!(
+            peek(&dir)
+                .setting(crate::store::AUTO_COMPACT)
+                .unwrap()
+                .as_deref(),
+            Some("80000")
+        );
+    }
+
+    #[test]
+    fn a_model_that_keeps_failing_is_warned_then_stopped() {
+        let dir = Scratch::new("agent-loop");
+        let replies = (0..10)
+            .map(|i| {
+                ScriptedProvider::tool_call(
+                    &format!("c{i}"),
+                    "read_file",
+                    &format!("{{\"path\":\"missing{i}.txt\"}}"),
+                )
+            })
+            .collect();
+        let (mut agent, requests) = agent_in(&dir, replies);
+        let outcome = agent.send("find it", &mut NoObserver);
+        assert_eq!(outcome, Outcome::LoopStopped { calls: 5 });
+        assert_eq!(requests.borrow().len(), 5);
+        // The 2nd call's result has no note, the 3rd and later ones do.
+        let sent = messages_of(&requests.borrow()[4]);
+        let notes = sent
+            .iter()
+            .filter(|m| m.to_string().contains(crate::loop_guard::NOTE))
+            .count();
+        assert_eq!(notes, 2);
     }
 
     #[test]
@@ -1865,6 +2338,90 @@ mod tests {
                 "SELECT COUNT(*) FROM messages WHERE status = 'failed'"
             ),
             3
+        );
+    }
+
+    /// Cancels the message while the request is in flight, as Esc would.
+    struct CancelsInFlight(Cancel);
+    impl Provider for CancelsInFlight {
+        fn complete(&self, _request: &[u8]) -> Result<Reply, Box<ProviderError>> {
+            self.0.cancel();
+            ScriptedProvider::failure("cancelled")
+        }
+    }
+
+    /// Cancels the message when the first tool call is announced, before the tool runs.
+    struct CancelsAtToolCall(Cancel);
+    impl Observer for CancelsAtToolCall {
+        fn tool_call(&mut self, _call: &ToolCall) {
+            self.0.cancel();
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_the_request_drops_the_message_and_the_chat_goes_on() {
+        let dir = Scratch::new("agent-cancel-request");
+        let cancel = Cancel::new();
+        let log = TurnLog::create(&dir.path().join("logs")).unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFile::new(dir.path()))];
+        let mut agent = Agent::new("m", Box::new(CancelsInFlight(cancel.clone())), tools, log)
+            .with_target("test", "http://x/v1")
+            .with_cancel(cancel)
+            .with_store(Store::open(&db_path(&dir)).unwrap(), context());
+        let before = agent.history().len();
+        assert_eq!(agent.send("slow one", &mut NoObserver), Outcome::Cancelled);
+        assert_eq!(agent.history().len(), before);
+        // The call was asked for, so the log shows it; nothing of it is in the database.
+        assert_eq!(log_lines(&agent).len(), 1);
+        assert_eq!(
+            rows(
+                &peek(&dir),
+                "SELECT COUNT(*) FROM messages WHERE status = 'ok'"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn a_cancel_before_a_tool_call_runs_it_not_and_marks_the_turn_failed() {
+        let dir = Scratch::new("agent-cancel-tool");
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let (agent, requests) = stored_agent(
+            &dir,
+            vec![
+                ScriptedProvider::tool_call("c1", "read_file", READ_A),
+                ScriptedProvider::text("never asked"),
+                ScriptedProvider::text("fresh start"),
+            ],
+        );
+        let mut agent = agent;
+        let mut observer = CancelsAtToolCall(agent.cancel_handle());
+        let before = agent.history().len();
+        assert_eq!(agent.send("go", &mut observer), Outcome::Cancelled);
+        assert_eq!(agent.history().len(), before);
+        // The first call was saved and is now marked failed with the rest of the turn.
+        let store = peek(&dir);
+        assert_eq!(
+            rows(&store, "SELECT COUNT(*) FROM messages WHERE status = 'ok'"),
+            0
+        );
+        assert!(
+            rows(
+                &store,
+                "SELECT COUNT(*) FROM messages WHERE status = 'failed'"
+            ) >= 2
+        );
+        // Only one request went out; the next message starts clean and clears the flag.
+        assert_eq!(requests.borrow().len(), 1);
+        assert_eq!(
+            agent.send("again", &mut NoObserver),
+            Outcome::Answer("never asked".into())
+        );
+        let second = messages_of(&requests.borrow()[1]);
+        assert_eq!(
+            second.len(),
+            2,
+            "the dropped message is not in the next request"
         );
     }
 
@@ -2629,9 +3186,16 @@ mod tests {
         assert_eq!(sent[1]["content"], "hello");
     }
 
+    fn texts(request: &[u8]) -> Vec<String> {
+        messages_of(request)
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or("").to_owned())
+            .collect()
+    }
+
     #[test]
-    fn the_active_text_goes_after_the_users_message_and_not_into_the_history() {
-        let dir = Scratch::new("agent-extra-place");
+    fn skills_that_are_on_go_into_the_chat_once_before_the_users_message() {
+        let dir = Scratch::new("agent-block-once");
         let (mut agent, requests) = stored_agent(
             &dir,
             vec![ScriptedProvider::text("one"), ScriptedProvider::text("two")],
@@ -2641,72 +3205,138 @@ mod tests {
         agent.set_skill("tdd", SkillState::On).unwrap();
         agent.send("first", &mut NoObserver);
 
-        let sent = messages_of(&requests.borrow()[0]);
-        assert_eq!(sent.len(), 3);
-        assert_eq!(sent[1]["content"], "first");
-        let extra = sent[2]["content"].as_str().unwrap();
-        assert_eq!(sent[2]["role"], "user");
-        assert!(extra.contains("## Personality: pirate\nTalk like a pirate."));
-        assert!(extra.contains("## Skill: tdd\nWrite the test first."));
-        // Not in the history, so not in the saved messages either.
-        assert_eq!(agent.history().len(), 3);
-        assert!(
-            !agent
-                .history()
-                .iter()
-                .any(|m| matches!(m, Message::User(t) if t.contains("Active instructions")))
-        );
-        let store = peek(&dir);
+        let first = messages_of(&requests.borrow()[0]);
+        // system, the instructions, the user's message: nothing after it.
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[1]["role"], "user");
+        let block = first[1]["content"].as_str().unwrap();
+        assert!(block.starts_with(ACTIVE_MARK));
+        assert!(block.contains("## Personality: pirate\nTalk like a pirate."));
+        assert!(block.contains("## Skill: tdd\nWrite the test first."));
+        assert_eq!(first[2]["content"], "first");
+        // It is part of the chat now: in memory and in the database.
+        assert_eq!(agent.history().len(), 4);
         assert_eq!(
             rows(
-                &store,
+                &peek(&dir),
                 "SELECT COUNT(*) FROM messages WHERE json LIKE '%Active instructions%'"
             ),
-            0
-        );
-        // The calls table records the size of the request that was sent, added text included.
-        assert_eq!(
-            rows(
-                &store,
-                "SELECT request_bytes FROM calls ORDER BY id LIMIT 1"
-            ),
-            i64::try_from(requests.borrow()[0].len()).unwrap()
+            1
         );
 
-        // The next message: everything before the newest message is the same bytes as before,
-        // and the text is at the end again.
+        // The next message adds no second copy, and everything sent before is a prefix of what
+        // is sent now (so the router's cache covers it).
         agent.send("second", &mut NoObserver);
-        let second = messages_of(&requests.borrow()[1]);
-        assert_eq!(second[..2], sent[..2]);
+        let requests = requests.borrow();
+        let second = messages_of(&requests[1]);
         assert_eq!(second.len(), 5);
-        assert_eq!(second[3]["content"], "second");
-        assert_eq!(second[4]["content"], extra);
+        assert_eq!(second[..3], first[..]);
+        assert_eq!(second[4]["content"], "second");
+        assert_eq!(
+            texts(&requests[1])
+                .iter()
+                .filter(|t| t.starts_with(ACTIVE_MARK))
+                .count(),
+            1
+        );
     }
 
     #[test]
-    fn the_active_text_stays_last_after_tool_results() {
-        let dir = Scratch::new("agent-extra-tools");
+    fn changing_or_clearing_the_skills_adds_a_newer_block_and_a_failed_message_leaves_none() {
+        let dir = Scratch::new("agent-block-changes");
+        let (mut agent, requests) = stored_agent(
+            &dir,
+            vec![
+                ScriptedProvider::text("one"),
+                ScriptedProvider::text("two"),
+                ScriptedProvider::text("three"),
+                ScriptedProvider::failure("boom"),
+                ScriptedProvider::text("five"),
+            ],
+        );
+        with_prompts(&mut agent);
+        agent.set_skill("tdd", SkillState::On).unwrap();
+        agent.send("a", &mut NoObserver);
+        // A second skill: a new block with both.
+        agent.set_skill("review", SkillState::On).unwrap();
+        agent.send("b", &mut NoObserver);
+        // All off: a block that says so.
+        agent.set_skill("tdd", SkillState::Off).unwrap();
+        agent.set_skill("review", SkillState::Off).unwrap();
+        agent.send("c", &mut NoObserver);
+        // Nothing changed, nothing added; a failure leaves no block behind.
+        let before = agent.history().len();
+        agent.set_skill("tdd", SkillState::On).unwrap();
+        assert!(matches!(
+            agent.send("d", &mut NoObserver),
+            Outcome::Failed(_)
+        ));
+        assert_eq!(agent.history().len(), before);
+        agent.send("e", &mut NoObserver);
+
+        let requests = requests.borrow();
+        let blocks = |i: usize| -> Vec<String> {
+            texts(&requests[i])
+                .into_iter()
+                .filter(|t| t.starts_with(ACTIVE_MARK))
+                .collect()
+        };
+        assert_eq!(blocks(0).len(), 1);
+        assert_eq!(blocks(1).len(), 2);
+        assert!(blocks(1)[1].contains("## Skill: review"));
+        assert_eq!(blocks(2).len(), 3);
+        assert_eq!(blocks(2)[2], NONE_ACTIVE);
+        // The retry after the failure has the same blocks as the failed try plus the new one.
+        assert_eq!(blocks(3).len(), 4);
+        assert_eq!(blocks(4).len(), 4);
+        assert!(blocks(4)[3].contains("## Skill: tdd"));
+        // The whole chat from an earlier request is the start of the later one.
+        let earlier = texts(&requests[1]);
+        assert_eq!(texts(&requests[2])[..earlier.len()], earlier[..]);
+    }
+
+    #[test]
+    fn a_skill_for_one_message_still_rides_last_and_is_not_kept() {
+        let dir = Scratch::new("agent-block-once-only");
         std::fs::write(dir.path().join("a.txt"), "hello from a\n").unwrap();
         let (mut agent, requests) = stored_agent(
             &dir,
             vec![
                 ScriptedProvider::tool_call("c1", "read_file", READ_A),
                 ScriptedProvider::text("done"),
+                ScriptedProvider::text("next"),
             ],
         );
         with_prompts(&mut agent);
-        agent.set_skill("review", SkillState::On).unwrap();
+        agent.set_skill("review", SkillState::Once).unwrap();
         agent.send("look", &mut NoObserver);
-        let requests = requests.borrow();
-        let (first, second) = (messages_of(&requests[0]), messages_of(&requests[1]));
-        assert_eq!(first.len(), 3);
-        // The second call: system, user, assistant call, tool result, then the added text.
-        assert_eq!(second.len(), 5);
-        assert_eq!(second[3]["role"], "tool");
-        assert_eq!(second[4]["content"], first[2]["content"]);
-        // The part before the added text is exactly the first call plus the new messages.
-        assert_eq!(second[..2], first[..2]);
+        {
+            let requests = requests.borrow();
+            let (first, second) = (messages_of(&requests[0]), messages_of(&requests[1]));
+            // system, user, then the text for this message only.
+            assert_eq!(first.len(), 3);
+            assert!(
+                first[2]["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Active instructions for this message only")
+            );
+            // system, user, assistant call, tool result, then the same text again.
+            assert_eq!(second.len(), 5);
+            assert_eq!(second[3]["role"], "tool");
+            assert_eq!(second[4]["content"], first[2]["content"]);
+        }
+        // Not in the chat, so not in the database, and gone from the next message.
         assert_eq!(agent.history().len(), 5);
+        assert_eq!(
+            rows(
+                &peek(&dir),
+                "SELECT COUNT(*) FROM messages WHERE json LIKE '%Active instructions%'"
+            ),
+            0
+        );
+        agent.send("again", &mut NoObserver);
+        assert_eq!(last_message(&requests.borrow()[2])["content"], "again");
     }
 
     #[test]
@@ -2776,34 +3406,26 @@ mod tests {
         assert_eq!(state.on, ["tdd"]);
         assert!(state.once.is_empty());
         second.send("again", &mut NoObserver);
-        let text = last_message(&requests.borrow()[0])["content"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(text.contains("Personality: caveman") && text.contains("Skill: tdd"));
-        assert!(!text.contains("Skill: review"));
+        // The first chat put the instructions in when it was sent; nothing is added again.
+        let sent = texts(&requests.borrow()[0]);
+        let blocks: Vec<&String> = sent.iter().filter(|t| t.starts_with(ACTIVE_MARK)).collect();
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains("Personality: caveman") && blocks[0].contains("Skill: tdd"));
+        assert!(!blocks[0].contains("Skill: review"));
     }
 
     #[test]
-    fn a_new_chat_starts_from_the_defaults_not_from_the_old_chat() {
+    fn a_new_chat_starts_clean_and_the_old_chat_keeps_what_it_had() {
         let dir = Scratch::new("agent-extra-new");
         let (mut agent, _) = stored_agent(&dir, vec![ScriptedProvider::text("one")]);
         with_prompts(&mut agent);
-        {
-            let store = agent.store_mut().unwrap();
-            store.set_prompt_enabled("tdd", true).unwrap();
-            store.set_prompt_enabled("pirate", true).unwrap();
-        }
         agent.load_prompt().unwrap();
-        assert_eq!(agent.chat_prompts().personality.as_deref(), Some("pirate"));
-        assert_eq!(agent.chat_prompts().on, ["tdd"]);
+        assert!(agent.chat_prompts().is_empty());
         agent.set_personality(Some("caveman")).unwrap();
-        agent.set_skill("tdd", SkillState::Off).unwrap();
         agent.set_skill("review", SkillState::On).unwrap();
         agent.send("hi", &mut NoObserver);
         agent.new_chat().unwrap();
-        assert_eq!(agent.chat_prompts().personality.as_deref(), Some("pirate"));
-        assert_eq!(agent.chat_prompts().on, ["tdd"]);
+        assert!(agent.chat_prompts().is_empty());
         // The old chat kept what it had.
         let id = peek(&dir).latest_session(Kind::Worker).unwrap().unwrap().id;
         let old = peek(&dir).chat_prompts(id).unwrap();

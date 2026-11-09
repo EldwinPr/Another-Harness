@@ -4,6 +4,7 @@
 //! for the turn log: the raw body exactly as received, the raw `usage` text, the
 //! elapsed time, and what is known about who served the request.
 
+use crate::cancel::Cancel;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -162,6 +163,7 @@ pub fn router_host(base_url: &str) -> Option<String> {
 }
 
 /// Sends requests to one router. No `Debug` on purpose: it holds the API key.
+#[derive(Clone)]
 pub struct HttpProvider {
     endpoint: String,
     models_endpoint: String,
@@ -285,6 +287,16 @@ impl HttpProvider {
 pub trait Provider {
     fn complete(&self, request: &[u8]) -> Result<Reply, Box<ProviderError>>;
 
+    /// Like [`Provider::complete`], but gives up early with an error when `cancel` is set while
+    /// waiting. The default cannot be interrupted and just calls `complete`.
+    fn complete_cancellable(
+        &self,
+        request: &[u8],
+        _cancel: &Cancel,
+    ) -> Result<Reply, Box<ProviderError>> {
+        self.complete(request)
+    }
+
     /// The model ids this provider offers. Not every provider can say.
     fn models(&self) -> Result<Vec<String>, String> {
         Err("this provider cannot list its models".to_owned())
@@ -294,6 +306,9 @@ pub trait Provider {
 /// Stands in until a provider is chosen (the chat starts with none the first time). The agent
 /// refuses to send before then, so `complete` is not normally reached.
 pub struct NoProvider;
+
+/// The error text of a request that was given up on because of a cancel.
+pub const CANCELLED: &str = "cancelled";
 
 /// What to tell someone who has not chosen a provider yet.
 pub const CHOOSE_A_PROVIDER: &str = "no provider selected: choose one with /provider <name>, or add one with /provider add <name> <base_url> <model>";
@@ -320,6 +335,45 @@ impl Provider for HttpProvider {
         HttpProvider::complete(self, request)
     }
 
+    /// The request runs on its own thread and this one watches the flag every 25 ms. After a
+    /// cancel the thread is left to finish by itself (it ends at the request timeout) and its
+    /// answer is dropped.
+    fn complete_cancellable(
+        &self,
+        request: &[u8],
+        cancel: &Cancel,
+    ) -> Result<Reply, Box<ProviderError>> {
+        let started = Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let me = self.clone();
+        let body = request.to_vec();
+        std::thread::spawn(move || {
+            let _ = sender.send(HttpProvider::complete(&me, &body));
+        });
+        let gone = |message: &str| {
+            Box::new(ProviderError {
+                message: message.to_owned(),
+                status: None,
+                raw_body: None,
+                elapsed: started.elapsed(),
+                served_by: self.served_by.clone(),
+            })
+        };
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.is_cancelled() {
+                        return Err(gone(CANCELLED));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(gone("the request thread ended without an answer"));
+                }
+            }
+        }
+    }
+
     fn models(&self) -> Result<Vec<String>, String> {
         HttpProvider::models(self)
     }
@@ -337,6 +391,47 @@ mod tests {
     const TIMEOUT: Duration = Duration::from_secs(10);
 
     const PLAIN_REPLY: &str = r#"{"id":"x","choices":[{"finish_reason":"stop","index":0,"message":{"content":"pong","role":"assistant","tool_calls":null}}],"model":"mimo-v2.6-flash","usage": {"prompt_tokens":2770,  "completion_tokens":8,"prompt_tokens_details":{"cached_tokens":512}}}"#;
+
+    #[test]
+    fn a_cancel_gives_up_on_a_request_that_is_still_waiting() {
+        // A router that accepts and then never answers.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let holder = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(stream);
+        });
+        let provider = HttpProvider::new(&base, None, Duration::from_secs(10));
+        let cancel = Cancel::new();
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            flag.cancel();
+        });
+        let started = Instant::now();
+        let error = Provider::complete_cancellable(&provider, REQUEST, &cancel).unwrap_err();
+        assert_eq!(error.message, CANCELLED);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn without_a_cancel_the_cancellable_call_returns_the_answer() {
+        let (base, handle) = fake_router(
+            "200 OK",
+            &[],
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+        );
+        let provider = HttpProvider::new(&base, None, Duration::from_secs(5));
+        let reply = Provider::complete_cancellable(&provider, REQUEST, &Cancel::new()).unwrap();
+        assert_eq!(reply.status, 200);
+        handle.join().unwrap();
+    }
 
     #[test]
     fn sends_the_bytes_unchanged_to_the_right_path_with_the_key() {

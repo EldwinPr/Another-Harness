@@ -7,7 +7,10 @@
 //!   already has replies shows a warning (see [`crate::agent::PERSONALITY_WARNING`]).
 //!
 //! Both are typed too, terminal or not: `/skills on|off|use <name>`, `/personality <name|none>`.
-//! The state is saved with the chat. A new chat starts from what `/prompts` switched on.
+//! The state is saved with the chat. A new chat starts with no skill and no personality.
+//!
+//! Each command also manages its own prompts, with the screens of [`crate::prompts_ui`]:
+//! `config` (terminal), `add [name [file]]`, `edit <name>`, `delete <name>`.
 
 use std::io::{BufRead, Write};
 
@@ -15,11 +18,11 @@ use crate::agent::Agent;
 use crate::config_ui::{done, error};
 use crate::menu::MenuItem;
 use crate::repl::{Shared, say_line};
-use crate::store_prompts::{Prompt, SkillState, size_label};
+use crate::store_prompts::{Prompt, PromptType, SkillState, size_label};
 
-const NO_SKILLS: &str =
-    "no skills yet: /prompts config, + add new, type skill (or /prompts type <name> skill)";
-const NO_PERSONALITIES: &str = "no personalities yet: /prompts config, + add new, type personality (or /prompts type <name> personality)";
+const NO_SKILLS: &str = "no skills yet: /skills add <name> (or /skills config in a terminal)";
+const NO_PERSONALITIES: &str =
+    "no personalities yet: /personality add <name> (or /personality config in a terminal)";
 
 fn mark(state: SkillState) -> &'static str {
     match state {
@@ -68,6 +71,12 @@ fn active_line(agent: &Agent) -> String {
 pub fn skills_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, rest: &str) {
     let style = term.borrow().style();
     let menus = term.borrow().menus_enabled();
+    let (first, tail) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(first, tail)| (first, tail.trim()));
+    if crate::prompts_ui::manage(agent, term, PromptType::Skill, first, tail) {
+        return;
+    }
     let mut words = rest.split_whitespace();
     let (word, name, extra) = (words.next(), words.next(), words.next());
     match (word, name, extra) {
@@ -99,7 +108,9 @@ pub fn skills_command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, 
         }
         _ => say_line(
             term,
-            &style.yellow("usage: /skills [on <name> | off <name> | use <name>]"),
+            &style.yellow(
+                "usage: /skills [on <name> | off <name> | use <name> | config | add [name [file]] | edit <name> | delete <name>]",
+            ),
         ),
     }
 }
@@ -189,6 +200,12 @@ pub fn personality_command<R: BufRead, W: Write>(
 ) {
     let style = term.borrow().style();
     let menus = term.borrow().menus_enabled();
+    let (first, tail) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(first, tail)| (first, tail.trim()));
+    if crate::prompts_ui::manage(agent, term, PromptType::Personality, first, tail) {
+        return;
+    }
     let mut words = rest.split_whitespace();
     let (name, extra) = (words.next(), words.next());
     match (name, extra) {
@@ -196,7 +213,12 @@ pub fn personality_command<R: BufRead, W: Write>(
         (None, _) => show_personalities(agent, term),
         (Some("none"), None) => choose(agent, term, None),
         (Some(name), None) => choose(agent, term, Some(name)),
-        _ => say_line(term, &style.yellow("usage: /personality [<name> | none]")),
+        _ => say_line(
+            term,
+            &style.yellow(
+                "usage: /personality [<name> | none | config | add [name [file]] | edit <name> | delete <name>]",
+            ),
+        ),
     }
 }
 
@@ -421,7 +443,7 @@ mod tests {
             agent.store_mut().unwrap().delete_prompt(name).unwrap();
         }
         skills_command(&mut agent, &term, "");
-        assert!(screen(&term).contains("no skills yet: /prompts config"));
+        assert!(screen(&term).contains("no skills yet: /skills add <name>"));
     }
 
     #[test]
@@ -560,24 +582,31 @@ mod tests {
     }
 
     #[test]
-    fn a_new_chat_starts_from_the_defaults_and_says_so() {
+    fn a_new_chat_starts_with_no_skill_and_no_personality_and_says_what_it_cleared() {
         let dir = Scratch::new("su-new");
-        let typed = "/skills on b\n/personality caveman\n/new\n/exit\n";
+        let typed = "/new\n/skills on b\n/personality caveman\n/new\n/exit\n";
         let (mut agent, term, _) = rig(&dir, typed, &[], false);
-        {
-            let store = agent.store_mut().unwrap();
-            store.set_prompt_enabled("a", true).unwrap();
-            store.set_prompt_enabled("pirate", true).unwrap();
-        }
-        agent.load_prompt().unwrap();
         run(&mut agent, &term).unwrap();
         let out = screen(&term);
+        // The first /new had nothing to clear, the second did.
         assert!(
-            out.contains("new chat; system prompt: 1 on (base)"),
+            out.contains(&format!(
+                "new chat; system prompt: 1 on (base); {}, about {} tokens (estimate)\n",
+                crate::store_prompts::size_label(
+                    crate::store_prompts::BUILTIN_PROMPT.chars().count()
+                ),
+                crate::store_prompts::BUILTIN_PROMPT
+                    .chars()
+                    .count()
+                    .div_ceil(4)
+            )),
             "{out}"
         );
-        assert!(out.contains("; personality pirate; skills on: a"), "{out}");
-        assert_eq!(agent.chat_prompts().on, ["a"]);
+        assert!(
+            out.contains("(estimate); personality and skills cleared"),
+            "{out}"
+        );
+        assert!(agent.chat_prompts().is_empty());
     }
 
     #[test]
@@ -593,7 +622,7 @@ mod tests {
             let store = agent.store_mut().unwrap();
             store.rename_prompt("a", "a2").unwrap();
             store.delete_prompt("b").unwrap();
-            store.set_prompt_type("pirate", PromptType::Skill).unwrap();
+            store.delete_prompt("pirate").unwrap();
         }
         agent.refresh_chat_prompts();
         // The saved chat follows the prompt by id, so the rename is kept.
