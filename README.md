@@ -1,0 +1,241 @@
+# Another Harness
+
+**You Only Prompt Once.** A modular prompt system for building your own coding agent, in a
+terminal, in about 45,000 lines of Rust and five dependencies.
+
+Most agent harnesses are a prompt you cannot see, wrapped around a loop you cannot change. This one
+is the other way round. The agent is **assembled from parts you own**: system prompts, skills,
+personalities and profiles that live in a database, a glossary and a set of rules the model can read
+on demand, and a request builder that turns all of it into the same bytes every time you ask for the
+same thing.
+
+Write a prompt once. Switch it on for a chat, for one message, or bake it into a profile. Hand a
+profile to a subagent. Ask the model to improve it. Edit it in a browser. Nothing is hidden in the
+binary except one default prompt, and that one is a row in the database like the rest.
+
+> **Status: early, and one person's tool.** It is used daily by its author against OpenRouter and
+> the Anthropic Messages API, and has a large test suite (770+ tests, none touch the network), but
+> few other people have run it. Expect rough edges, and read the [limits](#limits) before you point
+> it at anything you care about.
+
+---
+
+## The idea: an agent is a few small, named parts
+
+| Part | What it is | When it applies |
+|---|---|---|
+| **System prompt** | Plain text. Several can exist; the ones in your profile are joined, in order. | Fixed when a chat starts. |
+| **Skill** | A named block of instructions ("review like a maintainer", "write tests first"). | `on` for the chat, or `once` for the next message only. |
+| **Personality** | Like a skill, but exactly one at a time ("terse", "teacher"). | Every message while selected. |
+| **Profile** | A named starting setup: which system prompts, which skills are on, which personality. | Chosen for new chats; a subagent can run under one. |
+| **Glossary** | Words and definitions you keep ("the ledger", "a settled order"). | The model looks a word up instead of guessing. |
+| **Context** | Rules, decisions, shapes and guides you have said about the project. | The model fetches one by name before work it may cover. |
+
+All of it is stored, named and ordered in SQLite. You manage it from the chat, from the keyboard
+(menus, or plain typed commands when there is no terminal) or from a local web page.
+
+```text
+/prompts add reviewer ./prompts/reviewer.md     save a prompt from a file
+/skills on tests-first                          keep a skill on for this chat
+/skills use reviewer                            ...or only for the next message
+/personality terse                              one personality at a time
+/profile use backend                            what new chats start with
+/subagent reviewer check the diff in src/db     a background agent under another profile
+/web                                            edit all of it in a browser
+```
+
+The model can manage the library too. The `library` and `profile` tools list, show, add, edit and
+delete skills, personalities, prompts and profiles. Every change asks you first, shows the edit, and
+a new item is saved **switched off** so it cannot silently change the next chat. After a refusal the
+model is told not to ask again.
+
+## Why the prompt is built the way it is
+
+The goal is **determinism**, not saving tokens: the same state in gives the same request bytes out,
+so behaviour is something you can diff and a provider's prompt cache can actually hit. Everything
+below follows from that.
+
+```text
+┌─ system prompt ──────────────── frozen when the chat starts (profile's prompts, joined)
+├─ tool definitions ───────────── fixed order, verbatim schemas
+├─ message 1 … message N ──────── append-only; never rewritten, reordered or summarised in place
+├─ "Active instructions" ──────── one message, added only when your skills/personality CHANGE
+└─ "for this message only" ────── one-shot skills, appended last on each call, never saved
+```
+
+- **The system prompt never moves.** Turning a skill on or off does not edit it. It adds one
+  clearly marked "active instructions" message to the end of the history, and only when the set
+  actually changed. Everything before it stays byte-identical, so the cache keeps hitting.
+- **One-shot skills cost nothing to forget.** A `once` skill rides at the very end of the request
+  and is not saved, so the next request's prefix is exactly the previous one.
+- **Old file text is trimmed on a schedule, not continuously.** After a while a request does not
+  need the full text of a file the model wrote; the file is on disk. The trim is a pure function of
+  the history (the last 6 user messages stay whole) and its cutoff moves only every 4 messages, so
+  the cache is refilled rarely and a resumed chat gets the same view as a live one.
+- **The request builder is pure.** `kernel::assemble()` takes a config and messages and returns a
+  string. Struct fields serialise in declaration order, lists keep their order, and there is no map
+  anywhere, so key order cannot leak into the bytes. A golden test pins the output.
+- **The toolchain is pinned too.** Exact dependency versions, a pinned compiler, and SQLite compiled
+  from bundled source, so every machine runs the same SQLite.
+
+## Architecture
+
+Two crates, one direction of dependency. The kernel knows nothing about the outside world; the
+runner is everything that touches it.
+
+```mermaid
+flowchart TB
+  subgraph kernel["kernel (pure: no files, no network, no clock)"]
+    types["types: Message, ToolSpec, Config"]
+    assemble["assemble(): request, as bytes"]
+    types --> assemble
+  end
+
+  subgraph runner["runner (everything that touches the world)"]
+    repl["repl + inputbox + markdown<br/>terminal UI, slash commands"]
+    agent["agent<br/>the loop: send, run tools, append, repeat"]
+    tools["tools<br/>files, bash, glossary, context,<br/>library, profile, task, steps"]
+    prompts["store_prompts / store_profiles<br/>compose system prompt + active instructions"]
+    ctx["store_glossary / store_context"]
+    provider["provider / anthropic<br/>OpenAI-style or Messages API"]
+    jobs["jobs / subagent / tasks<br/>background work"]
+    store[("SQLite<br/>chats, calls, library")]
+    web["web<br/>localhost editor"]
+
+    repl --> agent
+    agent --> tools
+    agent --> prompts
+    agent --> provider
+    agent --> jobs
+    tools --> ctx
+    prompts --> store
+    ctx --> store
+    agent --> store
+    web --> store
+  end
+
+  agent --> assemble
+  provider -->|HTTPS| llm(["your model"])
+```
+
+| Where | What lives there |
+|---|---|
+| `kernel/` | The neutral message and tool types, and `assemble()`. Two dependencies. Written to be read: it carries running "Rust note" comments for people new to the language. |
+| `runner/src/agent.rs` | The loop. For each thing you type it sends the whole history, runs the tools the model asks for, appends results, and sends again until the model answers in text or hits the cap of 20 calls per message. |
+| `runner/src/tools/` | The model's hands. Path-confined file tools, `bash`, and the tools below. |
+| `runner/src/store*.rs` | Persistence and the library. Versioned migrations (`PRAGMA user_version`), a backup written before each one, and your edited prompts are never overwritten by an upgrade. |
+| `runner/src/provider.rs`, `anthropic.rs` | One chat-completions style (OpenRouter and compatible routers) and the Anthropic Messages API, with prompt-cache markers where the provider wants them. |
+| `runner/src/jobs.rs`, `subagent.rs`, `tools/tasks.rs` | Background subagents and background shell commands. |
+| `runner/src/repl.rs`, `inputbox.rs`, `markdown.rs`, `lineedit.rs` | The terminal: boxed input, live status, menus, and Markdown rendering (headings, code, tables, lists, links). |
+| `runner/src/web*.rs` | A small localhost-only server for editing the library in a browser. |
+
+## What the agent can do
+
+**Tools.** Around fifteen, all listed with `/tools`:
+
+- **Files:** `read_file`, `create_file`, `write_file`, `edit_file`, `delete_file`. Paths are
+  confined to the working folder; absolute paths, `..` and links that lead out are refused.
+- **Shell:** `bash`, with a 30 second limit. Looking commands (`ls`, `grep`, `find`, `git log`,
+  `diff`, and pipes between them) run without asking. Anything else asks. `background: true` runs a
+  long command in its own process group with a 64 KB output tail. `task` lists, reads and stops
+  those commands and the model's own subagents (ids `s1`, `a1`).
+- **Memory:** `glossary` and `context` read what you saved. `glossary_propose` and
+  `context_propose` suggest an entry, with your own words as the quote, and you confirm each one.
+- **Self-management:** `library` and `profile`, as above.
+- **Planning:** `steps` is a checklist the model keeps for work with three or more stages. While it
+  exists, the terminal shows the checklist instead of every call.
+- **Delegation:** `delegate(task, profile)` hands a task to a subagent.
+
+**Approvals.** `manual` asks before every file change; `auto` lets the file tools run, while `bash`
+still asks for anything that is not a plain look. Answer "always" once and that exact kind of action
+(say, `git` commands) stops asking for the rest of the run; `/approve forget` clears it.
+
+**Plan mode.** `/plan` makes the harness refuse every change, not just ask the model to behave. The
+model can only look, and must answer with a plan. Then you pick: build it here, build it with a
+subagent, or keep discussing.
+
+**Subagents.** `/subagent [profile] <task>`, or the model's `delegate`, starts an agent in a chat of
+its own, under a profile of your choosing, on a background thread. It gets only the tools that look,
+cannot ask you anything, and returns only a short final answer that is added to your chat at your
+next message. Up to three at a time. `/tasks` shows subagents and background commands together, under
+the input box.
+
+**Stopping a model that is stuck.** A call is bad if it failed or repeats the one before it exactly.
+Three bad calls in a row add a note telling the model to stop and ask you; five end the message.
+
+**Context that grows without being pasted.** `/init` has the model read your project and propose
+glossary words and context entries for you to accept one at a time. Context entries marked as
+preloaded start every subagent with them.
+
+## Everything is recorded
+
+- **SQLite is the record.** Every message verbatim, and for every model call: the SHA-256 and size
+  of the request, the raw response, token counts including cache reads and writes, which provider
+  actually served it, timing and errors. API keys are never stored with a chat.
+- **A JSONL turn log** sits next to it, one line per call, holding the full request exactly as sent.
+  "What did the model actually see?" is always answerable.
+- **Resume anything.** `/resume`, `/sessions`, or `--resume` for the latest. `/compact` has the
+  model summarise a chat and continue in a new one, and does it for you before a message once the
+  last request passed 80,000 prompt tokens. The old chat stays saved.
+- **Provider and model are runtime choices.** `/provider`, `/model` and `/models` switch with the
+  next message. Providers are saved in the database; their keys are asked for once.
+
+## Quick start
+
+You need a Rust toolchain (the version is pinned in `rust-toolchain.toml`, so `rustup` picks it up)
+and a C compiler, because SQLite is built from bundled source.
+
+```bash
+git clone https://github.com/EldwinPr/Another-Harness.git
+cd Another-Harness/src
+./chat.sh
+```
+
+`chat.sh` runs the chat in `workspace/`. To work in a real repository instead, run `harness.sh`
+from inside it (or link it onto your `PATH`):
+
+```bash
+cd ~/code/some-repo && /path/to/Another-Harness/src/harness.sh
+```
+
+Then, inside the chat:
+
+```text
+/provider add openrouter https://openrouter.ai/api/v1 <model-id>
+/help
+```
+
+`/provider add` takes `<name> <base_url> <model> [openai|anthropic]`, asks for the key, and switches
+to it. The chat database and logs live in `~/.local/share/aharness` (or `HARNESS_LOG_DIR`), never in
+your project. The only thing the harness may add to a repository is `.Aharness/`, which ignores
+itself.
+
+The command list is `/help`. The ones you will use most: `/model`, `/provider`, `/skills`,
+`/personality`, `/profile`, `/prompts`, `/glossary`, `/context`, `/approve`, `/plan`, `/subagent`,
+`/tasks`, `/compact`, `/resume`, `/web`, `/tools`, `/calls`. Type `@` in a message to attach a file,
+or `@dir/` to attach a folder listing.
+
+## Limits
+
+Being clear about these is the point of a barebones harness.
+
+- **`bash` is not a sandbox.** The file tools are confined to the working folder, but a shell
+  command that asks and is approved can reach the rest of the machine. Approve with your eyes open.
+- **One model call at a time.** The loop is sequential on purpose. Only subagents and background
+  commands run beside it.
+- **No MCP, no plugins, no network tool.** Extending the agent means writing prompts and skills,
+  not adding servers. That is the design, not an omission.
+- **Caching depends on the provider.** The request prefix is stable, but whether a router honours it
+  is up to the router. The calls table records cache reads and writes so you can check.
+- **Early software.** The author's own use is the main test. File an issue if something breaks.
+
+## Develop
+
+Run from `src/`. Tests use a temporary database and never touch the network or your real chats.
+
+```bash
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
