@@ -7,6 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 publish = false
+license = "AGPL-3.0-only"
 
 # Exact pins: determinism work does not take silent upgrades (see testing.md).
 [workspace.dependencies]

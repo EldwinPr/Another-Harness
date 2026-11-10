@@ -239,3 +239,12 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+## License
+
+Copyright (C) 2026 Eldwin Pradipta. Licensed under the GNU Affero General Public License v3.0; see
+[LICENSE](LICENSE).
+
+In plain terms: you may use, change and sell this software. If you distribute a changed version, or
+run one as a network service, you must offer its source to the people who receive or use it, under
+the same licence. The name "Another Harness" is not part of the licence.
