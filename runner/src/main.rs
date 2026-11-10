@@ -28,7 +28,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::Duration;
 
-use runner::agent::{Agent, MAX_CALLS_PER_MESSAGE, StoreContext};
+use runner::agent::{Agent, StoreContext};
 use runner::config::{self, ApiStyle, Options, Settings};
 use runner::provider::{HttpProvider, NoProvider, Provider, router_host};
 use runner::providers::Catalog;
@@ -114,7 +114,7 @@ fn start(
     let cwd = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
     let log = TurnLog::create(&log_dir).map_err(|e| format!("cannot create the log: {e}"))?;
     let db_path = log_dir.join(DB_FILE);
-    let store =
+    let mut store =
         Store::open(&db_path).map_err(|e| format!("cannot open {}: {e}", db_path.display()))?;
 
     // Rust note: `io::stdin().lock()` holds the keyboard for the whole run, so
@@ -139,14 +139,23 @@ fn start(
     term.borrow_mut().set_root(cwd.clone());
     let cancel = runner::cancel::Cancel::new();
     let shells = runner::tools::ShellTasks::new();
-    let tools: Vec<Box<dyn Tool>> = runner::tools::chat_tools(
+    let approver: Rc<dyn runner::tools::Approver> = Rc::new(TerminalApprover(Rc::clone(&term)));
+    let mut tools: Vec<Box<dyn Tool>> = runner::tools::chat_tools(
         &cwd,
         &db_path,
         Rc::clone(&approval),
-        Rc::new(TerminalApprover(Rc::clone(&term))),
+        Rc::clone(&approver),
         cancel.clone(),
         shells.clone(),
     );
+    // The MCP servers the owner added start now, and their tools are fixed for this chat
+    // (issue 44): a change made with /mcp applies the next time the program starts.
+    // `--mcp` and `--mcp-add` save their servers first, so they start in this very chat.
+    let added = runner::mcp_ui::apply_startup(&mut store, &options.mcp);
+    let mut mcp = runner::mcp::McpServers::start_all(&store, &cwd, &cancel);
+    mcp.notes.splice(0..0, added);
+    tools.extend(runner::tools::mcp_tools(&mcp, &approval, &approver));
+    term.borrow_mut().set_mcp(mcp.clients());
     let build = |def: &runner::providers::ProviderDef| -> Box<dyn Provider> {
         match def.api {
             ApiStyle::OpenAi => Box::new(HttpProvider::new(
@@ -210,6 +219,10 @@ fn start(
     agent.load_approval_mode();
 
     let mut notes = String::new();
+    for note in &mcp.notes {
+        notes.push_str(note);
+        notes.push('\n');
+    }
     // Provider files are copied into the database once, so the menus can edit them.
     match agent.import_provider_files() {
         Ok(0) => {}
@@ -296,12 +309,24 @@ fn start(
     if !agent.chat_prompts().on.is_empty() {
         banner.push_str(&row("skills:", &agent.chat_prompts().on.join(", ")));
     }
+    if !mcp.started.is_empty() {
+        let line = mcp
+            .started
+            .iter()
+            .map(|s| {
+                let (tools, tokens) = s.on_cost();
+                format!(
+                    "{} ({tools} tools, ~{} tokens a call)",
+                    s.server.name,
+                    runner::web_usage::compact(i64::try_from(tokens).unwrap_or(i64::MAX))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        banner.push_str(&row("mcp:", &line));
+    }
     banner.push_str(&row("database:", &db_path.display().to_string()));
     banner.push_str(&row("log:", &agent.log_path().display().to_string()));
-    banner.push_str(&row(
-        "limit:",
-        &format!("{MAX_CALLS_PER_MESSAGE} model calls per message"),
-    ));
     banner.push_str(&style.dim(&"─".repeat(60)));
     banner.push('\n');
     if !notes.is_empty() {

@@ -93,9 +93,6 @@ const NO_SWITCHING: &str = "this run cannot switch providers";
 const COLD_CACHE: &str =
     "the next request differs from the earlier ones, so the router's cache starts over";
 
-/// Most calls to the model allowed for one thing the user types.
-pub const MAX_CALLS_PER_MESSAGE: u32 = 20;
-
 /// The prompt-token limit for automatic compaction until the owner sets another (issue 24).
 pub const DEFAULT_AUTO_COMPACT_AT: u64 = 80_000;
 /// The lowest limit that can be set: below this a chat would be compacted almost at once.
@@ -125,8 +122,9 @@ pub enum Outcome {
     /// The model kept making failing or repeated calls (see [`crate::loop_guard`]) and the
     /// program ended the message. What was done is kept, like at the call cap.
     LoopStopped { calls: u32 },
-    /// The user cancelled while it worked. Handled like a failure: the message has been removed
-    /// from the history and its turn is marked failed in the database.
+    /// The user cancelled while it worked. The transcript is kept: the message, the calls that
+    /// finished and their results stay in the history and the database, followed by a line saying
+    /// the message was cancelled.
     Cancelled,
 }
 
@@ -139,6 +137,9 @@ pub trait Observer {
     fn warning(&mut self, _text: &str) {}
     /// Something about a background subagent (issue 35): it finished, or its answer was added.
     fn subagent_note(&mut self, _text: &str) {}
+    /// A model call was answered and its tokens are in `agent.usage()`: the numbers under the
+    /// input box can be updated now, not only when the whole message is done.
+    fn call_answered(&mut self, _agent: &Agent) {}
 }
 
 /// How to build the tools of a subagent (issue 33): called once per delegation.
@@ -262,6 +263,12 @@ pub const MAX_AUTO_WAKES: u32 = 3;
 
 /// The message sent when the program wakes the model; the answers of the subagents come ahead of it.
 /// Added to every request while plan mode is on (issue 42). It is not kept in the chat.
+/// The result of a tool call that was in the same reply as the one the owner cancelled on.
+const CANCELLED_CALL: &str = "cancelled by the user: this call was not run";
+
+/// The last line of a cancelled message in the transcript.
+const CANCELLED_NOTE: &str = "[cancelled by the user]";
+
 pub const PLAN_TEXT: &str = "Plan mode is on. Nothing may be changed: file changes, commands that are not looking commands, and saving to the glossary, context, library or profiles are all refused. Look at what you need (read_file, ls, grep, find, git log), then answer with a plan: the goal in one line; numbered steps, each naming the files it touches; and what you are unsure of. Do not start the work.";
 
 pub const WAKE_TEXT: &str = "A subagent you started has finished; its answer is in the message above. Carry on with what the user asked: use it, or tell the user what it found. If nothing more is needed, say so briefly.";
@@ -296,7 +303,7 @@ impl Agent {
             tools,
             log,
             stored: None,
-            max_calls: MAX_CALLS_PER_MESSAGE,
+            max_calls: u32::MAX,
             target: Target::default(),
             catalog: None,
             chat_prompts: ChatPrompts::default(),
@@ -1005,6 +1012,9 @@ impl Agent {
         self.cancel.clone()
     }
 
+    /// Limits the calls to the model for one message. A chat has no limit unless this is set (a
+    /// subagent sets one); the owner can stop a message with Esc, and the loop guard ends one that
+    /// keeps failing or repeating.
     pub fn with_max_calls(mut self, max_calls: u32) -> Self {
         self.max_calls = max_calls;
         self
@@ -1058,8 +1068,9 @@ impl Agent {
         }
         let block = self.block_to_add(kept.as_deref());
         let outcome = self.send_turn(text, delivery, block, extra.as_deref(), observer);
-        if matches!(outcome, Outcome::Failed(_) | Outcome::Cancelled) {
-            // They go with the next message that does go through.
+        if matches!(outcome, Outcome::Failed(_)) {
+            // They go with the next message that does go through. (A cancelled message keeps
+            // its deliveries: they are in the transcript.)
             let numbers: Vec<u32> = deliveries.iter().map(|d| d.n).collect();
             self.jobs.undeliver(&numbers);
         } else {
@@ -1121,8 +1132,7 @@ impl Agent {
             if self.cancel.is_cancelled() {
                 // The log keeps what was asked; nothing of this call is saved or used.
                 let _ = self.log.record_timed(&request, &result, None);
-                self.abandon(rollback, saved);
-                return Outcome::Cancelled;
+                return self.keep_cancelled(&[], rollback, saved);
             }
             // A failed call, or a reply that is not an assistant message, fails the turn.
             let turn_failed = match &result {
@@ -1167,6 +1177,7 @@ impl Agent {
             } else {
                 self.usage.add(Tokens::default());
             }
+            observer.call_answered(self);
             self.history.push(reply.message);
             if let Some(stored) = &mut self.stored {
                 // The save above already included this reply.
@@ -1177,10 +1188,9 @@ impl Agent {
                 return Outcome::Answer(content.unwrap_or_default());
             }
             let mut stop = false;
-            for call in &tool_calls {
+            for (index, call) in tool_calls.iter().enumerate() {
                 if self.cancel.is_cancelled() {
-                    self.abandon(rollback, saved);
-                    return Outcome::Cancelled;
+                    return self.keep_cancelled(&tool_calls[index..], rollback, saved);
                 }
                 observer.tool_call(call);
                 let mut output =
@@ -1192,8 +1202,12 @@ impl Agent {
                         self.run_tool(call)
                     };
                 if self.cancel.is_cancelled() {
-                    self.abandon(rollback, saved);
-                    return Outcome::Cancelled;
+                    // The call did run (or was cut short); its output is part of the transcript.
+                    self.history.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: output,
+                    });
+                    return self.keep_cancelled(&tool_calls[index + 1..], rollback, saved);
                 }
                 match guard.record(call, crate::toolview::failed(&output)) {
                     Verdict::Fine => {}
@@ -1297,6 +1311,33 @@ impl Agent {
             .map_err(|e| e.to_string())?;
         stored.saved = self.history.len();
         Ok(())
+    }
+
+    /// Ends a cancelled message but keeps what was said and done so far: the user's message, the
+    /// finished calls and their results stay in the history and are saved as good. A tool call
+    /// that did not run gets a result saying so, and a closing assistant line says the message
+    /// was cancelled, so the transcript stays well formed for the next request and on resume.
+    fn keep_cancelled(&mut self, unrun: &[ToolCall], rollback: usize, saved: usize) -> Outcome {
+        for call in unrun {
+            self.history.push(Message::Tool {
+                tool_call_id: call.id.clone(),
+                content: CANCELLED_CALL.to_owned(),
+            });
+        }
+        self.history.push(Message::Assistant {
+            content: Some(CANCELLED_NOTE.to_owned()),
+            tool_calls: Vec::new(),
+        });
+        // A cancel before the first call finished leaves no chat row yet.
+        let saved_ok = match &self.stored {
+            Some(_) => self.ensure_session().and_then(|_| self.flush()),
+            None => Ok(()),
+        };
+        if let Err(why) = saved_ok {
+            self.abandon(rollback, saved);
+            return Outcome::Failed(format!("could not save the chat: {why}"));
+        }
+        Outcome::Cancelled
     }
 
     /// Goes back to before the user's message. The database already has the turn marked failed.
@@ -2667,6 +2708,37 @@ mod tests {
     }
 
     #[test]
+    fn the_observer_hears_each_answered_call_with_the_tokens_so_far() {
+        struct Seen(Vec<(Option<u64>, u64)>);
+        impl Observer for Seen {
+            fn call_answered(&mut self, agent: &Agent) {
+                let usage = agent.usage();
+                self.0
+                    .push((usage.last.and_then(|t| t.prompt), usage.prompt_total));
+            }
+        }
+        let dir = Scratch::new("agent-call-answered");
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let (mut agent, _) = agent_in(
+            &dir,
+            vec![
+                ScriptedProvider::with_usage(
+                    ScriptedProvider::tool_call("c1", "read_file", READ_A),
+                    r#"{"prompt_tokens":100,"completion_tokens":5}"#,
+                ),
+                ScriptedProvider::with_usage(
+                    ScriptedProvider::text("done"),
+                    r#"{"prompt_tokens":250,"completion_tokens":7}"#,
+                ),
+            ],
+        );
+        let mut seen = Seen(vec![]);
+        agent.send("go", &mut seen);
+        // Once per call, in the middle of the message as well as at its end.
+        assert_eq!(seen.0, vec![(Some(100), 100), (Some(250), 350)]);
+    }
+
+    #[test]
     fn the_observer_hears_each_tool_call_in_order() {
         struct Recorder(Vec<String>);
         impl Observer for Recorder {
@@ -3033,7 +3105,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancel_during_the_request_drops_the_message_and_the_chat_goes_on() {
+    fn a_cancel_during_the_request_keeps_the_message_and_says_it_was_cancelled() {
         let dir = Scratch::new("agent-cancel-request");
         let cancel = Cancel::new();
         let log = TurnLog::create(&dir.path().join("logs")).unwrap();
@@ -3044,59 +3116,79 @@ mod tests {
             .with_store(Store::open(&db_path(&dir)).unwrap(), context());
         let before = agent.history().len();
         assert_eq!(agent.send("slow one", &mut NoObserver), Outcome::Cancelled);
-        assert_eq!(agent.history().len(), before);
-        // The call was asked for, so the log shows it; nothing of it is in the database.
+        // The user's message and the closing line stay in memory.
+        assert_eq!(agent.history().len(), before + 2);
+        assert_eq!(
+            agent.history().last(),
+            Some(&Message::Assistant {
+                content: Some(CANCELLED_NOTE.to_owned()),
+                tool_calls: Vec::new()
+            })
+        );
         assert_eq!(log_lines(&agent).len(), 1);
+        // And in the database, as good rows: no call finished, yet the chat exists.
+        let store = peek(&dir);
+        assert_eq!(
+            rows(&store, "SELECT COUNT(*) FROM messages WHERE status = 'ok'"),
+            2
+        );
         assert_eq!(
             rows(
-                &peek(&dir),
-                "SELECT COUNT(*) FROM messages WHERE status = 'ok'"
+                &store,
+                "SELECT COUNT(*) FROM messages WHERE status = 'failed'"
             ),
             0
         );
     }
 
     #[test]
-    fn a_cancel_before_a_tool_call_runs_it_not_and_marks_the_turn_failed() {
+    fn a_cancel_at_a_tool_call_keeps_the_exchange_and_answers_the_calls_not_run() {
         let dir = Scratch::new("agent-cancel-tool");
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
         let (agent, requests) = stored_agent(
             &dir,
             vec![
-                ScriptedProvider::tool_call("c1", "read_file", READ_A),
-                ScriptedProvider::text("never asked"),
-                ScriptedProvider::text("fresh start"),
+                ScriptedProvider::tool_calls(&[
+                    ("c1", "read_file", READ_A),
+                    ("c2", "read_file", READ_A),
+                ]),
+                ScriptedProvider::text("after the cancel"),
             ],
         );
         let mut agent = agent;
         let mut observer = CancelsAtToolCall(agent.cancel_handle());
         let before = agent.history().len();
         assert_eq!(agent.send("go", &mut observer), Outcome::Cancelled);
-        assert_eq!(agent.history().len(), before);
-        // The first call was saved and is now marked failed with the rest of the turn.
+        // user, assistant with two calls, result of c1 (it ran), result of c2 (not run), closing line.
+        assert_eq!(agent.history().len(), before + 5);
+        let Message::Tool { content, .. } = &agent.history()[before + 3] else {
+            panic!("the second call has no result");
+        };
+        assert_eq!(content, CANCELLED_CALL);
+        // Everything is saved as good, so a resume shows it.
         let store = peek(&dir);
         assert_eq!(
-            rows(&store, "SELECT COUNT(*) FROM messages WHERE status = 'ok'"),
-            0
-        );
-        assert!(
             rows(
                 &store,
                 "SELECT COUNT(*) FROM messages WHERE status = 'failed'"
-            ) >= 2
+            ),
+            0
         );
-        // Only one request went out; the next message starts clean and clears the flag.
+        assert_eq!(
+            rows(&store, "SELECT COUNT(*) FROM messages WHERE status = 'ok'"),
+            5
+        );
+        // Only one request went out; the next message carries the whole kept transcript.
         assert_eq!(requests.borrow().len(), 1);
         assert_eq!(
             agent.send("again", &mut NoObserver),
-            Outcome::Answer("never asked".into())
+            Outcome::Answer("after the cancel".into())
         );
         let second = messages_of(&requests.borrow()[1]);
-        assert_eq!(
-            second.len(),
-            2,
-            "the dropped message is not in the next request"
-        );
+        assert_eq!(second.len(), 7, "system + the 5 kept + the new message");
+        assert_eq!(second[2]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(second[4]["content"], CANCELLED_CALL);
+        assert_eq!(second[5]["content"], CANCELLED_NOTE);
     }
 
     #[test]

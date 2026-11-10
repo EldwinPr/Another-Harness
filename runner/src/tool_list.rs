@@ -136,6 +136,9 @@ mod tests {
             "library",
             "profile",
             "delegate",
+            "write_note",
+            "grep",
+            "find",
         ] {
             assert!(chat.contains(&name.to_owned()), "{name} in {chat:?}");
         }

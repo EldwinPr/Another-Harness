@@ -875,7 +875,13 @@ const HELP_TOP: &str = "\
 <p><a href=\"/usage\">Usage</a> shows the tokens used by day, model and chat. <a href=\"/database\">Database</a> draws the tables and how they relate. Neither shows your keys or your messages.</p>";
 
 /// The tools the model is given: the main chat's, then a reader subagent's and a coder's.
-pub fn tools(catalogue: &crate::tool_list::Catalogue) -> String {
+pub fn tools(
+    catalogue: &crate::tool_list::Catalogue,
+    servers: &[(
+        crate::store_mcp::McpServer,
+        Vec<(String, crate::store_mcp::Rule)>,
+    )],
+) -> String {
     let group = |title: &str, note: &str, list: &[crate::tool_list::ToolInfo]| -> String {
         let mut out = format!(
             "<h2>{}</h2><p class=\"dim\">{}</p>",
@@ -910,6 +916,35 @@ pub fn tools(catalogue: &crate::tool_list::Catalogue) -> String {
         escape(&names(&catalogue.reader)),
         escape(&names(&catalogue.coder))
     ));
+    body.push_str("<h2>MCP servers</h2>");
+    if servers.is_empty() {
+        body.push_str(
+            "<p class=\"dim\">None. <code>/mcp add NAME COMMAND</code> in the chat adds one.</p>",
+        );
+    } else {
+        body.push_str("<p class=\"dim\">Started with the chat; their tools are named <code>mcp__server__tool</code> and appear in <code>/tools</code> once running. A change made with <code>/mcp</code> applies the next time the program starts. Variable values are never shown.</p>");
+    }
+    for (server, rules) in servers {
+        let mut facts = vec![
+            format!("timeout {}s", server.timeout_secs),
+            format!("other tools: {}", server.default_rule.name()),
+        ];
+        if !server.vars.is_empty() {
+            let names: Vec<&str> = server.vars.iter().map(|(n, _)| n.as_str()).collect();
+            facts.push(format!("variables: {}", names.join(", ")));
+        }
+        for (tool, rule) in rules {
+            facts.push(format!("{tool}: {}", rule.name()));
+        }
+        body.push_str(&format!(
+            "<div class=\"card\"><p><strong><code>{}</code></strong>{} <code>{} {}</code></p><p class=\"dim\">{}</p></div>",
+            escape(&server.name),
+            if server.enabled { "" } else { " (off)" },
+            escape(&server.command),
+            escape(&server.args.join(" ")),
+            escape(&facts.join("; "))
+        ));
+    }
     page("/tools", "Tools", &body)
 }
 

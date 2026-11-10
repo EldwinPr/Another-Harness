@@ -20,11 +20,16 @@ use crate::cancel::Cancel;
 /// How long a command may run before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run with bash -c"},"background":{"type":"boolean","description":"Start it and return at once (a server, a long build); see the task tool. It has no time limit"}},"required":["command"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run with bash -c"},"timeout":{"type":"integer","description":"Seconds before the command is killed. Default 30, at most 300. For a long build, background: true is better"},"background":{"type":"boolean","description":"Start it and return at once (a server, a long build); see the task tool. It has no time limit"}},"required":["command"]}"#;
+
+/// The longest a command may ask to run before it is killed.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Deserialize)]
 struct Args {
     command: String,
+    #[serde(default)]
+    timeout: Option<u64>,
     #[serde(default)]
     background: bool,
 }
@@ -92,22 +97,23 @@ impl Bash {
         self
     }
 
-    fn execute(&self, command: &str) -> String {
+    fn execute(&self, command: &str, timeout: Duration) -> String {
         // `exec 2>&1` first makes the shell send errors to the same pipe as
         // normal output, so the two come back interleaved in the order they
         // were written. `process_group(0)` puts the command in its own process
         // group so we can kill all of it at once. Stdin is closed so a command
         // that waits for input ends instead of hanging.
-        let mut child = match Command::new("bash")
+        let mut start = Command::new("bash");
+        start
             .arg("-c")
             .arg(format!("exec 2>&1\n{command}"))
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-        {
+            .process_group(0);
+        // The provider's key is not passed on: `env` must not print it into the chat and the logs.
+        let mut child = match super::child_env::scrub(&mut start).spawn() {
             Ok(child) => child,
             Err(e) => return format!("error: could not start bash: {e}"),
         };
@@ -142,7 +148,7 @@ impl Bash {
                     let _ = child.kill();
                     break child.wait().ok();
                 }
-                Ok(None) if started.elapsed() >= self.timeout => {
+                Ok(None) if started.elapsed() >= timeout => {
                     timed_out = true;
                     kill_group(group);
                     let _ = child.kill();
@@ -161,7 +167,7 @@ impl Bash {
         let summary = if cancelled {
             "[cancelled by the user and killed]".to_owned()
         } else if timed_out {
-            format!("[timed out after {:?} and was killed]", self.timeout)
+            format!("[timed out after {:?} and was killed]", timeout)
         } else {
             match status.and_then(|s| s.code()) {
                 Some(code) => format!("[exit code: {code}]"),
@@ -178,7 +184,7 @@ impl Bash {
 
 /// Sends SIGKILL to a whole process group. Errors are ignored: the group may
 /// already be gone, which is the goal.
-pub(super) fn kill_group(group: u32) {
+pub fn kill_group(group: u32) {
     let _ = Command::new("bash")
         .arg("-c")
         .arg(format!("kill -KILL -- -{group}"))
@@ -204,9 +210,25 @@ impl Tool for Bash {
         if args.background && (self.looking_only || self.shells.is_none()) {
             return "error: this bash cannot run commands in the background".to_owned();
         }
+        let timeout = match args.timeout {
+            None => self.timeout,
+            Some(0) => {
+                return format!(
+                    "error: timeout must be at least 1 second and at most {}",
+                    MAX_TIMEOUT.as_secs()
+                );
+            }
+            Some(secs) if Duration::from_secs(secs) > MAX_TIMEOUT => {
+                return format!(
+                    "error: timeout is at most {} seconds; for a longer build use background: true",
+                    MAX_TIMEOUT.as_secs()
+                );
+            }
+            Some(secs) => Duration::from_secs(secs),
+        };
         if self.looking_only {
             return if is_looking(&args.command) {
-                self.execute(&args.command)
+                self.execute(&args.command, timeout)
             } else {
                 "error: a subagent can only look (ls, cat, head, tail, wc, grep, find, git status ...): this command was not run".to_owned()
             };
@@ -235,7 +257,7 @@ impl Tool for Bash {
                 Err(why) => why,
             };
         }
-        self.execute(&args.command)
+        self.execute(&args.command, timeout)
     }
 }
 
@@ -428,15 +450,28 @@ mod tests {
             vec![("touch one".to_owned(), Some("`touch` commands".to_owned()))],
             "the second touch was not asked about"
         );
-        // Another program still asks, and the answer "always" is not offered for a chain.
+        // Another program still asks. A chain is offered "always" for that exact line only.
         run(&tool, "rm one");
         run(&tool, "touch three; touch four");
-        let seen = seen.lock().unwrap();
-        assert_eq!(
-            seen[1],
-            ("rm one".to_owned(), Some("`rm` commands".to_owned()))
-        );
-        assert_eq!(seen[2], ("touch three; touch four".to_owned(), None));
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                seen[1],
+                ("rm one".to_owned(), Some("`rm` commands".to_owned()))
+            );
+            assert_eq!(
+                seen[2],
+                (
+                    "touch three; touch four".to_owned(),
+                    Some("this exact command (`touch three; touch four`)".to_owned())
+                )
+            );
+        }
+        // The same line is not asked again; a different one is.
+        run(&tool, "touch three; touch four");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        run(&tool, "touch three; touch five");
+        assert_eq!(seen.lock().unwrap().len(), 4);
     }
 
     #[test]
@@ -504,6 +539,23 @@ mod tests {
         let out = run(&tool, "echo before; sleep 30");
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(out, "before\n[timed out after 1s and was killed]");
+    }
+
+    #[test]
+    fn the_timeout_argument_raises_the_limit_and_its_range_is_checked() {
+        let dir = Scratch::new("bash-timeout-arg");
+        let tool = bash(dir.path(), Duration::from_secs(1), true);
+        let out = tool
+            .run(&serde_json::json!({"command": "sleep 2; echo done", "timeout": 20}).to_string());
+        assert_eq!(out, "done\n[exit code: 0]");
+        assert_eq!(
+            tool.run(&serde_json::json!({"command": "true", "timeout": 0}).to_string()),
+            "error: timeout must be at least 1 second and at most 300"
+        );
+        assert_eq!(
+            tool.run(&serde_json::json!({"command": "true", "timeout": 301}).to_string()),
+            "error: timeout is at most 300 seconds; for a longer build use background: true"
+        );
     }
 
     #[cfg(target_os = "linux")]

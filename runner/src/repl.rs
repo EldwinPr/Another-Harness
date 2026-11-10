@@ -148,6 +148,22 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
         "put an entry in the start of every subagent (shapes are on by default)",
     ),
     (
+        "/mcp",
+        "list the MCP servers the chat starts and what the model may do with their tools: each tool asks first, runs freely or is off; changes apply the next time the program starts",
+    ),
+    (
+        "/mcp config",
+        "a menu of the servers: add one by answering questions (name, program, arguments, variables such as an API key), enable, disable, remove, and ask, free or off for each tool (terminal only)",
+    ),
+    (
+        "/mcp toolset [add NAME]",
+        "list the ready-made MCP toolsets (rust-docs) and add one with its rules already set",
+    ),
+    (
+        "/mcp <add|remove|enable|disable|tools|restart|rule> ...",
+        "the same by typing (also without a terminal): add NAME COMMAND [ARGS] [--env N=v] [--timeout S], tools NAME, rule NAME TOOL|* ask|free|off",
+    ),
+    (
         "/tools [name]",
         "list the tools the model has, and what a subagent gets; with a name, show that tool in full",
     ),
@@ -414,6 +430,19 @@ fn steps_text(style: Style, before: &[crate::tools::Step], now: &[crate::tools::
 
 pub const PROMPT: &str = "> ";
 
+/// The mark at the left of what the owner sent, so it can be told from the answer without colour.
+const SENT_BAR: &str = "┃";
+
+/// A message the owner sent, as it stays in the scrollback: every line behind a bar, in cyan,
+/// (the callers put a blank line before and after). The model's answer has no bar, so the two
+/// differ by shape and spacing and not only by colour.
+fn sent_block(style: Style, text: &str) -> String {
+    text.lines()
+        .map(|line| format!("{} {}", style.cyan(SENT_BAR), style.cyan(line)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One input and one output, shared by the REPL, the observer and the approver
 /// so that the approval question and the next prompt read from the same stream.
 pub struct Terminal<R, W> {
@@ -455,6 +484,8 @@ pub struct Terminal<R, W> {
     watcher: Option<Watcher>,
     /// The working directory: the `@file` list is made from it and `@path` words are read from it.
     root: std::path::PathBuf,
+    /// The MCP servers this chat started, by name, for `/mcp restart` (issue 44).
+    mcp: Vec<(String, Rc<crate::mcp::McpClient>)>,
 }
 
 /// The box at the bottom of the screen while the model works: output is printed above it.
@@ -525,6 +556,7 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
             cancel: None,
             watcher: None,
             root: std::env::current_dir().unwrap_or_default(),
+            mcp: Vec::new(),
         }))
     }
 
@@ -657,6 +689,18 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
         self.root = root;
     }
 
+    /// Gives the MCP servers this chat started, so `/mcp restart` can start one again.
+    pub fn set_mcp(&mut self, clients: Vec<(String, Rc<crate::mcp::McpClient>)>) {
+        self.mcp = clients;
+    }
+
+    pub fn mcp_client(&self, name: &str) -> Option<Rc<crate::mcp::McpClient>> {
+        self.mcp
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, c)| Rc::clone(c))
+    }
+
     /// Gives the flag that Esc and Ctrl-C set while the model works.
     pub fn set_cancel(&mut self, cancel: Cancel) {
         self.cancel = Some(cancel);
@@ -682,6 +726,18 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
         });
         self.draw_sticky();
         self.start_watching();
+    }
+
+    /// Gives the working box new info text (a model call was answered) and draws it again.
+    pub fn refresh_working(&mut self, info: impl Fn(Option<usize>) -> String) {
+        if self.sticky.is_none() {
+            return;
+        }
+        let text = info(Some(terminal_size().1.saturating_sub(3)));
+        if let Some(sticky) = &mut self.sticky {
+            sticky.info = text;
+        }
+        self.refresh_sticky();
     }
 
     /// Takes the working box off the screen for good.
@@ -777,7 +833,7 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
         if let Some(sent) = &line
             && !sent.trim().is_empty()
         {
-            let echoed = format!("\n{}\n", self.style.cyan(sent));
+            let echoed = format!("\n{}\n\n", sent_block(self.style, sent));
             self.say(&echoed);
         }
         if let Some(line) = &line
@@ -1276,8 +1332,8 @@ impl<R: BufRead, W: Write> TerminalApprover<R, W> {
                 }
                 rows.push((Some(Answer::No), MenuItem::new("no")));
                 let items: Vec<MenuItem> = rows.iter().map(|(_, item)| item.clone()).collect();
-                // The cursor starts on "no": Enter alone never approves.
-                let picked = term.pick_from("allow it?", &items, items.len() - 1);
+                // The cursor starts on "yes", so Enter alone approves; Esc is still "no".
+                let picked = term.pick_from("allow it?", &items, 0);
                 let answer = match picked {
                     None => Some(Answer::No),
                     Some(index) => rows[index].0,
@@ -1327,6 +1383,12 @@ impl<R: BufRead, W: Write> TerminalApprover<R, W> {
 pub struct PrintObserver<R, W>(pub Shared<R, W>);
 
 impl<R: BufRead, W: Write> Observer for PrintObserver<R, W> {
+    fn call_answered(&mut self, agent: &Agent) {
+        self.0
+            .borrow_mut()
+            .refresh_working(|width| info_text(agent, width));
+    }
+
     fn tool_call(&mut self, call: &ToolCall) {
         let mut term = self.0.borrow_mut();
         let style = term.style();
@@ -1504,7 +1566,7 @@ pub fn show_history<R: BufRead, W: Write>(term: &Shared<R, W>, history: &[Messag
             }
             Message::User(content) if content == crate::agent::WAKE_TEXT => {}
             Message::User(content) => {
-                text.push_str(&format!("{}{content}\n", style.accent(PROMPT)));
+                text.push_str(&format!("\n{}\n\n", sent_block(style, content)));
             }
             Message::Assistant {
                 content,
@@ -2652,6 +2714,10 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                 crate::glossary_ui::command(agent, term, rest);
                 continue;
             }
+            "/mcp" => {
+                crate::mcp_ui::command(agent, term, rest);
+                continue;
+            }
             "/web" => {
                 crate::web_ui::command(agent, term, rest, &mut web);
                 continue;
@@ -2771,25 +2837,10 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                 ))
             ),
             Outcome::Failed(why) => format!("{}\n", style.red(&format!("[error: {why}]"))),
-            Outcome::Cancelled => {
-                // At the box the typed text comes back in it; a plain prompt cannot show it.
-                let boxed = term.borrow().menu_stty;
-                let boxed = boxed && !woke_up;
-                if boxed {
-                    term.borrow_mut().restore = Some(line.to_owned());
-                }
-                let back = if boxed {
-                    "; the text is back in the box"
-                } else {
-                    ""
-                };
-                format!(
-                    "{}\n",
-                    style.yellow(&format!(
-                        "[cancelled: nothing of this message was kept{back}]"
-                    ))
-                )
-            }
+            Outcome::Cancelled => format!(
+                "{}\n",
+                style.yellow("[cancelled: the transcript was kept; say what to do next]")
+            ),
         };
         term.borrow_mut().unpin_steps();
         term.borrow_mut().say(&report);
@@ -3173,9 +3224,10 @@ mod tests {
             "a result that went well is not shown: {out}"
         );
         assert!(
-            out.contains("run this command?\n  echo hi && touch hi.txt\n[y/N] "),
+            out.contains("run this command?\n  echo hi && touch hi.txt\n"),
             "{out}"
         );
+        assert!(out.contains("[y/a/N] "), "{out}");
         assert!(out.contains("It printed hi.\n"), "{out}");
         assert!(out.contains("▸ #2 read_file a.txt\n"), "{out}");
         assert!(out.contains("The file says: file text.\n"), "{out}");
@@ -3271,7 +3323,7 @@ mod tests {
         );
         assert!(out.contains("[instructions: none active]\n"), "{out}");
         assert!(
-            out.contains("> hello\nhi\n") && out.contains("> bye\n"),
+            out.contains("┃ hello\n\nhi\n") && out.contains("┃ bye\n"),
             "{out}"
         );
         assert!(!out.contains("Arr.") && !out.contains("Pretty."), "{out}");
@@ -3435,7 +3487,7 @@ mod tests {
         show_history(&term, &history);
         assert_eq!(
             screen(&term),
-            "> hi\nHello!\n> read it\n▸ read_file a.txt\nIt says x.\n[end of saved chat]\n"
+            "\n┃ hi\n\nHello!\n\n┃ read it\n\n▸ read_file a.txt\nIt says x.\n[end of saved chat]\n"
         );
     }
 
@@ -3451,11 +3503,14 @@ mod tests {
         let out = screen(&term);
         // q0, a0, q1, a1 are left out.
         assert!(
-            out.starts_with("[4 earlier messages not shown]\n> q2\na2\n"),
+            out.starts_with("[4 earlier messages not shown]\n\n┃ q2\n\na2\n"),
             "{out}"
         );
         assert!(!out.contains("q1\n") && !out.contains("a1\n"), "{out}");
-        assert!(out.ends_with("> q11\na11\n[end of saved chat]\n"), "{out}");
+        assert!(
+            out.ends_with("┃ q11\n\na11\n[end of saved chat]\n"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -3463,7 +3518,7 @@ mod tests {
         let term = blank_term();
         let history = vec![Message::System("p".into()), Message::User("only".into())];
         show_history(&term, &history);
-        assert_eq!(screen(&term), "> only\n[end of saved chat]\n");
+        assert_eq!(screen(&term), "\n┃ only\n\n[end of saved chat]\n");
     }
 
     #[test]
@@ -3639,7 +3694,9 @@ mod tests {
         assert!(out.contains("resumed chat 1, last used "), "{out}");
         assert!(out.contains("(4 messages)"), "{out}");
         assert!(
-            out.contains("> first question\none\n> second question\ntwo\n[end of saved chat]\n"),
+            out.contains(
+                "┃ first question\n\none\n\n┃ second question\n\ntwo\n[end of saved chat]\n"
+            ),
             "{out}"
         );
         assert!(out.contains("three\n"), "{out}");
@@ -3660,7 +3717,7 @@ mod tests {
         run(&mut r.agent, &r.term).unwrap();
         let out = screen(&r.term);
         assert!(out.contains("resumed chat 1,"), "{out}");
-        assert!(out.contains("> the first chat\n"), "{out}");
+        assert!(out.contains("┃ the first chat\n"), "{out}");
         assert!(!out.contains("the second chat"), "{out}");
     }
 
@@ -3792,7 +3849,7 @@ mod tests {
         );
         assert!(coloured.contains("\x1b[32mresumed chat 1,"), "{coloured}");
         assert!(
-            coloured.contains("\x1b[1;36m> \x1b[0mfirst question"),
+            coloured.contains("\x1b[36m┃\x1b[0m \x1b[36mfirst question"),
             "{coloured}"
         );
         assert!(
@@ -3995,7 +4052,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_is_asked_without_the_always_answer_and_a_typed_a_is_then_no() {
+    fn a_chain_is_offered_always_for_that_exact_line_and_a_typed_a_allows_it() {
         let dir = Scratch::new("repl-always-chain");
         let mut r = rig(
             &dir,
@@ -4007,19 +4064,22 @@ mod tests {
         );
         run(&mut r.agent, &r.term).unwrap();
         let out = screen(&r.term);
-        assert!(out.contains("[y/N] "), "{out}");
-        assert!(!out.contains("always allow"), "{out}");
-        assert!(!dir.path().join("x").exists());
+        assert!(out.contains("[y/a/N] "), "{out}");
+        assert!(
+            out.contains("a = always allow this exact command (`touch x; touch y`) until you quit"),
+            "{out}"
+        );
+        assert!(dir.path().join("x").exists() && dir.path().join("y").exists());
     }
 
     #[test]
     fn the_selector_answers_yes_always_and_no_and_escape_is_no() {
         let dir = Scratch::new("repl-selector");
-        // The cursor starts on "no", so Enter alone is no. Keys after each question:
-        // Up Up Enter = yes; Enter = no; Up Enter = always (a chain has no such row); Esc = no.
+        // The cursor starts on "yes", so Enter alone is yes. Keys after each question:
+        // Enter = yes; Down Down Enter = no (rows: yes, always, no); Down Enter = always; Esc = no.
         let mut r = rig(
             &dir,
-            "m1\n\x1b[A\x1b[A\rm2\n\rm3\n\x1b[A\rm4\nm5\n\x1b/exit\n",
+            "m1\n\rm2\n\x1b[B\x1b[B\rm3\n\x1b[B\rm4\nm5\n\x1b/exit\n",
             vec![
                 touch("one"),
                 ScriptedProvider::text("ok1"),
@@ -4036,8 +4096,11 @@ mod tests {
         r.term.borrow_mut().enable_menus(false);
         run(&mut r.agent, &r.term).unwrap();
         let out = screen(&r.term);
-        assert!(dir.path().join("one").exists(), "yes: {out}");
-        assert!(!dir.path().join("two").exists(), "Enter alone is no: {out}");
+        assert!(dir.path().join("one").exists(), "Enter alone is yes: {out}");
+        assert!(
+            !dir.path().join("two").exists(),
+            "Down Down Enter is no: {out}"
+        );
         assert!(dir.path().join("three").exists(), "always: {out}");
         assert!(
             dir.path().join("four").exists(),
@@ -4062,11 +4125,11 @@ mod tests {
                 &format!(r#"{{"path":"{path}","content":"SECRET\nBODY"}}"#),
             )
         };
-        // Rows: yes, always, view, no (the cursor starts on no).
-        // m1: Up Enter = view, then Esc = no. m2: view, then Up x3 Enter = yes.
+        // Rows: yes, always, view, no (the cursor starts on yes).
+        // m1: Down Down Enter = view, then Esc = no. m2: view, then Enter = yes.
         let mut r = rig(
             &dir,
-            "m1\n\x1b[A\r\x1bm2\n\x1b[A\r\x1b[A\x1b[A\x1b[A\r/exit\n",
+            "m1\n\x1b[B\x1b[B\r\x1bm2\n\x1b[B\x1b[B\r\r/exit\n",
             vec![
                 create("one.txt"),
                 ScriptedProvider::text("ok1"),
@@ -4099,7 +4162,7 @@ mod tests {
         };
         let mut r = rig(
             &dir,
-            "m1\na\nm2\nm3\nn\n/exit\n",
+            "m1\na\nm2\ny\nm3\nn\n/exit\n",
             vec![
                 create("a.txt"),
                 ScriptedProvider::text("1"),
@@ -4111,9 +4174,10 @@ mod tests {
         );
         run(&mut r.agent, &r.term).unwrap();
         let out = screen(&r.term);
-        assert_eq!(out.matches("create this file?").count(), 1, "{out}");
+        // "always" covers one file now, so the second create is asked again.
+        assert_eq!(out.matches("create this file?").count(), 2, "{out}");
         assert!(
-            out.contains("a = always allow create_file calls until you quit"),
+            out.contains("a = always allow create_file on a.txt until you quit"),
             "{out}"
         );
         assert!(dir.path().join("b.txt").exists());
@@ -5184,7 +5248,7 @@ mod tests {
         run(&mut r.agent, &r.term).unwrap();
         let out = screen(&r.term);
         assert!(out.contains("tools the model has"), "{out}");
-        assert!(out.contains("read_file(path)"), "{out}");
+        assert!(out.contains("read_file(lines?, path, start?)"), "{out}");
         assert!(out.contains("/tools <name> shows one in full"), "{out}");
         assert!(out.contains("there is no tool 'nope'"), "{out}");
     }

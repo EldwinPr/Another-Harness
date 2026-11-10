@@ -637,9 +637,17 @@ fn get(h: &Head<'_>, ctx: &Ctx<'_>) -> Reply {
         "/tools" => with_db(ctx, |store| {
             let db = store.path().ok_or("the database has no file")?;
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            let servers = store.list_mcp_servers().map_err(|e| e.to_string())?;
+            let rules = servers
+                .iter()
+                .map(|s| store.mcp_rules(s.id).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Reply::page(
                 200,
-                web_pages::tools(&crate::tool_list::catalogue(&cwd, &db)),
+                web_pages::tools(
+                    &crate::tool_list::catalogue(&cwd, &db),
+                    &servers.into_iter().zip(rules).collect::<Vec<_>>(),
+                ),
             ))
         }),
         "/context" => with_db(ctx, |store| {
@@ -1153,8 +1161,10 @@ mod tests {
         let page = get_db(&db, "/tools");
         assert_eq!(status(&page), "HTTP/1.1 200 OK");
         for name in [
-            "read_file(path)",
-            "bash(background?, command)",
+            "read_file(lines?, path, start?)",
+            "bash(background?, command, timeout?)",
+            "grep(",
+            "find(",
             "task(",
             "glossary_propose(",
             "context_propose(",
@@ -1167,6 +1177,32 @@ mod tests {
         }
         assert!(page.contains("A subagent"));
         assert!(!page.contains(SECRET));
+    }
+
+    #[test]
+    fn the_tools_page_lists_the_mcp_servers_and_their_rules_but_not_their_variables() {
+        let (_dir, db) = seeded("web-tools-mcp");
+        {
+            let mut store = Store::open(&db).unwrap();
+            store
+                .add_mcp_server(
+                    "docs",
+                    "rust-docs-mcp",
+                    &[],
+                    &[("MCP_PAGE_TOKEN".to_owned(), "hidden-value".to_owned())],
+                    30,
+                )
+                .unwrap();
+            store
+                .set_mcp_rule("docs", "search", crate::store_mcp::Rule::Free)
+                .unwrap();
+        }
+        let page = get_db(&db, "/tools");
+        assert!(page.contains("MCP servers"), "{page}");
+        assert!(page.contains("rust-docs-mcp"));
+        assert!(page.contains("search"));
+        assert!(page.contains("MCP_PAGE_TOKEN"));
+        assert!(!page.contains("hidden-value"));
     }
 
     #[test]

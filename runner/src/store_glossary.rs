@@ -482,7 +482,7 @@ mod tests {
             (entry.area.as_str(), entry.definition.as_str()),
             ("billing", "a request")
         );
-        assert!(dir.path().join("harness.db.before-20").exists());
+        assert!(dir.path().join("harness.db.before-25").exists());
     }
 
     #[test]

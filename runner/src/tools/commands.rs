@@ -10,7 +10,8 @@
 /// must be relative and stay below the working directory (see [`is_free`]).
 pub const FREE_COMMANDS: &[&str] = &[
     "ls", "cd", "pwd", "echo", "mkdir", "sleep", "pgrep", "cat", "head", "tail", "wc", "du",
-    "grep", "find", "sed", "sort", "uniq", "printf", "node", "python", "python3", "git",
+    "grep", "find", "sed", "sort", "uniq", "printf", "node", "python", "python3", "git", "which",
+    "diff", "cmp", "stat", "basename", "dirname", "cut", "nl", "tr",
 ];
 
 /// Commands whose job is to run other commands (or code). "Always allow" is never offered for
@@ -209,6 +210,8 @@ fn free_stage(words: &[String]) -> bool {
         "cd" => matches!(args.as_slice(), [dir] if !dir.starts_with('-') && path_ok(dir)),
         "pwd" => args.iter().all(|a| matches!(*a, "-L" | "-P")),
         "echo" | "pgrep" | "printf" => true,
+        // Looks a program name up on PATH: plain names, no flags, and never a path.
+        "which" => !args.is_empty() && args.iter().all(|a| !a.starts_with('-') && !a.contains('/')),
         "sort" => sort_ok(&args),
         "uniq" => {
             // A second path would be the file it writes to.
@@ -267,7 +270,7 @@ fn grep_ok(args: &[&str]) -> bool {
     true
 }
 
-/// `git` only as `git status|log|diff|show|ls-files|blame|rev-parse ...` (and `remote -v`, `branch -a`) straight after the name (no `-c` or `-C` before
+/// `git` only as `git status|log|diff|show|ls-files|blame|rev-parse|check-ignore ...` (and `remote -v`, `branch -a`) straight after the name (no `-c` or `-C` before
 /// the subcommand), which read the repository. Flags that write a file or run a program are
 /// refused, and every path must stay below the working directory.
 fn git_ok(args: &[&str]) -> bool {
@@ -297,7 +300,7 @@ fn git_ok(args: &[&str]) -> bool {
     }
     if !matches!(
         *sub,
-        "status" | "log" | "diff" | "show" | "ls-files" | "blame" | "rev-parse"
+        "status" | "log" | "diff" | "show" | "ls-files" | "blame" | "rev-parse" | "check-ignore"
     ) {
         return false;
     }
@@ -380,24 +383,38 @@ fn path_ok(token: &str) -> bool {
 }
 
 /// For a command that may be remembered with "always": the key the permission is stored under and
-/// what to call it on screen. `None` for anything but one plain program with plain arguments, and
-/// for programs that run other commands.
+/// what to call it on screen.
+///
+/// One plain program with plain arguments is remembered as the program (`git ...`). Anything else
+/// (a program that runs other commands, a chain, a pipe, a redirect, a path) is remembered as this
+/// exact command line only, so "always" never allows more than the owner has seen.
 pub fn always_for(command: &str) -> Option<(String, String)> {
     let command = command.trim();
-    if command
-        .chars()
-        .any(|c| SHELL_CONTROL.contains(&c) || c.is_control())
-    {
+    if command.is_empty() {
         return None;
     }
     let name = command.split_whitespace().next()?;
     let plain = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'));
-    if !plain || RUNS_OTHER_COMMANDS.contains(&name) {
-        return None;
+    let simple = !command
+        .chars()
+        .any(|c| SHELL_CONTROL.contains(&c) || c.is_control());
+    if simple && plain && !RUNS_OTHER_COMMANDS.contains(&name) {
+        return Some((format!("bash:{name}"), format!("`{name}` commands")));
     }
-    Some((format!("bash:{name}"), format!("`{name}` commands")))
+    Some((format!("bash-exact:{command}"), exact_label(command)))
+}
+
+/// "this exact command: `...`", the first line of it cut to fit a screen line.
+fn exact_label(command: &str) -> String {
+    const SHOWN: usize = 50;
+    let first = command.lines().next().unwrap_or("");
+    let mut shown: String = first.chars().take(SHOWN).collect();
+    if first.chars().count() > SHOWN || command.lines().nth(1).is_some() {
+        shown.push_str("...");
+    }
+    format!("this exact command (`{shown}`)")
 }
 
 #[cfg(test)]
@@ -421,6 +438,10 @@ mod tests {
             "git ls-files src",
             "git blame a.txt",
             "git rev-parse --show-toplevel",
+            "git check-ignore -v data/requests.db",
+            "ls -la .gitignore 2>&1; git check-ignore -v a.db 2>&1",
+            "which python3 node 2>/dev/null",
+            "which chromium chromium-browser google-chrome 2>/dev/null; ls",
         ] {
             assert!(is_free(command), "{command}");
         }
@@ -434,6 +455,10 @@ mod tests {
             "git rev-parse --git-dir",
             "git -C . remote -v",
             "cut -d: -f1 /etc/passwd",
+            "git check-ignore -v ../x",
+            "which",
+            "which -a python3",
+            "which /usr/bin/python3",
         ] {
             assert!(!is_free(command), "{command}");
         }
@@ -644,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn always_is_not_offered_when_it_would_allow_too_much() {
+    fn always_for_a_command_that_could_allow_too_much_covers_that_exact_line_only() {
         for command in [
             "bash -c 'rm x'",
             "sh script.sh",
@@ -662,9 +687,26 @@ mod tests {
             "echo $(rm x)",
             "ls > x",
             ". ./x.sh",
-            "",
         ] {
-            assert_eq!(always_for(command), None, "{command:?}");
+            let (id, label) = always_for(command).unwrap_or_else(|| panic!("{command:?}"));
+            assert_eq!(id, format!("bash-exact:{command}"), "{command:?}");
+            assert!(label.starts_with("this exact command ("), "{label}");
         }
+        // The same words with other arguments are a different command.
+        assert_ne!(always_for("python3 a.py"), always_for("python3 b.py"));
+        assert_eq!(always_for("python3 a.py"), always_for("  python3 a.py "));
+        assert_eq!(always_for(""), None);
+        assert_eq!(always_for("   "), None);
+    }
+
+    #[test]
+    fn the_exact_label_shows_one_short_line() {
+        let long = format!("python3 -c \"{}\"", "x".repeat(200));
+        let (_, label) = always_for(&long).unwrap();
+        assert!(label.chars().count() < 100, "{label}");
+        assert!(label.contains("...`"), "{label}");
+        let (_, label) = always_for("cat > a <<'EOF'\nbody\nEOF").unwrap();
+        assert_eq!(label, "this exact command (`cat > a <<'EOF'...`)");
+        assert!(!label.contains('\n'));
     }
 }

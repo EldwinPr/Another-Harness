@@ -636,7 +636,7 @@ mod tests {
         let saved = store.list_providers().unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].api, crate::config::ApiStyle::OpenAi);
-        assert!(dir.path().join("harness.db.before-20").exists());
+        assert!(dir.path().join("harness.db.before-25").exists());
     }
 
     #[test]

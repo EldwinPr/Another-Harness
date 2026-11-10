@@ -124,7 +124,22 @@ pub struct Options {
     pub resume: bool,
     /// Serve the web page (view and edit) on this port instead of starting a chat (issue 28).
     pub serve: Option<u16>,
+    /// MCP servers to add before the chat starts (issue 44), in the order given.
+    pub mcp: Vec<McpRequest>,
 }
+
+/// One `--mcp` or `--mcp-add` on the command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpRequest {
+    /// `--mcp NAME`: a ready-made toolset (see `mcp_toolsets.rs`).
+    Toolset(String),
+    /// `--mcp-add NAME COMMAND [ARGS] [--env N=v] [--timeout S]`: the words after the option, as
+    /// `/mcp add` reads them.
+    Add(String),
+}
+
+/// The options that end the words of `--mcp-add`.
+const OWN_OPTIONS: [&str; 4] = ["--resume", "--serve", "--mcp", "--mcp-add"];
 
 /// The port `--serve` uses when none is given.
 pub const DEFAULT_WEB_PORT: u16 = 8787;
@@ -150,9 +165,30 @@ impl Options {
                     };
                     options.serve = Some(port);
                 }
+                "--mcp" => {
+                    let name = args
+                        .next_if(|next| !next.starts_with("--"))
+                        .ok_or("--mcp needs the name of a toolset, for example --mcp rust-docs")?;
+                    options.mcp.push(McpRequest::Toolset(name));
+                }
+                "--mcp-add" => {
+                    let mut words: Vec<String> = Vec::new();
+                    while let Some(word) =
+                        args.next_if(|next| !OWN_OPTIONS.contains(&next.as_str()))
+                    {
+                        words.push(word);
+                    }
+                    if words.len() < 2 {
+                        return Err(
+                            "--mcp-add needs a name and a program: --mcp-add NAME COMMAND [ARGS] [--env NAME=value] [--timeout SECONDS]"
+                                .to_owned(),
+                        );
+                    }
+                    options.mcp.push(McpRequest::Add(words.join(" ")));
+                }
                 other => {
                     return Err(format!(
-                        "unknown option '{other}': the options are --resume and --serve [port]"
+                        "unknown option '{other}': the options are --resume, --serve [port], --mcp NAME and --mcp-add NAME COMMAND [ARGS]"
                     ));
                 }
             }
@@ -367,6 +403,37 @@ mod tests {
         assert!(args(&["--serve", "70000"]).is_err());
         assert!(args(&["--serve", "x"]).is_err());
         assert!(args(&["--serve", "--resume"]).is_err());
+    }
+
+    #[test]
+    fn mcp_options_name_a_toolset_or_add_a_server() {
+        let options = args(&[
+            "--mcp",
+            "rust-docs",
+            "--mcp-add",
+            "docs",
+            "prog",
+            "serve",
+            "--cache-dir",
+            "/x",
+            "--env",
+            "A=1",
+            "--resume",
+        ])
+        .unwrap();
+        assert!(options.resume);
+        assert_eq!(
+            options.mcp,
+            [
+                McpRequest::Toolset("rust-docs".to_owned()),
+                McpRequest::Add("docs prog serve --cache-dir /x --env A=1".to_owned()),
+            ]
+        );
+        // A name is needed, and for --mcp-add a program too.
+        assert!(args(&["--mcp"]).is_err());
+        assert!(args(&["--mcp", "--resume"]).is_err());
+        assert!(args(&["--mcp-add", "docs"]).is_err());
+        assert!(args(&["--mcp-add"]).is_err());
         assert!(args(&["--resume"]).unwrap().serve.is_none());
     }
 

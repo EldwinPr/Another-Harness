@@ -7,6 +7,7 @@
 # there: they are in the program's own folder in your user data folder (~/.local/share/aharness,
 # or HARNESS_LOG_DIR). The only thing it may add to the repository is .Aharness/ (subagent notes),
 # which ignores itself.
+# MCP servers can be added when starting: --mcp rust-docs, or --mcp-add NAME COMMAND [ARGS].
 set -euo pipefail
 src="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export HARNESS_PROVIDER_DIR="${HARNESS_PROVIDER_DIR:-$src/providers}"

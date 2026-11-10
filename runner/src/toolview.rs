@@ -56,6 +56,47 @@ pub fn summary(name: &str, arguments: &str, max: usize) -> String {
         }),
         "read_file" | "delete_file" => text("path"),
         "glossary" | "glossary_propose" => text("term"),
+        "context" => text("name").or_else(|| text("kind")),
+        "context_propose" => text("kind")
+            .zip(text("name"))
+            .map(|(kind, name)| format!("{kind}: {name}")),
+        "library" | "profile" => text("action").map(|action| {
+            let mut parts = vec![action];
+            if let Some(kind) = text("type") {
+                parts.push(kind);
+            }
+            if let Some(name) = text("name") {
+                parts.push(name);
+            }
+            parts.join(" ")
+        }),
+        "task" => text("action").map(|action| {
+            let id = parsed
+                .as_ref()
+                .and_then(|v| v.get("id"))
+                .and_then(|id| match id {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                });
+            match id {
+                Some(id) => format!("{action} {id}"),
+                None => action,
+            }
+        }),
+        "steps" => {
+            let list = parsed
+                .as_ref()
+                .and_then(|v| v.get("steps"))
+                .and_then(Value::as_array);
+            list.map(|steps| {
+                let done = steps
+                    .iter()
+                    .filter(|s| s.get("status").and_then(Value::as_str) == Some("done"))
+                    .count();
+                format!("{done}/{} done", steps.len())
+            })
+        }
         "delegate" => text("profile").zip(text("task")).map(|(profile, task)| {
             let first = task
                 .lines()
@@ -64,6 +105,12 @@ pub fn summary(name: &str, arguments: &str, max: usize) -> String {
                 .trim();
             format!("{profile}: {first}")
         }),
+        // An MCP tool: its first text argument (by name), usually the thing asked about.
+        name if name.starts_with("mcp__") => parsed
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|args| args.values().find_map(Value::as_str))
+            .map(str::to_owned),
         "create_file" | "write_file" => text("path")
             .zip(text("content"))
             .map(|(path, content)| format!("{path} · {} bytes", content.len())),
@@ -250,6 +297,57 @@ mod tests {
             ),
             "claim"
         );
+    }
+
+    #[test]
+    fn an_mcp_call_shows_its_first_text_argument() {
+        assert_eq!(
+            summary("mcp__docs__search", r#"{"limit":5,"query":"serde"}"#, 80),
+            "serde"
+        );
+        // No text argument: the arguments themselves.
+        assert_eq!(summary("mcp__docs__list", r#"{"n":1}"#, 80), r#"{"n":1}"#);
+    }
+
+    #[test]
+    fn the_newer_tools_get_a_summary_too() {
+        assert_eq!(
+            summary("context", r#"{"name":"build-and-test"}"#, 80),
+            "build-and-test"
+        );
+        assert_eq!(
+            summary(
+                "context_propose",
+                r#"{"kind":"rule","name":"no-tabs","text":"t","quote":"q"}"#,
+                80
+            ),
+            "rule: no-tabs"
+        );
+        assert_eq!(
+            summary(
+                "library",
+                r#"{"action":"add","type":"skill","name":"tidy","text":"t"}"#,
+                80
+            ),
+            "add skill tidy"
+        );
+        assert_eq!(
+            summary("profile", r#"{"action":"show","name":"work"}"#, 80),
+            "show work"
+        );
+        assert_eq!(summary("profile", r#"{"action":"list"}"#, 80), "list");
+        assert_eq!(
+            summary("task", r#"{"action":"output","id":2}"#, 80),
+            "output 2"
+        );
+        assert_eq!(summary("task", r#"{"action":"list"}"#, 80), "list");
+        let steps = serde_json::json!({"steps": [
+            {"text": "one", "status": "done"},
+            {"text": "two", "status": "doing"},
+            {"text": "three", "status": "todo"},
+        ]})
+        .to_string();
+        assert_eq!(summary("steps", &steps, 80), "1/3 done");
     }
 
     #[test]

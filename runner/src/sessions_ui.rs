@@ -244,7 +244,7 @@ mod tests {
         assert!(out.contains("saved chats"), "{out}");
         assert!(out.contains("resumed chat 1, last used "), "{out}");
         assert!(
-            out.contains("> first question\nok\n[end of saved chat]\n"),
+            out.contains("┃ first question\n\nok\n[end of saved chat]\n"),
             "{out}"
         );
         let shown = out.split("resumed chat").nth(1).unwrap();
@@ -358,7 +358,7 @@ mod tests {
         let (mut agent, term, _) = rig(&dir, &typed, &[]);
         sessions_menu(&mut agent, &term);
         assert!(
-            screen(&term).contains("> banana split\n"),
+            screen(&term).contains("┃ banana split\n"),
             "{}",
             screen(&term)
         );
@@ -418,7 +418,10 @@ mod tests {
         sessions_menu(&mut agent, &term);
         let out = screen(&term);
         assert!(out.contains("\x1b[32mresumed chat 1,"), "{out}");
-        assert!(out.contains("\x1b[1;36m> \x1b[0mfirst question"), "{out}");
+        assert!(
+            out.contains("\x1b[36m┃\x1b[0m \x1b[36mfirst question"),
+            "{out}"
+        );
     }
 
     #[test]

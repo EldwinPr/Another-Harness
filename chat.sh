@@ -4,6 +4,10 @@
 # to last time, or on none the first time.
 #   ./chat.sh
 #   ./chat.sh --resume                # continue the most recent saved chat
+#   ./chat.sh --mcp rust-docs         # add a ready-made MCP toolset (once; it starts in this chat)
+#   ./chat.sh --mcp-add NAME COMMAND [ARGS] [--env N=v] [--timeout S]   # add any MCP server
+# Both save the server in the database and leave one that is already saved as it is; change rules
+# with /mcp config, or ask the model (it has an mcp tool and asks you before every change).
 set -euo pipefail
 src="$(cd "$(dirname "$0")" && pwd)"
 

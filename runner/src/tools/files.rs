@@ -51,16 +51,24 @@ struct Shared {
 }
 
 impl Shared {
-    /// `true` when the change may go ahead: auto mode, an earlier "always" for this tool, or the
-    /// person said yes. `tool` is the name the model called.
-    fn allowed(&self, tool: &str, question: &str, detail: &str, full: Option<&str>) -> bool {
+    /// `true` when the change may go ahead: auto mode, an earlier "always" for this tool and this
+    /// file, or the person said yes. `tool` is the name the model called, and `path` is the file it
+    /// would change: "always" covers one file, so it is never a blanket yes for every later write.
+    fn allowed(
+        &self,
+        tool: &str,
+        path: &str,
+        question: &str,
+        detail: &str,
+        full: Option<&str>,
+    ) -> bool {
         if self.mode.planning() {
             return false;
         }
         if self.mode.mode() == Mode::Auto {
             return true;
         }
-        let key = Some((format!("tool:{tool}"), format!("{tool} calls")));
+        let key = Some((format!("tool:{tool}:{path}"), format!("{tool} on {path}")));
         self.mode
             .confirm(self.approver.as_ref(), question, detail, key, full)
     }
@@ -205,6 +213,7 @@ impl CreateFile {
         let bytes = args.content.len();
         if !self.shared.allowed(
             "create_file",
+            &args.path,
             "create this file?",
             &format!("{} ({bytes} bytes)", args.path),
             Some(&args.content),
@@ -280,6 +289,7 @@ impl WriteFile {
         let bytes = args.content.len();
         if !self.shared.allowed(
             "write_file",
+            &args.path,
             "overwrite this file?",
             &format!("{} ({bytes} bytes, replaces {was})", args.path),
             Some(&args.content),
@@ -385,6 +395,7 @@ impl EditFile {
         let diff = format!("--- old\n{}\n+++ new\n{}", args.old_string, args.new_string);
         if !self.shared.allowed(
             "edit_file",
+            &args.path,
             "edit this file?",
             &format!(
                 "{} ({}, -{removed} +{added} bytes)",
@@ -464,6 +475,7 @@ impl DeleteFile {
         }
         if !self.shared.allowed(
             "delete_file",
+            &args.path,
             "delete this file?",
             &format!("{} ({} bytes)", args.path, meta.len()),
             None,
@@ -749,6 +761,29 @@ mod tests {
         std::fs::write(r.file("a.txt"), "old").unwrap();
         assert!(r.edit("a.txt", "old", "new").starts_with("edited"));
         assert!(r.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn always_covers_one_file_of_one_tool_and_nothing_else() {
+        let r = rig("files-always-one", Mode::Manual, Answer::Always);
+        std::fs::write(r.file("a.txt"), "old").unwrap();
+        std::fs::write(r.file("b.txt"), "old").unwrap();
+        // The first edit is answered "always"; the same file with the same tool is not asked again.
+        assert!(r.edit("a.txt", "old", "new").starts_with("edited"));
+        assert!(r.edit("a.txt", "new", "newer").starts_with("edited"));
+        assert_eq!(r.asked.borrow().len(), 1);
+        // Another file, and another tool on the first file, are asked again.
+        assert!(r.edit("b.txt", "old", "new").starts_with("edited"));
+        assert!(r.write("a.txt", "written").starts_with("wrote"));
+        assert_eq!(r.asked.borrow().len(), 3);
+        assert_eq!(
+            r.mode.always_labels(),
+            [
+                "edit_file on a.txt".to_owned(),
+                "edit_file on b.txt".to_owned(),
+                "write_file on a.txt".to_owned()
+            ]
+        );
     }
 
     #[test]

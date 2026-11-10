@@ -1282,7 +1282,7 @@ mod tests {
             after.text, before.text,
             "the first chat after the upgrade has the same system prompt"
         );
-        let copy = dir.path().join("harness.db.before-20");
+        let copy = dir.path().join("harness.db.before-25");
         assert!(copy.exists());
         let old = rusqlite::Connection::open(&copy).unwrap();
         let version: i64 = old

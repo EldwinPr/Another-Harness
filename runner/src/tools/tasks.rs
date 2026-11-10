@@ -159,14 +159,17 @@ impl ShellTasks {
                 "error: {running} commands are already running in the background; stop one first"
             ));
         }
-        let mut child = Command::new("bash")
+        let mut start = Command::new("bash");
+        start
             .arg("-c")
             .arg(format!("exec 2>&1\n{command}"))
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .process_group(0)
+            .process_group(0);
+        // Same rule as `bash`: a background command does not get the provider's key either.
+        let mut child = super::child_env::scrub(&mut start)
             .spawn()
             .map_err(|e| format!("error: could not start bash: {e}"))?;
         let group = child.id();
@@ -270,6 +273,42 @@ impl ShellTasks {
 
     /// The latest output of task `n`, at most `max` bytes (cut at a character), and its facts.
     pub fn output(&self, n: u32, max: usize) -> Result<(ShellInfo, String), String> {
+        let (info, text) = self.output_now(n, max)?;
+        Ok((
+            ShellInfo {
+                status: self.status(n).unwrap_or(info.status),
+                ..info
+            },
+            text,
+        ))
+    }
+
+    /// `output`, after waiting up to `wait` for task `n` to stop running. The wait happens with no
+    /// lock held, so a long build can be followed without blocking the rest of the run.
+    pub fn output_waiting(
+        &self,
+        n: u32,
+        max: usize,
+        wait: Duration,
+    ) -> Result<(ShellInfo, String), String> {
+        let from = Instant::now();
+        loop {
+            let now = self.output_now(n, max)?;
+            if now.0.status != ShellStatus::Running || from.elapsed() >= wait {
+                return Ok(now);
+            }
+            thread::sleep(Duration::from_millis(25).min(wait));
+        }
+    }
+
+    /// The status of task `n`, without its output.
+    pub fn status(&self, n: u32) -> Option<ShellStatus> {
+        let inner = lock(&self.0);
+        let task = inner.tasks.iter().find(|t| t.n == n)?;
+        Some(lock(&task.state).status)
+    }
+
+    fn output_now(&self, n: u32, max: usize) -> Result<(ShellInfo, String), String> {
         let inner = lock(&self.0);
         let task = inner
             .tasks
@@ -334,7 +373,10 @@ impl ShellTasks {
 
 // ---- the `task` tool ----
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","output","stop"]},"id":{"type":["string","integer"],"description":"The id shown by list: s1 for a command, a1 for a subagent. For output and stop"}},"required":["action"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","output","stop"]},"id":{"type":["string","integer"],"description":"The id shown by list: s1 for a command, a1 for a subagent. For output and stop"},"wait":{"type":"integer","description":"Seconds to wait for the task to finish before reading its output. Default 0, at most 300"}},"required":["action"]}"#;
+
+/// The longest `task output` waits for a task to finish.
+const MAX_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -347,14 +389,18 @@ enum RawId {
 struct Args {
     action: String,
     id: Option<RawId>,
+    #[serde(default)]
+    wait: Option<u64>,
 }
 
 /// What a `task` call asks for. The id is `('s', n)` for a command, `('a', n)` for a subagent, and
-/// `('?', n)` for a bare number (a command, as before subagents could be reached).
+/// `('?', n)` for a bare number (a command, as before subagents could be reached). `wait` is how
+/// long `output` waits for the task to finish first.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TaskCall {
     pub action: String,
     pub id: Option<(char, u32)>,
+    pub wait: Duration,
 }
 
 /// `s2` or `a1` (a bare number, or `#3`, is also taken: its kind is `'?'`).
@@ -382,6 +428,16 @@ pub fn parse_task_call(arguments: &str) -> Result<TaskCall, String> {
     Ok(TaskCall {
         action: args.action,
         id,
+        wait: match args.wait {
+            None | Some(0) => Duration::ZERO,
+            Some(secs) if Duration::from_secs(secs) > MAX_WAIT => {
+                return Err(format!(
+                    "error: wait is at most {} seconds",
+                    MAX_WAIT.as_secs()
+                ));
+            }
+            Some(secs) => Duration::from_secs(secs),
+        },
     })
 }
 
@@ -425,7 +481,7 @@ impl TaskTool {
                     .join("\n"))
             }
             "output" => {
-                let (info, text) = self.shells.output(id()?, SHOWN_BYTES)?;
+                let (info, text) = self.shells.output_waiting(id()?, SHOWN_BYTES, call.wait)?;
                 let body = if text.trim().is_empty() {
                     "(no output yet)".to_owned()
                 } else {
@@ -598,6 +654,36 @@ mod tests {
             call(serde_json::json!({"action": "kill", "id": 1})).contains("list, output or stop")
         );
         assert!(call(serde_json::json!({"action": "stop", "id": 4})).contains("no task s4"));
+    }
+
+    #[test]
+    fn output_waits_when_asked_and_parses_the_wait_range() {
+        let dir = Scratch::new("shell-tool-wait");
+        let shells = ShellTasks::new();
+        let tool = TaskTool::new(shells.clone());
+        let call = |args: serde_json::Value| tool.run(&args.to_string());
+        let n = shells.start("sleep 1; echo done", dir.path()).unwrap();
+        let started = Instant::now();
+        let out = call(serde_json::json!({"action": "output", "id": n, "wait": 20}));
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(
+            out.starts_with(&format!("s{n}  exited 0")) && out.ends_with("done\n"),
+            "{out:?}"
+        );
+        // With no wait it reads at once, even while the command runs.
+        let m = shells.start("sleep 30", dir.path()).unwrap();
+        let quick = call(serde_json::json!({"action": "output", "id": m}));
+        assert!(quick.contains("running"), "{quick:?}");
+        assert!(
+            call(serde_json::json!({"action": "output", "id": m, "wait": 301}))
+                .contains("wait is at most 300 seconds")
+        );
+        let parsed = parse_task_call(r#"{"action":"output","id":"s2","wait":5}"#).unwrap();
+        assert_eq!(parsed.wait, Duration::from_secs(5));
+        // A wait past the limit gives up and reports what there is.
+        let started = Instant::now();
+        let partial = call(serde_json::json!({"action": "output", "id": n, "wait": 1}));
+        assert!(started.elapsed() < Duration::from_secs(10) && partial.contains("exited 0"));
     }
 
     #[test]

@@ -1,4 +1,6 @@
-//! Tools the model can call: `read_file`, `create_file`, `write_file`, `delete_file` and `bash`.
+//! Tools the model can call: `read_file`, the file tools (`create_file`, `write_file`, `edit_file`,
+//! `delete_file`), `bash`, `task`, `steps`, `write_note`, the glossary, the context entries and the
+//! owner's library and profiles.
 //!
 //! A tool takes the model's arguments as raw JSON text and returns text for the
 //! model. Every failure (bad arguments, missing file, timeout, denied) comes
@@ -6,13 +8,17 @@
 //! to the model.
 
 mod bash;
+mod child_env;
 mod commands;
 mod context;
 mod files;
 mod glossary;
 mod library;
+mod mcp;
+mod mcp_config;
 mod notes;
 mod read_file;
+mod search;
 mod steps;
 mod tasks;
 mod truncate;
@@ -26,14 +32,18 @@ use std::rc::Rc;
 
 use kernel::ToolSpec;
 
-pub use bash::{Bash, DEFAULT_TIMEOUT};
+pub use bash::{Bash, DEFAULT_TIMEOUT, kill_group};
+pub use child_env::{is_secret_name, scrub};
 pub use commands::{FREE_COMMANDS, always_for, is_free, is_looking};
 pub use context::{context_read_tool, context_tools, kinds_text};
 pub use files::{MAX_CONTENT_BYTES, file_tools};
 pub use glossary::{glossary_lookup_tool, glossary_tools};
 pub use library::library_tools;
+pub use mcp::{McpTool, mcp_tools};
+pub use mcp_config::mcp_config_tool;
 pub use notes::{MAX_NOTE_BYTES, NOTES_DIR, WriteNote};
 pub use read_file::ReadFile;
+pub use search::{Find, Grep, search_tools};
 pub use steps::{Step, StepStatus, StepsTool, parse_steps, unfinished};
 pub use tasks::{
     ShellInfo, ShellStatus, ShellTasks, TaskCall, TaskTool, clock, parse_task_call, task_id,
@@ -86,6 +96,7 @@ pub fn chat_tools(
     shells: ShellTasks,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFile::new(cwd))];
+    tools.extend(search_tools(cwd));
     tools.extend(file_tools(cwd, Rc::clone(&approval), Rc::clone(&approver)));
     tools.push(Box::new(
         Bash::new(
@@ -94,11 +105,14 @@ pub fn chat_tools(
             Box::new(SharedApprover(Rc::clone(&approver))),
         )
         .with_approval(Rc::clone(&approval))
-        .with_cancel(cancel)
+        .with_cancel(cancel.clone())
         .with_shells(shells.clone()),
     ));
     tools.push(Box::new(TaskTool::new(shells)));
     tools.push(Box::new(StepsTool::new()));
+    // A long result (a plan, a search, a review) goes in a note instead of the chat, where it can
+    // be read again by name.
+    tools.push(Box::new(WriteNote::new(cwd)));
     tools.extend(glossary_tools(
         db,
         cwd.display().to_string(),
@@ -110,6 +124,14 @@ pub fn chat_tools(
         cwd.display().to_string(),
         Rc::clone(&approver),
         Rc::clone(&approval),
+    ));
+    // The owner's MCP servers: the model may set them up, and the owner is asked for every change.
+    tools.push(mcp_config_tool(
+        db,
+        cwd,
+        Rc::clone(&approver),
+        Rc::clone(&approval),
+        cancel,
     ));
     tools.extend(library_tools(db, approver, approval));
     tools

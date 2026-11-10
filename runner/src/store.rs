@@ -22,7 +22,7 @@ use crate::providers::ProviderDef;
 use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, earlier_line};
 
 /// The schema version this program writes. It is kept in SQLite's `user_version`.
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// How long a write waits for another writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -209,6 +209,30 @@ CREATE TABLE IF NOT EXISTS context_entries (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE (project, name)
+) STRICT;
+";
+
+// Issue 44: the MCP servers the owner added and the rule of each of their tools. `args` is a JSON
+// array of strings and `env` a JSON object of NAME to value. A tool with no row in
+// `mcp_tool_rules` has the server's `default_rule`.
+const SCHEMA_V24: &str = "
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id           INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    command      TEXT NOT NULL,
+    args         TEXT NOT NULL DEFAULT '[]',
+    env          TEXT NOT NULL DEFAULT '{}',
+    timeout_secs INTEGER NOT NULL DEFAULT 60 CHECK (timeout_secs BETWEEN 1 AND 600),
+    enabled      INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    default_rule TEXT NOT NULL DEFAULT 'ask' CHECK (default_rule IN ('ask', 'free', 'off')),
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS mcp_tool_rules (
+    server_id INTEGER NOT NULL REFERENCES mcp_servers (id) ON DELETE CASCADE,
+    tool      TEXT NOT NULL,
+    rule      TEXT NOT NULL CHECK (rule IN ('ask', 'free', 'off')),
+    PRIMARY KEY (server_id, tool)
 ) STRICT;
 ";
 
@@ -1236,9 +1260,63 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(&format!(
             "BEGIN; UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
              WHERE name = '{}' AND text = '{}'; PRAGMA user_version = 20; COMMIT;",
-            p::BUILTIN_PROMPT.replace('\'', "''"),
+            p::BUILTIN_PROMPT_V20.replace('\'', "''"),
             p::BASE_NAME,
             p::BUILTIN_PROMPT_V17.replace('\'', "''"),
+        ))?;
+    }
+    if version < 21 {
+        // The base prompt says where skills live (the `library` tool, not .claude files). Only an
+        // unedited `base` changes.
+        use crate::store_prompts as p;
+        conn.execute_batch(&format!(
+            "BEGIN; UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{}' AND text = '{}'; PRAGMA user_version = 21; COMMIT;",
+            p::BUILTIN_PROMPT_V21.replace('\'', "''"),
+            p::BASE_NAME,
+            p::BUILTIN_PROMPT_V20.replace('\'', "''"),
+        ))?;
+    }
+    if version < 22 {
+        // The base prompt no longer states a call limit and asks the model to plan before it acts.
+        // Only an unedited `base` changes.
+        use crate::store_prompts as p;
+        conn.execute_batch(&format!(
+            "BEGIN; UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{}' AND text = '{}'; PRAGMA user_version = 22; COMMIT;",
+            p::BUILTIN_PROMPT.replace('\'', "''"),
+            p::BASE_NAME,
+            p::BUILTIN_PROMPT_V21.replace('\'', "''"),
+        ))?;
+    }
+    if version < 23 {
+        // The base prompt names `grep`, `find` and `write_note`, and the arguments `read_file`,
+        // `bash` and `task` gained. Only an unedited `base` (schema 22's text) changes.
+        use crate::store_prompts as p;
+        conn.execute_batch(&format!(
+            "BEGIN; UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{}' AND text = '{}'; PRAGMA user_version = 23; COMMIT;",
+            p::BUILTIN_PROMPT.replace('\'', "''"),
+            p::BASE_NAME,
+            p::BUILTIN_PROMPT_V22.replace('\'', "''"),
+        ))?;
+    }
+    if version < 24 {
+        // Issue 44: the MCP server tables.
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V24} PRAGMA user_version = 24; COMMIT;"
+        ))?;
+    }
+    if version < 25 {
+        // The base prompt asks for fewer round trips and names the file tools for reading. Only an
+        // unedited `base` (schema 23's text) changes.
+        use crate::store_prompts as p;
+        conn.execute_batch(&format!(
+            "BEGIN; UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{}' AND text = '{}'; PRAGMA user_version = 25; COMMIT;",
+            p::BUILTIN_PROMPT.replace('\'', "''"),
+            p::BASE_NAME,
+            p::BUILTIN_PROMPT_V23.replace('\'', "''"),
         ))?;
     }
     Ok(())

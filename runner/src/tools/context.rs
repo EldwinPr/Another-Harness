@@ -1,9 +1,10 @@
 //! `context` and `context_propose` (issue 37): the model reads the rules, decisions and shapes the
 //! owner has said, and can only add or change one by asking.
 //!
-//! `context` never asks. Its description lists the names of the entries there were when the
-//! program started, so it costs a few tokens per entry and nothing when there are none (then it is
-//! not offered). `context_propose` asks every time, in `manual` and in `auto` mode alike, never
+//! `context` never asks. Its description lists the entries there were when the tool was built, and
+//! each call lists them again, so an entry added while the program runs is found and named: it
+//! costs a few tokens per entry and nothing when there are none (then the tool is not offered).
+//! `context_propose` asks every time, in `manual` and in `auto` mode alike, never
 //! offers "always", and needs the owner's own words as a quote: no quote means the model is
 //! guessing, and a guess is not saved. Both use their own connection to the database.
 
@@ -23,8 +24,9 @@ const PROPOSE_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"s
 /// How much of a text the one-line question shows.
 const SHOWN_CHARS: usize = 70;
 
-/// The tools for the main chat: `context` (only when the project has entries) and
-/// `context_propose`.
+/// The tools for the main chat: `context` and `context_propose`. The reading tool is always
+/// offered, because an entry may be saved while the chat runs: its description cannot list names
+/// that do not exist yet, so a call with an unknown name lists them.
 pub fn context_tools(
     db: impl Into<PathBuf>,
     project: impl Into<String>,
@@ -32,10 +34,10 @@ pub fn context_tools(
     approval: SharedMode,
 ) -> Vec<Box<dyn Tool>> {
     let (db, project) = (db.into(), project.into());
-    let mut tools = Vec::new();
-    tools.extend(context_read_tool(db.clone(), project.clone()));
-    tools.push(Box::new(Propose::new(db, project, approver, approval)));
-    tools
+    vec![
+        dynamic_context_read_tool(db.clone(), project.clone()),
+        Box::new(Propose::new(db, project, approver, approval)),
+    ]
 }
 
 /// Only the reading tool, for a subagent (it cannot propose: nobody could confirm). `None` when
@@ -55,7 +57,21 @@ pub fn context_read_tool(
     if names.is_empty() {
         return None;
     }
-    Some(Box::new(Read::new(db, project, &names)))
+    let description = format!(
+        "Get what the owner has said about this project: rules, decisions and how its areas are thought of. Give the name of one entry; the text comes back as stored. Entries: {}.",
+        names.join(", ")
+    );
+    Some(Box::new(Read::new(db, project, &description)))
+}
+
+/// A chat's `context`: the description cannot list the entries, because one may be saved while the
+/// chat runs, so a call with an unknown name lists them. Always offered, and always a real tool.
+pub fn dynamic_context_read_tool(
+    db: impl Into<PathBuf>,
+    project: impl Into<String>,
+) -> Box<dyn Tool> {
+    let description = "Get what the owner has said about this project: rules, decisions and how its areas are thought of. Give the name of one entry with the `name` argument; the text comes back as stored, including the owner's own words (quote). To see the entry names, call it with an empty name: the error lists them, and a name typed with the wrong case is accepted. Entries saved during this chat are found the same way.";
+    Box::new(Read::new(db.into(), project.into(), description))
 }
 
 fn open(db: &Path) -> Result<Store, String> {
@@ -85,13 +101,10 @@ struct Read {
 }
 
 impl Read {
-    fn new(db: PathBuf, project: String, names: &[String]) -> Self {
-        let description = format!(
-            "Get what the owner has said about this project: rules, decisions and how its areas are thought of. Give the name of one entry; the text comes back as stored. Entries: {}.",
-            names.join(", ")
-        );
+    /// `description` is the whole description sent to the model.
+    fn new(db: PathBuf, project: String, description: &str) -> Self {
         Self {
-            spec: ToolSpec::new("context", &description, READ_SCHEMA)
+            spec: ToolSpec::new("context", description, READ_SCHEMA)
                 .expect("the schema constant is valid JSON"),
             db,
             project,
@@ -102,10 +115,25 @@ impl Read {
         let args: ReadArgs = serde_json::from_str(arguments)
             .map_err(|e| format!("error: invalid arguments: {e}"))?;
         let store = open(&self.db)?;
-        if let Some(entry) = store
-            .context_entry(&self.project, &args.name)
-            .map_err(|e| format!("error: {e}"))?
-        {
+        let wanted = args.name.trim().to_ascii_lowercase();
+        let entries = store
+            .list_context(&self.project)
+            .map_err(|e| format!("error: {e}"))?;
+        // The name typed with the wrong case is still that entry: the list is right here.
+        let found = if wanted.is_empty() {
+            None
+        } else {
+            store
+                .context_entry(&self.project, &args.name)
+                .map_err(|e| format!("error: {e}"))?
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .find(|e| e.name.to_ascii_lowercase() == wanted)
+                        .cloned()
+                })
+        };
+        if let Some(entry) = found {
             let area = if entry.area.is_empty() {
                 String::new()
             } else {
@@ -121,12 +149,7 @@ impl Read {
                 entry.name, entry.kind, entry.text
             ));
         }
-        let names: Vec<String> = store
-            .list_context(&self.project)
-            .map_err(|e| format!("error: {e}"))?
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
+        let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
         Err(format!(
             "error: no entry named '{}'; the entries are: {}",
             args.name.trim(),
@@ -328,25 +351,38 @@ mod tests {
     }
 
     #[test]
-    fn without_entries_only_propose_is_offered_and_with_entries_the_names_are_in_the_description() {
+    fn the_chat_tool_is_always_offered_and_finds_an_entry_saved_while_the_chat_runs() {
         let dir = Scratch::new("ctx-tools-offer");
         let db = dir.path().join("harness.db");
         let (a, _) = approver(&[Answer::Yes]);
         let tools = context_tools(&db, "/p", a, shared_mode(Mode::Manual));
         let names: Vec<&str> = tools.iter().map(|t| t.spec().name.as_str()).collect();
-        assert_eq!(names, ["context_propose"]);
+        // Offered even with no entries, so a proposal made in this chat can be read back.
+        assert_eq!(names, ["context", "context_propose"]);
+        // A subagent's tool is still only offered when there are entries.
         assert!(context_read_tool(&db, "/p").is_none());
+
+        assert_eq!(
+            call(&tools, "context", serde_json::json!({"name": ""})),
+            "error: no entry named ''; the entries are: "
+        );
 
         call(
             &tools,
             "context_propose",
             proposal("db-writes", "Use IMMEDIATE.", "always immediate"),
         );
+        let got = call(&tools, "context", serde_json::json!({"name": "db-writes"}));
+        assert_eq!(
+            got,
+            "db-writes (rule)\nUse IMMEDIATE.\nthe owner said: always immediate"
+        );
+
         let (a, _) = approver(&[]);
         let tools = context_tools(&db, "/p", a, shared_mode(Mode::Manual));
-        let names: Vec<&str> = tools.iter().map(|t| t.spec().name.as_str()).collect();
-        assert_eq!(names, ["context", "context_propose"]);
-        assert!(tools[0].spec().description.contains("Entries: db-writes."));
+        assert!(tools[0].spec().description.contains("the `name` argument"));
+        let subagent = context_read_tool(&db, "/p").unwrap();
+        assert!(subagent.spec().description.contains("Entries: db-writes."));
         // Another project does not see it.
         assert!(context_read_tool(&db, "/other").is_none());
     }
