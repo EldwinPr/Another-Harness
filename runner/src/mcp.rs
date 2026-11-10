@@ -31,7 +31,7 @@ use crate::store_mcp::{McpServer, Rule, rule_of};
 /// The protocol version this program asks for.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// The versions it accepts when the server answers with another one.
-const ACCEPTED_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"];
+pub(crate) const ACCEPTED_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"];
 /// How long a server gets to start, answer `initialize` and list all its tools.
 pub const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a server gets to exit by itself after its input is closed.

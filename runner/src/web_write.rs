@@ -4,8 +4,9 @@
 //! and token checks. Every rule about what a word or a prompt may be lives in the store (the same
 //! functions the terminal uses); this file only reads the form, calls the store and turns the
 //! result into a redirect (done), the form again with what was typed (refused), or a page saying
-//! the row changed or is gone. Nothing outside the prompts, glossary and profile tables (and the
-//! `profile` setting) is touched.
+//! the row changed or is gone. Nothing outside the prompts, glossary, context and profile tables, the
+//! inbox (`buffer_entries`: accept and reject, see `web_inbox.rs`) and the `profile` setting is
+//! touched.
 
 use crate::store::{Edit, Store};
 use crate::store_context::{ContextDraft, check_scope};
@@ -28,6 +29,8 @@ pub(crate) fn post(path: &str, form: &Form, ctx: &Ctx<'_>) -> Reply {
         "/context/add" => context_add(form, &mut store, ctx),
         "/context/edit" => context_edit(form, &mut store, ctx),
         "/context/delete" => context_delete(form, &mut store),
+        "/inbox/accept" => inbox_accept(form, &mut store, ctx),
+        "/inbox/reject" => inbox_reject(form, &mut store),
         "/prompt/add" => prompt_add(form, &mut store, ctx),
         "/prompt/edit" => prompt_edit(form, &mut store, ctx),
         "/prompt/delete" => prompt_delete(form, &mut store),
@@ -267,6 +270,76 @@ fn context_delete(form: &Form, store: &mut Store) -> Reply {
         Ok(Edit::Stale) => changed(&format!("/context/delete?id={id}"), "entry", ""),
         Ok(Edit::Gone) => gone(),
         Err(e) => failed(&e.to_string()),
+    }
+}
+
+/// Accept: applies the entry if the stored target is still the one the page showed (`expected`).
+fn inbox_accept(form: &Form, store: &mut Store, ctx: &Ctx<'_>) -> Reply {
+    use crate::store_buffer::{ApplyOutcome, apply_entry};
+    let Some(id) = id_of(form) else {
+        return bad_form();
+    };
+    let expected = form.get("expected");
+    let expected = (!expected.is_empty()).then_some(expected);
+    let again = |store: &Store, status: u16, why: &str| match crate::web_inbox::show_page(
+        store,
+        id,
+        &view_with(ctx, why),
+    ) {
+        Ok(Some(page)) => Reply::page(status, page),
+        Ok(None) => gone(),
+        Err(e) => failed(&e),
+    };
+    match apply_entry(store, id, expected) {
+        Ok(ApplyOutcome::Applied(text)) => Reply::page(200, crate::web_inbox::accepted(id, &text)),
+        Ok(ApplyOutcome::NoChange) => Reply::page(
+            200,
+            crate::web_inbox::accepted(
+                id,
+                "Nothing to change: it is stored already. The entry is marked applied.",
+            ),
+        ),
+        Ok(ApplyOutcome::Stale) => again(
+            store,
+            409,
+            "The stored item changed while you were reading; check it again. Nothing was changed.",
+        ),
+        Ok(ApplyOutcome::Failed(why)) => {
+            let (status, why) = explain(&why);
+            again(store, status, &why)
+        }
+        Err(e) => {
+            let (status, why) = explain(&e.to_string());
+            if why.starts_with("there is no submission") {
+                gone()
+            } else {
+                Reply::page(status, web_pages::error(&why))
+            }
+        }
+    }
+}
+
+/// Reject: marks the entry rejected, with the owner's note. Touches no stored context, word or prompt.
+fn inbox_reject(form: &Form, store: &mut Store) -> Reply {
+    let Some(id) = id_of(form) else {
+        return bad_form();
+    };
+    let note = match crate::inbox_view::check_note(form.get("note")) {
+        Ok(note) => note,
+        Err(why) => return Reply::page(400, web_pages::error(&why)),
+    };
+    match crate::store_buffer::reject(store, id, &note) {
+        Ok(()) => Reply::redirect("/inbox?ok=rejected"),
+        Err(e) => {
+            let (status, why) = explain(&e.to_string());
+            if why.starts_with("there is no submission") {
+                gone()
+            } else if why.ends_with("already") {
+                Reply::page(409, web_pages::error(&why))
+            } else {
+                Reply::page(status, web_pages::error(&why))
+            }
+        }
     }
 }
 

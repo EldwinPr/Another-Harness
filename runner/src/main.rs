@@ -4,6 +4,13 @@
 //! ```text
 //! cd src && ./chat.sh                 # starts on the provider used last, or on none
 //! cd src && ./chat.sh --resume        # continue the most recent saved chat
+//! cd src && ./chat.sh --mcp-serve     # no chat: an MCP server on stdin/stdout: reads, and submit to the owner's inbox (issues 45, 47)
+//! cd src && ./chat.sh --mcp-serve --read-only   # the same, with the read tools alone (issue 47)
+//! cd src && ./chat.sh --mcp-serve --direct   # the same, with tools that write instead of submit (issue 46)
+//! cd src && ./chat.sh --mcp-serve --decider llm:PROVIDER[:MODEL]   # a model suggests accept/reject for each submission (issue 48)
+//! cd src && ./chat.sh --mcp-serve --decider jev[:PROVIDER[:MODEL]]   # the same with OpenRouter's Jev decisions model (issue 49)
+//! cd src && ./chat.sh --eval-decider llm:PROVIDER[:MODEL]   # run the labelled cases through a model, write nothing (issue 48)
+//! cd src && ./chat.sh --eval-decider jev[:PROVIDER[:MODEL]]   # the same through Jev (issue 49)
 //! ```
 //!
 //! Without `chat.sh`, `HARNESS_BASE_URL` and `HARNESS_MODEL` start the chat on that provider
@@ -26,20 +33,16 @@
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::time::Duration;
 
 use runner::agent::{Agent, StoreContext};
-use runner::config::{self, ApiStyle, Options, Settings};
-use runner::provider::{HttpProvider, NoProvider, Provider, router_host};
-use runner::providers::Catalog;
+use runner::config::{self, ApiStyle, DeciderSpec, Options, Settings};
+use runner::provider::{HttpProvider, NoProvider, Provider, REQUEST_TIMEOUT, router_host};
+use runner::providers::{Catalog, ProviderDef};
 use runner::repl::{self, Terminal, TerminalApprover};
 use runner::store::Store;
 use runner::style::Style;
 use runner::tools::{Mode, Tool, shared_mode};
 use runner::turn_log::TurnLog;
-
-/// How long to wait for the router to answer one call.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The name to show for a provider given through the environment (default: the router's host).
 const ENV_PROVIDER: &str = "HARNESS_PROVIDER";
@@ -49,6 +52,38 @@ const ENV_PROVIDER_DIR: &str = "HARNESS_PROVIDER_DIR";
 
 /// The database file, inside the log directory.
 const DB_FILE: &str = "harness.db";
+
+/// A provider object for a saved provider: the one place that knows which API a `ProviderDef`
+/// speaks. The chat's catalog and the deciders (issue 48) both build through it.
+fn build_provider(def: &ProviderDef) -> Box<dyn Provider> {
+    match def.api {
+        ApiStyle::OpenAi => Box::new(HttpProvider::new(
+            &def.base_url,
+            def.api_key.as_deref(),
+            REQUEST_TIMEOUT,
+        )),
+        ApiStyle::Anthropic => Box::new(runner::anthropic::AnthropicProvider::new(
+            &def.base_url,
+            def.api_key.as_deref(),
+            REQUEST_TIMEOUT,
+        )),
+    }
+}
+
+/// The decider a spec names, built against the providers saved in the database (issue 48). Reads
+/// the database and writes nothing. The error is the reason, and never holds a key.
+fn decider_for(
+    db: &std::path::Path,
+    spec: &DeciderSpec,
+) -> Result<Option<Box<dyn runner::decider::Decider>>, String> {
+    let store = Store::open_read_only(db).map_err(|e| {
+        format!(
+            "cannot read {}: {e} (start the chat once to create it, or set HARNESS_LOG_DIR)",
+            db.display()
+        )
+    })?;
+    runner::decider::resolve(spec, &store, &build_provider)
+}
 
 fn main() -> ExitCode {
     let options = match Options::from_args(std::env::args().skip(1)) {
@@ -70,6 +105,74 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `--eval-decider` runs the labelled cases through a decider and prints how it did (issue 48).
+    // It reads the saved providers and writes nothing, not even to the database.
+    if let Some(spec) = &options.eval_decider {
+        let outcome = decider_for(&log_dir.join(DB_FILE), spec).and_then(|decider| {
+            let decider = decider.ok_or("there is no decider to measure")?;
+            let report = runner::decider_cases::run(decider.as_ref(), &mut io::stdout().lock())
+                .map_err(|e| format!("cannot print the report: {e}"))?;
+            // A run in which calls failed judged less than it says: the exit code tells a script.
+            match report.summary().failures {
+                0 => Ok(()),
+                failed => Err(format!(
+                    "{failed} of the calls failed, so this run is incomplete"
+                )),
+            }
+        });
+        return match outcome {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("error: {why}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // `--mcp-serve` answers another harness over standard input and output and starts no chat and
+    // needs no provider (issue 45). By default it reads and queues submissions for the owner
+    // (issue 47); `--read-only` reads alone and `--direct` offers the write tools (issue 46). The
+    // project is the folder it was started in.
+    if options.mcp_serve {
+        let project = std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        let mode = if options.read_only {
+            runner::mcp_serve::Mode::ReadOnly
+        } else if options.direct {
+            runner::mcp_serve::Mode::Direct
+        } else {
+            runner::mcp_serve::Mode::Buffer
+        };
+        let db_path = log_dir.join(DB_FILE);
+        // A decider that cannot be built (an unknown provider, no key) stops the start here.
+        let decider = match options
+            .decider
+            .as_ref()
+            .filter(|s| **s != DeciderSpec::None)
+        {
+            None => None,
+            Some(spec) => match decider_for(&db_path, spec) {
+                Ok(decider) => decider,
+                Err(why) => {
+                    eprintln!("error: --decider: {why}");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+        if let Some(decider) = &decider {
+            eprintln!(
+                "decider: {} suggests accept or reject for each submission; the owner still decides",
+                decider.name()
+            );
+        }
+        return match runner::mcp_serve::run(&db_path, &project, mode, decider) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("error: {why}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // `--serve` shows the lists in a browser and starts no chat (issue 28).
     if let Some(port) = options.serve {
         let db_path = log_dir.join(DB_FILE);
@@ -156,26 +259,12 @@ fn start(
     mcp.notes.splice(0..0, added);
     tools.extend(runner::tools::mcp_tools(&mcp, &approval, &approver));
     term.borrow_mut().set_mcp(mcp.clients());
-    let build = |def: &runner::providers::ProviderDef| -> Box<dyn Provider> {
-        match def.api {
-            ApiStyle::OpenAi => Box::new(HttpProvider::new(
-                &def.base_url,
-                def.api_key.as_deref(),
-                REQUEST_TIMEOUT,
-            )),
-            ApiStyle::Anthropic => Box::new(runner::anthropic::AnthropicProvider::new(
-                &def.base_url,
-                def.api_key.as_deref(),
-                REQUEST_TIMEOUT,
-            )),
-        }
-    };
     let catalog = Catalog {
         provider_dir: std::env::var(ENV_PROVIDER_DIR)
             .ok()
             .filter(|dir| !dir.trim().is_empty())
             .map(std::path::PathBuf::from),
-        build: Box::new(build),
+        build: Box::new(build_provider),
     };
     let store_context = StoreContext {
         cwd: cwd.display().to_string(),
@@ -191,7 +280,7 @@ fn start(
                 .unwrap_or_default();
             Agent::new(
                 settings.model.clone(),
-                build(&runner::providers::ProviderDef {
+                build_provider(&ProviderDef {
                     name: name.clone(),
                     base_url: settings.base_url.clone(),
                     model: settings.model.clone(),

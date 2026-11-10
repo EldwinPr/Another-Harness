@@ -1,7 +1,7 @@
 # Another Harness
 
 **You Only Prompt Once.** A modular prompt system for building your own coding agent, in a
-terminal, in about 45,000 lines of Rust and five dependencies.
+terminal, in about 60,000 lines of Rust (a good part of it tests) and five dependencies.
 
 Most agent harnesses are a prompt you cannot see, wrapped around a loop you cannot change. This one
 is the other way round. The agent is **assembled from parts you own**: system prompts, skills,
@@ -14,7 +14,7 @@ profile to a subagent. Ask the model to improve it. Edit it in a browser. Nothin
 binary except one default prompt, and that one is a row in the database like the rest.
 
 > **Status: early, and one person's tool.** It is used daily by its author against OpenRouter and
-> the Anthropic Messages API, and has a large test suite (770+ tests, none touch the network), but
+> the Anthropic Messages API, and has a large test suite (1,000+ tests, none touch the network), but
 > few other people have run it. Expect rough edges, and read the [limits](#limits) before you point
 > it at anything you care about.
 
@@ -127,7 +127,9 @@ flowchart TB
 | `runner/src/provider.rs`, `anthropic.rs` | One chat-completions style (OpenRouter and compatible routers) and the Anthropic Messages API, with prompt-cache markers where the provider wants them. |
 | `runner/src/jobs.rs`, `subagent.rs`, `tools/tasks.rs` | Background subagents and background shell commands. |
 | `runner/src/repl.rs`, `inputbox.rs`, `markdown.rs`, `lineedit.rs` | The terminal: boxed input, live status, menus, and Markdown rendering (headings, code, tables, lists, links). |
-| `runner/src/web*.rs` | A small localhost-only server for editing the library in a browser. |
+| `runner/src/web*.rs` | A small localhost-only server for editing the library in a browser, and for reviewing the inbox. |
+| `runner/src/mcp.rs`, `mcp_serve*`, `store_buffer*` | The MCP client (this chat uses other servers' tools) and the MCP server (other harnesses use this store): read-only, buffer and direct modes, and the inbox table. |
+| `runner/src/decider*.rs`, `jev.rs` | The optional models that suggest an answer for an inbox entry, and the labelled cases that measure them. |
 
 ## What the agent can do
 
@@ -167,6 +169,40 @@ Three bad calls in a row add a note telling the model to stop and ask you; five 
 glossary words and context entries for you to accept one at a time. Context entries marked as
 preloaded start every subagent with them.
 
+## Other harnesses can use it as a store (MCP)
+
+The same database can be served to another harness (Claude Code, opencode, anything that speaks MCP
+over standard input and output), so your prompts, glossary and context are not locked inside this
+chat. `--mcp-serve` starts no chat and needs no provider; the folder it starts in is the project.
+
+| Command | What the other harness can do |
+|---|---|
+| `--mcp-serve` | **Buffer mode (the default).** Read the library, glossary, context and profiles, and `submit` a proposed entry. Nothing changes until you accept it. |
+| `--mcp-serve --read-only` | Read only. |
+| `--mcp-serve --direct` | Read, and write straight into the store (no review; back the database up first). |
+
+In buffer mode a `submit` lands in an **inbox**. You open it on the web page (`/inbox`) or in the chat
+(`/inbox`, `/inbox show N`, `/inbox accept N`, `/inbox reject N [note]`), see it next to what is stored
+now, and accept or reject it. Applying is plain code with no model in it; rows are kept, so the inbox
+is also the record of who proposed what. What the sender calls itself is a claim, not an identity, and
+text with control or invisible characters is refused.
+
+A **decider** can suggest an answer for each entry, never decide it:
+
+```bash
+claude mcp add aharness -- /path/to/src/target/debug/runner --mcp-serve --decider llm:openrouter
+```
+
+`--decider` is `none` (the default), `llm[:PROVIDER[:MODEL]]` (any saved provider) or
+`jev[:PROVIDER[:MODEL]]` (OpenRouter's Jev decision model). The suggestion is stored once and shown
+next to the entry; it is never shown to the sender and never applied. A decider sends the entry's text
+to its provider and costs tokens, which is why it is off unless you ask. `--eval-decider SPEC` runs 18
+labelled cases through a decider and prints how it did, so a model is measured before it is trusted.
+Jev's API is an alpha; see `context/index/decisions/` (11 to 15) for the reasons behind each choice.
+
+The other direction works too: `/mcp add NAME COMMAND` lets this chat use another MCP server's tools,
+each tool set to ask, run free or be off.
+
 ## Everything is recorded
 
 - **SQLite is the record.** Every message verbatim, and for every model call: the SHA-256 and size
@@ -178,7 +214,8 @@ preloaded start every subagent with them.
   model summarise a chat and continue in a new one, and does it for you before a message once the
   last request passed 80,000 prompt tokens. The old chat stays saved.
 - **Provider and model are runtime choices.** `/provider`, `/model` and `/models` switch with the
-  next message. Providers are saved in the database; their keys are asked for once.
+  next message, and the model you pick is the one the next start uses. Providers are saved in the
+  database; their keys are asked for once.
 
 ## Quick start
 
@@ -211,8 +248,8 @@ your project. The only thing the harness may add to a repository is `.Aharness/`
 itself.
 
 The command list is `/help`. The ones you will use most: `/model`, `/provider`, `/skills`,
-`/personality`, `/profile`, `/prompts`, `/glossary`, `/context`, `/approve`, `/plan`, `/subagent`,
-`/tasks`, `/compact`, `/resume`, `/web`, `/tools`, `/calls`. Type `@` in a message to attach a file,
+`/personality`, `/profile`, `/prompts`, `/glossary`, `/context`, `/inbox`, `/mcp`, `/approve`,
+`/plan`, `/subagent`, `/tasks`, `/compact`, `/resume`, `/web`, `/tools`, `/calls`. Type `@` in a message to attach a file,
 or `@dir/` to attach a folder listing.
 
 ## Limits
@@ -223,8 +260,12 @@ Being clear about these is the point of a barebones harness.
   command that asks and is approved can reach the rest of the machine. Approve with your eyes open.
 - **One model call at a time.** The loop is sequential on purpose. Only subagents and background
   commands run beside it.
-- **No MCP, no plugins, no network tool.** Extending the agent means writing prompts and skills,
-  not adding servers. That is the design, not an omission.
+- **No plugins and no network tool.** Extending the agent means writing prompts and skills. MCP is
+  there for two jobs only: using another server's tools (each one set by you) and serving this store
+  to other harnesses, where anything they write waits in an inbox for you.
+- **A decider can be wrong.** It only suggests, and it is a model reading outside text. On the
+  author's 18 labelled cases neither the LLM nor Jev wrongly accepted anything, but 18 cases is a
+  small test; read the entry yourself.
 - **Caching depends on the provider.** The request prefix is stable, but whether a router honours it
   is up to the router. The calls table records cache reads and writes so you can check.
 - **Early software.** The author's own use is the main test. File an issue if something breaks.

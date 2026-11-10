@@ -234,11 +234,7 @@ fn is_anthropic_itself(base_url: &str) -> bool {
 
 impl AnthropicProvider {
     pub fn new(base_url: &str, api_key: Option<&str>, timeout: Duration) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(timeout))
-            .build()
-            .into();
+        let agent = crate::provider::http_agent(timeout);
         let base = base_url.trim_end_matches('/');
         Self {
             endpoint: format!("{base}/messages"),

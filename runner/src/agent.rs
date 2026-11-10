@@ -275,6 +275,11 @@ pub const WAKE_TEXT: &str = "A subagent you started has finished; its answer is 
 
 pub const PERSONALITY_WARNING: &str = "changing the personality in the middle of a chat can be troublesome: earlier replies keep the old style and the model may keep following them. /new starts a clean chat.";
 
+/// The setting that holds the model last picked with `/model` on one provider file.
+fn last_model_key(provider: &str) -> String {
+    format!("last_model.{provider}")
+}
+
 impl Agent {
     pub fn new(
         model: impl Into<String>,
@@ -1544,7 +1549,59 @@ impl Agent {
             ));
         }
         self.config.model = model.to_owned();
+        // The pick carries over to the next start: it becomes the saved provider's default (the
+        // decider and the model lists read that too) and is remembered for any provider.
+        if let Some(why) = self.remember_model(model) {
+            warnings.push(why);
+        }
         Ok(warnings)
+    }
+
+    /// Remembers `model` as the one last picked on the current provider, for the next start. A
+    /// saved provider keeps it as its default model (the one row the chat, the lists and the
+    /// decider all read); a provider file has no row, so the pick goes into a setting. A failure is
+    /// returned as a warning, not an error: the switch itself has worked.
+    fn remember_model(&mut self, model: &str) -> Option<String> {
+        let name = self.target.name.clone();
+        if name.is_empty() {
+            return None;
+        }
+        let saved = self.is_saved_provider(&name);
+        let stored = self.stored.as_mut()?;
+        if saved {
+            return stored
+                .store
+                .set_default_model(&name, model)
+                .err()
+                .map(|e| format!("could not save the default model: {e}"));
+        }
+        stored
+            .store
+            .set_setting(&last_model_key(&name), model)
+            .err()
+            .map(|e| format!("could not remember this model for next time: {e}"))
+    }
+
+    fn is_saved_provider(&self, name: &str) -> bool {
+        self.stored
+            .as_ref()
+            .and_then(|s| s.store.list_providers().ok())
+            .is_some_and(|all| all.iter().any(|p| p.name == name))
+    }
+
+    /// The model last picked with `/model` on this provider file, if there is one. A saved
+    /// provider has none: its default model is the pick.
+    fn last_model_of(&self, name: &str) -> Option<String> {
+        if self.is_saved_provider(name) {
+            return None;
+        }
+        let model = self
+            .stored
+            .as_ref()?
+            .store
+            .setting(&last_model_key(name))
+            .ok()??;
+        providers::check_model(&model).ok().map(|()| model)
     }
 
     /// Switches to a provider file or saved provider by name, taking its model and pinning too. History
@@ -1571,6 +1628,8 @@ impl Agent {
         if let Some(model) = model {
             providers::check_model(model)?;
             def.model = model.to_owned();
+        } else if let Some(last) = self.last_model_of(name) {
+            def.model = last;
         }
         let mut warnings = if self.ready() {
             vec![COLD_CACHE.to_owned()]
@@ -1630,7 +1689,12 @@ impl Agent {
             .find(|l| l.name == name)?
             .def
         {
-            Ok(def) => def,
+            Ok(mut def) => {
+                if let Some(last) = self.last_model_of(&name) {
+                    def.model = last;
+                }
+                def
+            }
             Err(why) => {
                 return Some(format!(
                     "note: the provider you used last, {name}, cannot be used: {why}"
@@ -3873,6 +3937,75 @@ mod tests {
         assert_eq!(again.target().name, "two");
         assert_eq!(again.model(), "m2");
         assert_eq!(built.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_model_last_picked_with_model_is_the_one_a_new_start_uses() {
+        let dir = Scratch::new("agent-remembered-model");
+        write_provider_file(
+            &dir,
+            "one",
+            "HARNESS_BASE_URL=http://one/v1\nHARNESS_MODEL=m1\n",
+        );
+        let (mut agent, _) = unconfigured_agent(&dir);
+        agent.switch_provider("one").unwrap();
+        agent.switch_model("picked").unwrap();
+        agent.switch_model("picked-later").unwrap();
+        drop(agent);
+
+        let (mut again, _) = unconfigured_agent(&dir);
+        assert_eq!(again.use_remembered_provider(), None);
+        assert_eq!(again.target().name, "one");
+        assert_eq!(
+            again.model(),
+            "picked-later",
+            "the last pick, not the file's"
+        );
+        // Switching away and back keeps it too.
+        again.switch_provider("one").unwrap();
+        assert_eq!(again.model(), "picked-later");
+        // A model given on purpose still wins.
+        again.switch_provider_with("one", Some("explicit")).unwrap();
+        assert_eq!(again.model(), "explicit");
+    }
+
+    #[test]
+    fn a_model_picked_on_a_saved_provider_becomes_its_default() {
+        let dir = Scratch::new("agent-model-default");
+        let (mut agent, _, _) = switching_agent(&dir, vec![]);
+        agent.add_provider(saved("alpha", None)).unwrap();
+        agent.switch_provider("alpha").unwrap();
+        agent.switch_model("other").unwrap();
+        drop(agent);
+
+        let stored = peek(&dir).list_providers().unwrap();
+        let alpha = stored.iter().find(|p| p.name == "alpha").unwrap();
+        assert_eq!(alpha.model, "other", "what the decider and the lists read");
+        let (mut again, _) = unconfigured_agent(&dir);
+        assert_eq!(again.use_remembered_provider(), None);
+        assert_eq!(again.model(), "other");
+    }
+
+    #[test]
+    fn a_default_model_edited_after_a_model_pick_wins_on_a_saved_provider() {
+        let dir = Scratch::new("agent-model-edit");
+        let (mut agent, _, _) = switching_agent(&dir, vec![]);
+        agent.add_provider(saved("alpha", None)).unwrap();
+        agent.switch_provider("alpha").unwrap();
+        agent.switch_model("picked").unwrap();
+        let mut def = agent.provider_def("alpha").unwrap();
+        assert_eq!(def.model, "picked");
+        def.model = "edited".to_owned();
+        agent.edit_provider("alpha", def).unwrap();
+        drop(agent);
+
+        let (mut again, _) = unconfigured_agent(&dir);
+        assert_eq!(again.use_remembered_provider(), None);
+        assert_eq!(again.model(), "edited", "the edit, not the older pick");
+        assert!(
+            peek(&dir).setting("last_model.alpha").unwrap().is_none(),
+            "a saved provider keeps no separate pick"
+        );
     }
 
     #[test]

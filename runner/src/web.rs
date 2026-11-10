@@ -46,7 +46,7 @@ const MAX_FIELDS: usize = 400;
 /// How often the thread looks at its stop flag when nobody is connecting.
 const POLL: Duration = Duration::from_millis(50);
 
-const READ_ROUTES: [&str; 20] = [
+const READ_ROUTES: [&str; 22] = [
     "/",
     "/profiles",
     "/profile/edit",
@@ -63,12 +63,14 @@ const READ_ROUTES: [&str; 20] = [
     "/context",
     "/context/edit",
     "/context/delete",
+    "/inbox",
+    "/inbox/show",
     "/tools",
     "/help",
     "/prompt/edit",
     "/prompt/delete",
 ];
-const WRITE_ROUTES: [&str; 16] = [
+const WRITE_ROUTES: [&str; 18] = [
     "/profile/add",
     "/profile/edit",
     "/profile/delete",
@@ -85,6 +87,8 @@ const WRITE_ROUTES: [&str; 16] = [
     "/prompt/delete",
     "/prompt/enable",
     "/prompt/move",
+    "/inbox/accept",
+    "/inbox/reject",
 ];
 
 /// What answering a request needs: the server's port and token, and how to read and to write the
@@ -677,6 +681,34 @@ fn get(h: &Head<'_>, ctx: &Ctx<'_>) -> Reply {
                     web_pages::context_delete(e, &view)
                 },
             ))
+        }),
+        "/inbox" => with_db(ctx, |store| {
+            let pending = store.list_pending().map_err(|e| e.to_string())?;
+            let decided = store
+                .list_decided(crate::web_inbox::DECIDED_SHOWN)
+                .map_err(|e| e.to_string())?;
+            let suggestions = store
+                .suggestions_for(pending.iter().chain(&decided).map(|e| e.id))
+                .map_err(|e| e.to_string())?;
+            Ok(Reply::page(
+                200,
+                crate::web_inbox::list(
+                    &pending,
+                    &decided,
+                    &suggestions,
+                    crate::store::now_secs(),
+                    &view,
+                ),
+            ))
+        }),
+        "/inbox/show" => with_db(ctx, |store| {
+            let Some(id) = id_of(h.query) else {
+                return Ok(Reply::page(404, web_pages::not_found()));
+            };
+            Ok(match crate::web_inbox::show_page(store, id, &view)? {
+                Some(page) => Reply::page(200, page),
+                None => Reply::page(404, web_pages::not_found()),
+            })
         }),
         "/prompt/edit" => match prompt() {
             Some(p) => {
@@ -2542,5 +2574,762 @@ mod tests {
         }
         // The home page says how much today's use is, and works with no database to ask.
         assert!(get("/").contains("Usage"));
+    }
+
+    // ---- the Inbox (issue 47) ----
+
+    use crate::store_buffer::{Checked, Status, Submission, Submitted};
+
+    fn submission(kind: &str, action: &str, name: &str, text: &str) -> Submission {
+        Submission {
+            kind: kind.to_owned(),
+            action: action.to_owned(),
+            name: name.to_owned(),
+            text: text.to_owned(),
+            context_kind: if kind == "context" && action == "set" {
+                "rule".to_owned()
+            } else {
+                String::new()
+            },
+            ..Submission::default()
+        }
+    }
+
+    /// Queues a submission as another harness would; the row's id.
+    fn queue(db: &Path, sub: &Submission, why: &str, source: &str) -> i64 {
+        let checked = Checked::new(sub, why, source).unwrap();
+        match Store::open(db).unwrap().queue_submission(&checked).unwrap() {
+            Submitted::Queued(id) => id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn entry(db: &Path, id: i64) -> crate::store_buffer::BufferEntry {
+        Store::open_read_only(db)
+            .unwrap()
+            .buffer_entry(id)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The value of the hidden field `name` in the first form that has it.
+    fn hidden_value(page: &str, name: &str) -> String {
+        page.split(&format!("name=\"{name}\" value=\""))
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap()
+            .to_owned()
+    }
+
+    /// Everything the stored context, words, prompts and profiles hold, as one text.
+    fn curated(db: &Path) -> String {
+        let store = Store::open_read_only(db).unwrap();
+        format!(
+            "{:?}{:?}{:?}{:?}",
+            store.list_all_context().unwrap(),
+            store.list_all_glossary().unwrap(),
+            store.list_prompts().unwrap(),
+            store.list_profiles().unwrap()
+        )
+    }
+
+    #[test]
+    fn the_inbox_page_is_in_the_menu_and_says_so_when_nothing_waits() {
+        let (_dir, db) = seeded("web-inbox-empty");
+        let page = get_db(&db, "/inbox");
+        assert_eq!(status(&page), "HTTP/1.1 200 OK");
+        assert!(page.contains("Nothing is waiting."), "{page}");
+        assert!(page.contains("Nothing has been decided yet."));
+        assert!(page.contains("<a href=\"/inbox\" aria-current=\"page\">Inbox</a>"));
+        // Every other page links to it too.
+        assert!(get_db(&db, "/context").contains("<a href=\"/inbox\">Inbox</a>"));
+        assert_eq!(
+            status(&get_db(&db, "/inbox/show?id=1")),
+            "HTTP/1.1 404 Not Found"
+        );
+        for path in ["/inbox/show", "/inbox/show?id=abc"] {
+            assert_eq!(status(&get_db(&db, path)), "HTTP/1.1 404 Not Found");
+        }
+        // The help page lists the chat command.
+        assert!(get_db(&db, "/help").contains("/inbox"));
+    }
+
+    #[test]
+    fn the_inbox_lists_what_waits_oldest_first_with_source_why_and_age() {
+        let (_dir, db) = seeded("web-inbox-list");
+        let first = queue(
+            &db,
+            &submission("glossary", "set", "sku", "a stock unit"),
+            "the docs use it",
+            "claude-code",
+        );
+        let second = queue(
+            &db,
+            &submission("context", "delete", "old-rule", ""),
+            "it is outdated",
+            "codex",
+        );
+        let page = get_db(&db, "/inbox");
+        assert!(page.contains("2 waiting."), "{page}");
+        let (a, b) = (
+            page.find(&format!("/inbox/show?id={first}")).unwrap(),
+            page.find(&format!("/inbox/show?id={second}")).unwrap(),
+        );
+        assert!(a < b, "oldest first");
+        for text in [
+            "glossary set",
+            "context delete",
+            "claude-code",
+            "codex",
+            "the docs use it",
+            "it is outdated",
+            "just now",
+            "every project",
+        ] {
+            assert!(page.contains(text), "{text}");
+        }
+        assert!(page.contains("Nothing has been decided yet."));
+    }
+
+    #[test]
+    fn a_submission_is_shown_next_to_the_stored_item_with_a_line_diff() {
+        let (_dir, db) = seeded("web-inbox-show");
+        Store::open(&db)
+            .unwrap()
+            .set_context("", "style", "rule", "one\ntwo\nthree", "plain please", None)
+            .unwrap();
+        let mut sub = submission("context", "set", "style", "one\n2\nthree");
+        sub.quote = "newer words".to_owned();
+        let id = queue(&db, &sub, "clearer", "claude-code");
+        let page = get_db(&db, &format!("/inbox/show?id={id}"));
+        assert_eq!(status(&page), "HTTP/1.1 200 OK");
+        for text in [
+            "What the sender says about itself (not checked)",
+            "claude-code",
+            "clearer",
+            "plain please",
+            "newer words",
+            "Accepting replaces the stored item",
+            "<span>  one</span>",
+            "<span class=\"del\">- two</span>",
+            "<span class=\"add\">+ 2</span>",
+            "<span>  three</span>",
+            "action=\"/inbox/accept\"",
+            "action=\"/inbox/reject\"",
+        ] {
+            assert!(page.contains(text), "{text}: {page}");
+        }
+        assert!(!page.contains("This system prompt is on"));
+        let stamp = hidden_value(&page, "expected");
+        let stored = Store::open_read_only(&db)
+            .unwrap()
+            .list_all_context()
+            .unwrap()
+            .remove(0);
+        assert_eq!(stamp, stored.fingerprint());
+
+        // A new item: nothing stored, the whole text is added; a library item says it starts off.
+        let new = queue(
+            &db,
+            &submission("skill", "set", "tidy", "Tidy up.\nThen stop."),
+            "useful",
+            "claude-code",
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={new}"));
+        assert!(page.contains("accepting adds it"), "{page}");
+        assert!(page.contains("A new skill is saved switched off."));
+        assert!(page.contains("<span class=\"add\">+ Tidy up.</span>"));
+        assert_eq!(hidden_value(&page, "expected"), "");
+
+        // A delete shows what would go.
+        let gone = queue(
+            &db,
+            &submission("context", "delete", "style", ""),
+            "obsolete",
+            "codex",
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={gone}"));
+        assert!(page.contains("Accepting deletes this"), "{page}");
+        assert!(page.contains("one\n2") || page.contains("one\ntwo\nthree"));
+        assert!(page.contains("plain please"));
+        // A delete of nothing says so.
+        let nothing = queue(
+            &db,
+            &submission("glossary", "delete", "nothing-here", ""),
+            "x",
+            "codex",
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={nothing}"));
+        assert!(page.contains("there is nothing to delete"), "{page}");
+    }
+
+    #[test]
+    fn accepting_applies_it_shows_the_outcome_and_the_trail_keeps_the_row() {
+        let (_dir, db) = seeded("web-inbox-accept");
+        let id = queue(
+            &db,
+            &submission("context", "set", "no-input-edits", "Never edit input/."),
+            "the owner said so",
+            "claude-code",
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={id}"));
+        let expected = hidden_value(&page, "expected");
+        assert_eq!(expected, "");
+        let id_text = id.to_string();
+        let done = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &id_text), ("expected", &expected)],
+        );
+        assert_eq!(status(&done), "HTTP/1.1 200 OK");
+        assert!(done.contains("added context entry"), "{done}");
+        let stored = Store::open_read_only(&db)
+            .unwrap()
+            .list_all_context()
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].text, "Never edit input/.");
+        assert_eq!(entry(&db, id).status, Status::Applied);
+
+        // Accepting again is "nothing to change", not a second write.
+        let again = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &id_text), ("expected", &expected)],
+        );
+        assert_eq!(status(&again), "HTTP/1.1 200 OK");
+        assert!(again.contains("Nothing to change"), "{again}");
+
+        // The inbox no longer lists it as waiting; the trail does, read-only.
+        let list = get_db(&db, "/inbox");
+        assert!(list.contains("Nothing is waiting."));
+        assert!(list.contains("<span class=\"badge\">applied</span>"));
+        assert!(list.contains("the last 50") || list.contains("The last 50 decisions"));
+        let shown = get_db(&db, &format!("/inbox/show?id={id}"));
+        assert!(shown.contains("Decided "), "{shown}");
+        assert!(!shown.contains("action=\"/inbox/accept\""));
+        assert!(!shown.contains("action=\"/inbox/reject\""));
+
+        // A library item is saved switched off.
+        let skill = queue(
+            &db,
+            &submission("skill", "set", "tidy", "Tidy up."),
+            "useful",
+            "claude-code",
+        );
+        let done = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &skill.to_string()), ("expected", "")],
+        );
+        assert!(done.contains("added skill &#39;tidy&#39;, switched off"));
+        assert!(!prompt(&db, "tidy").unwrap().enabled);
+    }
+
+    #[test]
+    fn a_target_that_changed_while_reading_is_reported_and_not_overwritten() {
+        let (_dir, db) = seeded("web-inbox-stale");
+        Store::open(&db)
+            .unwrap()
+            .set_glossary_in("", "sku", "old meaning", None)
+            .unwrap();
+        let id = queue(
+            &db,
+            &submission("glossary", "set", "sku", "newer meaning"),
+            "better",
+            "claude-code",
+        );
+        let shown = get_db(&db, &format!("/inbox/show?id={id}"));
+        let expected = hidden_value(&shown, "expected");
+        // Someone edits the word after the page was shown.
+        Store::open(&db)
+            .unwrap()
+            .set_glossary_in("", "sku", "my own meaning", None)
+            .unwrap();
+        let before = curated(&db);
+        let id_text = id.to_string();
+        let stale = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &id_text), ("expected", &expected)],
+        );
+        assert_eq!(status(&stale), "HTTP/1.1 409 Conflict");
+        assert!(
+            stale.contains("The stored item changed while you were reading; check it again."),
+            "{stale}"
+        );
+        // The page it comes back to shows the current text and a new stamp.
+        assert!(stale.contains("my own meaning"));
+        assert_ne!(hidden_value(&stale, "expected"), expected);
+        assert_eq!(curated(&db), before);
+        assert_eq!(entry(&db, id).status, Status::Pending);
+        // Accepting with the new stamp works.
+        let fresh = hidden_value(&stale, "expected");
+        let done = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &id_text), ("expected", &fresh)],
+        );
+        assert_eq!(status(&done), "HTTP/1.1 200 OK");
+        assert!(words(&db).iter().any(|w| w.2 == "newer meaning"));
+        // An empty stamp for something that exists is stale too.
+        let id2 = queue(
+            &db,
+            &submission("glossary", "set", "sku", "third meaning"),
+            "again",
+            "claude-code",
+        );
+        let none = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &id2.to_string()), ("expected", "")],
+        );
+        assert_eq!(status(&none), "HTTP/1.1 409 Conflict");
+        assert!(words(&db).iter().any(|w| w.2 == "newer meaning"));
+        // A missing field is the same as an empty one.
+        let missing = post(&db, "/inbox/accept", &[("id", &id2.to_string())]);
+        assert_eq!(status(&missing), "HTTP/1.1 409 Conflict");
+    }
+
+    #[test]
+    fn the_inbox_shows_a_suggestion_escaped_and_none_when_there_is_none_and_decides_without_it() {
+        use crate::decider::{Opinion, Verdict};
+        let (_dir, db) = seeded("web-inbox-suggestion");
+        let judged = queue(
+            &db,
+            &submission("glossary", "set", "sku", "a stock unit"),
+            "docs",
+            "claude-code",
+        );
+        let plain = queue(
+            &db,
+            &submission("glossary", "set", "lot", "a batch"),
+            "docs",
+            "claude-code",
+        );
+        let weak = queue(
+            &db,
+            &submission("glossary", "set", "bin", "a box"),
+            "docs",
+            "claude-code",
+        );
+        {
+            let mut store = Store::open(&db).unwrap();
+            let hostile = Opinion {
+                verdict: Verdict::Reject,
+                confidence: Some(0.95),
+                reason: "<script>alert(1)</script> & \"quoted\"".to_owned(),
+                raw: String::new(),
+            };
+            store
+                .add_suggestion(judged, "llm:<b>x</b>:m", &hostile)
+                .unwrap();
+            let weak_accept = Opinion {
+                verdict: Verdict::Accept,
+                confidence: Some(0.79),
+                reason: "probably".to_owned(),
+                raw: String::new(),
+            };
+            store.add_suggestion(weak, "llm:p:m", &weak_accept).unwrap();
+        }
+        let list = get_db(&db, "/inbox");
+        assert!(list.contains("<th>Suggestion</th>"), "{list}");
+        assert!(
+            list.contains("Reject (said reject, confidence 0.95)"),
+            "{list}"
+        );
+        // Below the threshold an accept is shown as unsure, and what was said stays visible.
+        assert!(
+            list.contains("Unsure (said accept, confidence 0.79)"),
+            "{list}"
+        );
+        assert!(list.contains("<span class=\"dim\">none</span>"), "{list}");
+
+        let page = get_db(&db, &format!("/inbox/show?id={judged}"));
+        assert!(
+            page.contains(
+                "Suggestion (from <code>llm:&lt;b&gt;x&lt;/b&gt;:m</code>, not a decision)"
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains("Reason: &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quoted&quot;"),
+            "{page}"
+        );
+        assert!(
+            !page.contains("<script>") && !page.contains("<b>x</b>"),
+            "{page}"
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={plain}"));
+        assert!(page.contains("Suggestion: none"), "{page}");
+        assert!(page.contains("action=\"/inbox/accept\""));
+
+        // Both can be accepted or rejected, the suggestion read by nothing.
+        let stamp =
+            |id: i64| hidden_value(&get_db(&db, &format!("/inbox/show?id={id}")), "expected");
+        let accepted = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &judged.to_string()), ("expected", &stamp(judged))],
+        );
+        assert_eq!(status(&accepted), "HTTP/1.1 200 OK");
+        assert_eq!(entry(&db, judged).status, Status::Applied);
+        let rejected = post(&db, "/inbox/reject", &[("id", &plain.to_string())]);
+        assert_eq!(location(&rejected), Some("/inbox?ok=rejected"));
+        assert_eq!(entry(&db, plain).status, Status::Rejected);
+        // The trail shows the suggestion too, read-only.
+        let shown = get_db(&db, &format!("/inbox/show?id={judged}"));
+        assert!(shown.contains("not a decision"), "{shown}");
+        assert!(get_db(&db, "/inbox").contains("Reject (said reject, confidence 0.95)"));
+    }
+
+    #[test]
+    fn a_system_prompt_that_is_on_shows_the_banner() {
+        let (_dir, db) = seeded("web-inbox-on");
+        {
+            let mut store = Store::open(&db).unwrap();
+            store
+                .add_prompt_of_type("house", "", "Be brief.", None, PromptType::System)
+                .unwrap();
+            store.set_prompt_enabled("house", true).unwrap();
+            store
+                .add_prompt_of_type("spare", "", "Be calm.", None, PromptType::System)
+                .unwrap();
+        }
+        let on = queue(
+            &db,
+            &submission("prompt", "set", "house", "Be very brief."),
+            "shorter",
+            "claude-code",
+        );
+        let off = queue(
+            &db,
+            &submission("prompt", "set", "spare", "Be very calm."),
+            "calmer",
+            "claude-code",
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={on}"));
+        assert!(
+            page.contains("This system prompt is on: accepting changes what the next chat sends."),
+            "{page}"
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={off}"));
+        assert!(!page.contains("This system prompt is on"));
+        // A delete of the one that is on shows it too.
+        let delete = queue(
+            &db,
+            &submission("prompt", "delete", "house", ""),
+            "gone",
+            "claude-code",
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={delete}"));
+        assert!(page.contains("This system prompt is on"), "{page}");
+    }
+
+    #[test]
+    fn a_library_item_of_another_type_shows_the_error_and_offers_only_reject() {
+        let (_dir, db) = seeded("web-inbox-err");
+        // "tdd" is a skill; the submission says it is a personality.
+        let id = queue(
+            &db,
+            &submission("personality", "set", "tdd", "Talk like a pirate."),
+            "fun",
+            "claude-code",
+        );
+        let page = get_db(&db, &format!("/inbox/show?id={id}"));
+        assert_eq!(status(&page), "HTTP/1.1 200 OK");
+        assert!(
+            page.contains("This cannot be accepted: &#39;tdd&#39; is a skill, not a personality"),
+            "{page}"
+        );
+        assert!(!page.contains("action=\"/inbox/accept\""));
+        assert!(page.contains("action=\"/inbox/reject\""));
+        // Posting an accept anyway changes nothing and leaves the row pending.
+        let before = curated(&db);
+        let forced = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &id.to_string()), ("expected", "")],
+        );
+        assert_eq!(status(&forced), "HTTP/1.1 400 Bad Request");
+        assert!(forced.contains("is a skill, not a personality"));
+        assert_eq!(curated(&db), before);
+        assert_eq!(entry(&db, id).status, Status::Pending);
+        // Reject works.
+        let rejected = post(
+            &db,
+            "/inbox/reject",
+            &[("id", &id.to_string()), ("note", "wrong type")],
+        );
+        assert_eq!(location(&rejected), Some("/inbox?ok=rejected"));
+    }
+
+    #[test]
+    fn rejecting_keeps_the_note_touches_nothing_stored_and_is_listed_in_the_trail() {
+        let (_dir, db) = seeded("web-inbox-reject");
+        let id = queue(
+            &db,
+            &submission("glossary", "set", "sku", "a stock unit"),
+            "docs",
+            "claude-code",
+        );
+        let before = curated(&db);
+        let id_text = id.to_string();
+        let long = "x".repeat(crate::inbox_view::MAX_NOTE_CHARS + 1);
+        let refused = post(&db, "/inbox/reject", &[("id", &id_text), ("note", &long)]);
+        assert_eq!(status(&refused), "HTTP/1.1 400 Bad Request");
+        assert_eq!(entry(&db, id).status, Status::Pending);
+        let done = post(
+            &db,
+            "/inbox/reject",
+            &[("id", &id_text), ("note", "  not our word <b>  ")],
+        );
+        assert_eq!(location(&done), Some("/inbox?ok=rejected"));
+        assert_eq!(curated(&db), before);
+        let row = entry(&db, id);
+        assert_eq!(row.status, Status::Rejected);
+        assert_eq!(row.decision_note, "not our word <b>");
+        let list = get_db(&db, "/inbox?ok=rejected");
+        assert!(list.contains("Rejected."));
+        assert!(list.contains("<span class=\"badge\">rejected</span>"));
+        assert!(list.contains("not our word &lt;b&gt;") && !list.contains("our word <b>"));
+        // Rejecting twice, accepting a rejected row and an unknown id are refused.
+        let twice = post(&db, "/inbox/reject", &[("id", &id_text), ("note", "")]);
+        assert_eq!(status(&twice), "HTTP/1.1 409 Conflict");
+        assert!(twice.contains("is rejected already"));
+        let accept = post(&db, "/inbox/accept", &[("id", &id_text), ("expected", "")]);
+        assert_eq!(status(&accept), "HTTP/1.1 400 Bad Request");
+        assert!(accept.contains("was rejected"));
+        assert_eq!(curated(&db), before);
+        let unknown = post(&db, "/inbox/reject", &[("id", "999")]);
+        assert_eq!(status(&unknown), "HTTP/1.1 404 Not Found");
+        let nan = post(&db, "/inbox/accept", &[("id", "abc")]);
+        assert_eq!(status(&nan), "HTTP/1.1 400 Bad Request");
+        // The decided list holds at most the last 50, newest first.
+        for n in 0..52 {
+            let id = queue(
+                &db,
+                &submission("glossary", "set", &format!("word{n}"), "x"),
+                "bulk",
+                "claude-code",
+            );
+            post(&db, "/inbox/reject", &[("id", &id.to_string())]);
+        }
+        let list = get_db(&db, "/inbox");
+        assert_eq!(list.matches("badge\">rejected").count(), 50);
+        assert!(list.contains("word51") && !list.contains("word0<"));
+        assert!(list.find("word51").unwrap() < list.find("word50").unwrap());
+    }
+
+    #[test]
+    fn what_a_sender_wrote_is_shown_as_plain_escaped_text_on_every_inbox_page() {
+        let (_dir, db) = seeded("web-inbox-hostile");
+        let hostile = "<script>alert(1)</script> \"onmouseover=\"x\" 'a' & <img src=x onerror=y>";
+        let mut sub = submission("context", "set", "evil", hostile);
+        sub.quote = hostile.to_owned();
+        sub.area = Some("billing".to_owned());
+        let id = queue(&db, &sub, hostile, "<b>claude</b>\"onmouseover=\"z");
+        let mut skill = submission("skill", "set", "evil-skill", hostile);
+        skill.description = "<i>one line</i>".to_owned();
+        let skill_id = queue(&db, &skill, "plain", "codex");
+        Store::open(&db)
+            .unwrap()
+            .set_context("", "evil", "rule", hostile, hostile, None)
+            .unwrap();
+        let pages = [
+            get_db(&db, "/inbox"),
+            get_db(&db, &format!("/inbox/show?id={id}")),
+            get_db(&db, &format!("/inbox/show?id={skill_id}")),
+        ];
+        for page in &pages {
+            assert!(!page.contains("<script"), "{page}");
+            assert!(!page.contains("<img"));
+            assert!(!page.contains("<b>claude"));
+            assert!(!page.contains("<i>one"));
+            assert!(!page.contains("\"onmouseover="), "{page}");
+        }
+        assert!(pages[0].contains("&lt;b&gt;claude&lt;/b&gt;&quot;onmouseover=&quot;z"));
+        assert!(pages[1].contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(pages[2].contains("&lt;i&gt;one line&lt;/i&gt;"));
+        // The escaped text is also what the stamp field and the note come back as.
+        let done = post(
+            &db,
+            "/inbox/reject",
+            &[("id", &id.to_string()), ("note", hostile)],
+        );
+        assert_eq!(location(&done), Some("/inbox?ok=rejected"));
+        let list = get_db(&db, "/inbox");
+        assert!(!list.contains("<script") && list.contains("&lt;script&gt;"));
+        let shown = get_db(&db, &format!("/inbox/show?id={id}"));
+        assert!(!shown.contains("<script") && shown.contains("&lt;script&gt;alert(1)"));
+        // A failed apply leaves an error note on the row; it is escaped as well.
+        let failing = queue(
+            &db,
+            &submission("personality", "set", "tdd", hostile),
+            "x",
+            "codex",
+        );
+        let reply = post(
+            &db,
+            "/inbox/accept",
+            &[("id", &failing.to_string()), ("expected", "")],
+        );
+        assert!(!reply.contains("<script"), "{reply}");
+    }
+
+    #[test]
+    fn the_inbox_forms_are_protected_like_every_other_write_form() {
+        let (_dir, db) = seeded("web-inbox-protect");
+        let id = queue(
+            &db,
+            &submission("glossary", "set", "sku", "a stock unit"),
+            "docs",
+            "claude-code",
+        );
+        let before = curated(&db);
+        for path in ["/inbox/accept", "/inbox/reject"] {
+            let body = form_body(&[("token", TOKEN), ("id", &id.to_string()), ("expected", "")]);
+            let with_token = |token: &str| {
+                form_body(&[("token", token), ("id", &id.to_string()), ("expected", "")])
+            };
+            let good = |extra: &[(&'static str, String)]| -> Vec<(&'static str, String)> {
+                let mut headers: Vec<(&'static str, String)> = vec![
+                    ("Origin", format!("http://localhost:{PORT}")),
+                    (
+                        "Content-Type",
+                        "application/x-www-form-urlencoded".to_owned(),
+                    ),
+                    ("Content-Length", body.len().to_string()),
+                ];
+                headers.retain(|(name, _)| !extra.iter().any(|(n, _)| n == name));
+                headers.extend_from_slice(extra);
+                headers
+            };
+            let origin = |value: &str| good(&[("Origin", value.to_owned())]);
+            let ctype = |value: &str| good(&[("Content-Type", value.to_owned())]);
+            let length = |value: String| good(&[("Content-Length", value)]);
+            let cases: Vec<Case> = vec![
+                (
+                    "foreign origin",
+                    origin("http://evil.example"),
+                    body.clone(),
+                ),
+                ("null origin", origin("null"), body.clone()),
+                ("other port", origin("http://localhost:9999"), body.clone()),
+                ("json", ctype("application/json"), body.clone()),
+                ("text", ctype("text/plain"), body.clone()),
+                ("wrong token", good(&[]), with_token("wrong")),
+                ("empty token", good(&[]), with_token("")),
+                (
+                    "token with more",
+                    good(&[]),
+                    with_token(&format!("{TOKEN}0")),
+                ),
+                ("no token", good(&[]), format!("id={id}&expected=")),
+                (
+                    "short body",
+                    length((body.len() + 10).to_string()),
+                    body.clone(),
+                ),
+                (
+                    "huge length",
+                    length((MAX_BODY + 1).to_string()),
+                    body.clone(),
+                ),
+            ];
+            for (name, headers, text) in cases {
+                let page = post_raw(&db, path, &headers, &text);
+                let code = status(&page).to_owned();
+                assert!(
+                    [
+                        "HTTP/1.1 403 Forbidden",
+                        "HTTP/1.1 415 Unsupported Media Type",
+                        "HTTP/1.1 400 Bad Request",
+                        "HTTP/1.1 413 Content Too Large",
+                        "HTTP/1.1 411 Length Required"
+                    ]
+                    .contains(&code.as_str()),
+                    "{path} {name}: {code}"
+                );
+                assert_eq!(location(&page), None, "{path} {name}");
+            }
+            // No origin at all.
+            let page = post_raw(
+                &db,
+                path,
+                &[
+                    (
+                        "Content-Type",
+                        "application/x-www-form-urlencoded".to_owned(),
+                    ),
+                    ("Content-Length", body.len().to_string()),
+                ],
+                &body,
+            );
+            assert_eq!(status(&page), "HTTP/1.1 403 Forbidden", "{path}");
+            // Not from the address line, and not with another method.
+            let page = ask_db(
+                &db,
+                &format!(
+                    "GET {path}?token={TOKEN}&id={id} HTTP/1.1\r\nHost: localhost:{PORT}\r\n\r\n"
+                ),
+            );
+            assert_eq!(status(&page), "HTTP/1.1 405 Method Not Allowed", "{path}");
+            assert!(page.contains("Allow: POST\r\n"));
+            let page = ask_db(
+                &db,
+                &format!("PUT {path} HTTP/1.1\r\nHost: localhost:{PORT}\r\n\r\n"),
+            );
+            assert_eq!(status(&page), "HTTP/1.1 405 Method Not Allowed", "{path}");
+        }
+        // The show page does not take a form.
+        let page = ask_db(
+            &db,
+            &format!(
+                "POST /inbox/show HTTP/1.1\r\nHost: localhost:{PORT}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert_eq!(status(&page), "HTTP/1.1 405 Method Not Allowed");
+        // A wrong Host is refused before anything.
+        let page = ask_db(&db, "GET /inbox HTTP/1.1\r\nHost: evil.example\r\n\r\n");
+        assert_eq!(status(&page), "HTTP/1.1 421 Misdirected Request");
+        assert_eq!(curated(&db), before);
+        assert_eq!(entry(&db, id).status, Status::Pending);
+    }
+
+    #[test]
+    fn the_inbox_pages_have_the_safety_headers_and_a_busy_database_is_a_503() {
+        let (_dir, db) = seeded("web-inbox-headers");
+        let id = queue(
+            &db,
+            &submission("glossary", "set", "sku", "x"),
+            "docs",
+            "codex",
+        );
+        for path in ["/inbox".to_owned(), format!("/inbox/show?id={id}")] {
+            let page = get_db(&db, &path);
+            assert_eq!(status(&page), "HTTP/1.1 200 OK");
+            assert!(page.contains("Content-Security-Policy: default-src 'none'"));
+            assert!(page.contains("Cache-Control: no-store"));
+            assert!(!page.contains("<script"));
+        }
+        let write = || Err("the database is locked".to_owned());
+        let read = || load(&db);
+        let ctx = Ctx {
+            project: "",
+            port: PORT,
+            token: TOKEN,
+            read: &read,
+            write: &write,
+            open: &no_open,
+        };
+        let body = form_body(&[("token", TOKEN), ("id", &id.to_string())]);
+        let request = format!(
+            "POST /inbox/reject HTTP/1.1\r\nHost: localhost:{PORT}\r\nOrigin: http://localhost:{PORT}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let page = String::from_utf8(respond(request.as_bytes(), &ctx)).unwrap();
+        assert_eq!(status(&page), "HTTP/1.1 503 Service Unavailable");
+        assert_eq!(entry(&db, id).status, Status::Pending);
     }
 }

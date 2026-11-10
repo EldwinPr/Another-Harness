@@ -164,6 +164,14 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
         "the same by typing (also without a terminal): add NAME COMMAND [ARGS] [--env N=v] [--timeout S], tools NAME, rule NAME TOOL|* ask|free|off",
     ),
     (
+        "/inbox",
+        "list what other harnesses have submitted through the MCP server (its default buffer mode) and waits for your decision; nothing is stored until you accept it",
+    ),
+    (
+        "/inbox <show|accept|reject> N [note]",
+        "show a submission next to what is stored now with a line diff; accept it (asks first; a stored item that changed meanwhile is reported, not overwritten); or reject it with an optional note",
+    ),
+    (
         "/tools [name]",
         "list the tools the model has, and what a subagent gets; with a name, show that tool in full",
     ),
@@ -2718,6 +2726,10 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
                 crate::mcp_ui::command(agent, term, rest);
                 continue;
             }
+            "/inbox" => {
+                crate::inbox_ui::command(agent, term, rest);
+                continue;
+            }
             "/web" => {
                 crate::web_ui::command(agent, term, rest, &mut web);
                 continue;
@@ -5235,6 +5247,403 @@ mod tests {
         assert!(out.contains("deleted keep-small"), "{out}");
         let store = Store::open(&dir.path().join("harness.db")).unwrap();
         assert!(store.list_all_context().unwrap().is_empty());
+    }
+
+    // ---- /inbox (issue 47) ----
+
+    use crate::store_buffer::{Checked, Status as InboxStatus, Submission, Submitted};
+
+    fn inbox_sub(kind: &str, action: &str, name: &str, text: &str) -> Submission {
+        Submission {
+            kind: kind.to_owned(),
+            action: action.to_owned(),
+            name: name.to_owned(),
+            text: text.to_owned(),
+            context_kind: if kind == "context" && action == "set" {
+                "rule".to_owned()
+            } else {
+                String::new()
+            },
+            ..Submission::default()
+        }
+    }
+
+    /// Queues a submission in `<dir>/harness.db` as another harness would; the row's id.
+    fn inbox_queue(dir: &Scratch, sub: &Submission, why: &str, source: &str) -> i64 {
+        let mut store = Store::open(&dir.path().join("harness.db")).unwrap();
+        match store
+            .queue_submission(&Checked::new(sub, why, source).unwrap())
+            .unwrap()
+        {
+            Submitted::Queued(id) => id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn inbox_row(dir: &Scratch, id: i64) -> crate::store_buffer::BufferEntry {
+        Store::open(&dir.path().join("harness.db"))
+            .unwrap()
+            .buffer_entry(id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn inbox_says_so_when_empty_and_lists_what_waits_with_the_sender_marked_as_claimed() {
+        let dir = Scratch::new("repl-inbox-list");
+        let mut r = rig_stored(&dir, "/inbox\n/exit\n", vec![]);
+        run(&mut r.agent, &r.term).unwrap();
+        assert!(
+            screen(&r.term).contains("the inbox is empty: nothing waits for your decision"),
+            "{}",
+            screen(&r.term)
+        );
+        drop(r);
+        let first = inbox_queue(
+            &dir,
+            &inbox_sub("glossary", "set", "sku", "a stock unit"),
+            "the docs use it\nsecond line",
+            "claude-code",
+        );
+        let second = inbox_queue(
+            &dir,
+            &inbox_sub("context", "delete", "old-rule", ""),
+            "outdated",
+            "codex",
+        );
+        let mut r = rig_stored(&dir, "/inbox\n/inbox list\n/exit\n", vec![]);
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains(&format!(
+                "#{first}  glossary set sku · every project · from claude-code (claimed) · just now"
+            )),
+            "{out}"
+        );
+        assert!(out.contains("why: the docs use it..."), "{out}");
+        assert!(out.contains(&format!("#{second}  context delete old-rule")));
+        assert!(out.find(&format!("#{first}")).unwrap() < out.find(&format!("#{second}")).unwrap());
+        assert!(out.contains("2 waiting: /inbox show N"), "{out}");
+        assert!(
+            r.requests.borrow().is_empty(),
+            "/inbox is not sent to the model"
+        );
+    }
+
+    #[test]
+    fn inbox_show_prints_the_submission_next_to_the_stored_item_with_a_line_diff() {
+        let dir = Scratch::new("repl-inbox-show");
+        Store::open(&dir.path().join("harness.db"))
+            .unwrap()
+            .set_context("", "style", "rule", "one\ntwo\nthree", "plain please", None)
+            .unwrap();
+        let mut sub = inbox_sub("context", "set", "style", "one\n2\nthree");
+        sub.quote = "newer words".to_owned();
+        let id = inbox_queue(&dir, &sub, "clearer", "claude-code");
+        let new = inbox_queue(
+            &dir,
+            &inbox_sub("skill", "set", "tidy", "Tidy up."),
+            "useful",
+            "codex",
+        );
+        let gone = inbox_queue(
+            &dir,
+            &inbox_sub("context", "delete", "style", ""),
+            "obsolete",
+            "codex",
+        );
+        let mut r = rig_stored(
+            &dir,
+            &format!(
+                "/inbox show {id}\n/inbox show #{new}\n/inbox show {gone}\n/inbox show 99\n/inbox show\n/inbox show x\n/exit\n"
+            ),
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        for text in [
+            &format!("#{id} context set 'style' · every project · pending"),
+            "from claude-code (as the sender claims, not checked)",
+            "why (the sender's words):",
+            "clearer",
+            "accepting replaces the stored item:",
+            "quote: plain please  ->  newer words",
+            "  one",
+            "- two",
+            "+ 2",
+            "  three",
+            "nothing is stored under this name: accepting adds it; a new item is saved switched off",
+            "+ Tidy up.",
+            "accepting deletes this:",
+            "there is no submission #99",
+            "usage: /inbox show N",
+        ] {
+            assert!(out.contains(text), "{text}: {out}");
+        }
+        assert!(!out.contains("This system prompt is on"));
+    }
+
+    #[test]
+    fn inbox_accept_shows_the_diff_asks_and_applies_only_after_a_yes() {
+        let dir = Scratch::new("repl-inbox-accept");
+        let id = inbox_queue(
+            &dir,
+            &inbox_sub("glossary", "set", "sku", "a stock unit"),
+            "docs",
+            "claude-code",
+        );
+        let mut r = rig_stored(
+            &dir,
+            &format!(
+                "/inbox accept {id}\nn\n/inbox accept {id}\ny\n/inbox accept {id}\n/inbox accept\n/exit\n"
+            ),
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains(&format!("accept #{id}? [y/N]")), "{out}");
+        assert!(out.contains("+ a stock unit"));
+        assert!(out.contains("[not accepted]"), "{out}");
+        assert!(
+            out.contains("added glossary term 'sku' for every project"),
+            "{out}"
+        );
+        assert!(out.contains(&format!("#{id} is applied already")), "{out}");
+        assert!(out.contains("usage: /inbox accept N"));
+        let store = Store::open(&dir.path().join("harness.db")).unwrap();
+        let word = store.glossary_entry("sku").unwrap().unwrap();
+        assert_eq!(word.definition, "a stock unit");
+        assert_eq!(inbox_row(&dir, id).status, InboxStatus::Applied);
+    }
+
+    #[test]
+    fn inbox_accept_of_a_library_item_that_is_on_shows_the_banner_and_a_no_applies_nothing() {
+        let dir = Scratch::new("repl-inbox-on");
+        {
+            let mut store = Store::open(&dir.path().join("harness.db")).unwrap();
+            store
+                .add_prompt_of_type(
+                    "house",
+                    "",
+                    "Be brief.",
+                    None,
+                    crate::store_prompts::PromptType::System,
+                )
+                .unwrap();
+            store.set_prompt_enabled("house", true).unwrap();
+        }
+        let id = inbox_queue(
+            &dir,
+            &inbox_sub("prompt", "set", "house", "Be very brief."),
+            "shorter",
+            "claude-code",
+        );
+        let wrong = inbox_queue(
+            &dir,
+            &inbox_sub("skill", "set", "house", "x"),
+            "oops",
+            "claude-code",
+        );
+        let mut r = rig_stored(
+            &dir,
+            &format!(
+                "/inbox accept {id}\nno\n/inbox accept {wrong}\n/inbox reject {wrong} wrong type\n/exit\n"
+            ),
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            out.contains("! This system prompt is on: accepting changes what the next chat sends."),
+            "{out}"
+        );
+        assert!(out.contains("[not accepted]"));
+        let store = Store::open(&dir.path().join("harness.db")).unwrap();
+        assert_eq!(store.prompt("house").unwrap().text, "Be brief.");
+        // A library item of another type: the error is shown and only reject is left.
+        assert!(
+            out.contains("this cannot be accepted: 'house' is a system, not a skill"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("[nothing accepted] /inbox reject {wrong}")),
+            "{out}"
+        );
+        assert!(!out.contains(&format!("accept #{wrong}?")));
+        assert!(out.contains(&format!("rejected #{wrong}")));
+        assert_eq!(inbox_row(&dir, wrong).decision_note, "wrong type");
+    }
+
+    #[test]
+    fn inbox_apply_reports_a_stored_item_that_changed_and_leaves_the_row_pending() {
+        let dir = Scratch::new("repl-inbox-stale");
+        Store::open(&dir.path().join("harness.db"))
+            .unwrap()
+            .set_glossary_in("", "sku", "old meaning", None)
+            .unwrap();
+        let id = inbox_queue(
+            &dir,
+            &inbox_sub("glossary", "set", "sku", "newer meaning"),
+            "better",
+            "claude-code",
+        );
+        let shown = Store::open(&dir.path().join("harness.db"))
+            .unwrap()
+            .glossary_entry("sku")
+            .unwrap()
+            .unwrap()
+            .fingerprint();
+        // The word is edited after the reviewer saw it.
+        Store::open(&dir.path().join("harness.db"))
+            .unwrap()
+            .set_glossary_in("", "sku", "my own meaning", None)
+            .unwrap();
+        let mut r = rig_stored(&dir, "/exit\n", vec![]);
+        crate::inbox_ui::apply_shown(&mut r.agent, &r.term, id, Some(&shown));
+        let out = screen(&r.term);
+        assert!(
+            out.contains(&format!(
+                "the stored item changed while you were reading; check it again: /inbox show {id}"
+            )),
+            "{out}"
+        );
+        let store = Store::open(&dir.path().join("harness.db")).unwrap();
+        assert_eq!(
+            store.glossary_entry("sku").unwrap().unwrap().definition,
+            "my own meaning"
+        );
+        assert_eq!(inbox_row(&dir, id).status, InboxStatus::Pending);
+    }
+
+    #[test]
+    fn inbox_reject_keeps_the_note_and_changes_nothing_stored() {
+        let dir = Scratch::new("repl-inbox-reject");
+        let id = inbox_queue(
+            &dir,
+            &inbox_sub("glossary", "set", "sku", "a stock unit"),
+            "docs",
+            "claude-code",
+        );
+        let long = "x".repeat(crate::inbox_view::MAX_NOTE_CHARS + 1);
+        let mut r = rig_stored(
+            &dir,
+            &format!(
+                "/inbox reject {id} {long}\n/inbox reject {id}   not our word  \n/inbox reject {id}\n/inbox reject 99\n/inbox reject\n/inbox bogus\n/inbox show {id} extra\n/exit\n"
+            ),
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(out.contains("a note is at most 1000 characters"), "{out}");
+        assert!(out.contains(&format!("rejected #{id}")));
+        assert!(out.contains(&format!("#{id} is rejected already")), "{out}");
+        assert!(out.contains("there is no submission #99"));
+        assert!(out.contains("usage: /inbox reject N [note]"));
+        assert!(out.contains("usage: /inbox [show N | accept N | reject N [note]]"));
+        assert!(out.contains("usage: /inbox show N"));
+        let row = inbox_row(&dir, id);
+        assert_eq!(row.status, InboxStatus::Rejected);
+        assert_eq!(row.decision_note, "not our word");
+        let store = Store::open(&dir.path().join("harness.db")).unwrap();
+        assert!(store.glossary_entry("sku").unwrap().is_none());
+    }
+
+    #[test]
+    fn inbox_prints_what_a_sender_wrote_without_terminal_control_characters() {
+        let dir = Scratch::new("repl-inbox-control");
+        let evil = "bad\x1b[2J\x1b]0;pwned\x07text\rmore\x1b[31m";
+        let id = inbox_queue(
+            &dir,
+            &inbox_sub("context", "set", "evil", "Line one\nCLEANTEXT"),
+            "fine",
+            "claude-code",
+        );
+        {
+            // `submit` now refuses such text, but a row written by something else may hold anything
+            // in its text, `why`, `source` and note, and the screen must still print it safely.
+            let store = Store::open(&dir.path().join("harness.db")).unwrap();
+            let json_evil = serde_json::to_string(evil).unwrap();
+            let json_evil = &json_evil[1..json_evil.len() - 1];
+            store
+                .conn
+                .execute(
+                    "UPDATE buffer_entries SET why = ?1, source = ?2, decision_note = ?3, \
+                     entry_json = replace(entry_json, 'CLEANTEXT', ?5) WHERE id = ?4",
+                    rusqlite::params![evil, evil, evil, id, json_evil],
+                )
+                .unwrap();
+        }
+        let mut r = rig_stored(
+            &dir,
+            &format!("/inbox\n/inbox show {id}\n/inbox accept {id}\nn\n/exit\n"),
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(!out.contains('\x07') && !out.contains('\r'), "{out:?}");
+        assert!(out.contains("bad[2J]0;pwnedtextmore[31m"), "{out:?}");
+        assert!(out.contains("from bad[2J]0;pwnedtextmore[31m"), "{out:?}");
+    }
+
+    #[test]
+    fn inbox_prints_the_suggestion_or_none_without_control_characters_and_decides_without_it() {
+        use crate::decider::{Opinion, Verdict};
+        let dir = Scratch::new("repl-inbox-suggestion");
+        let judged = inbox_queue(
+            &dir,
+            &inbox_sub("glossary", "set", "sku", "a stock unit"),
+            "docs",
+            "claude-code",
+        );
+        let plain = inbox_queue(
+            &dir,
+            &inbox_sub("glossary", "set", "lot", "a batch"),
+            "docs",
+            "claude-code",
+        );
+        {
+            let mut store = Store::open(&dir.path().join("harness.db")).unwrap();
+            let hostile = Opinion {
+                verdict: Verdict::Reject,
+                confidence: Some(0.95),
+                reason: "bad\x1b[2J\x1b]0;pwned\x07 <b>reason</b>\rmore".to_owned(),
+                raw: String::new(),
+            };
+            assert!(store.add_suggestion(judged, "llm:p:m", &hostile).unwrap());
+        }
+        let mut r = rig_stored(
+            &dir,
+            &format!(
+                "/inbox\n/inbox show {judged}\n/inbox show {plain}\n/inbox accept {judged}\ny\n/inbox reject {plain}\n/exit\n"
+            ),
+            vec![],
+        );
+        run(&mut r.agent, &r.term).unwrap();
+        let out = screen(&r.term);
+        assert!(
+            !out.contains('\x1b') && !out.contains('\x07') && !out.contains('\r'),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("suggestion: Reject (said reject, confidence 0.95)"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "suggestion (from llm:p:m, not a decision): Reject (said reject, confidence 0.95)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("reason: bad[2J]0;pwned <b>reason</b>more"),
+            "{out:?}"
+        );
+        assert!(out.contains("suggestion: none"), "{out}");
+        // Accepting went ahead against the suggestion, and an entry with none can be rejected.
+        assert_eq!(inbox_row(&dir, judged).status, InboxStatus::Applied);
+        assert_eq!(inbox_row(&dir, plain).status, InboxStatus::Rejected);
+        assert!(r.requests.borrow().is_empty(), "no model was called");
     }
 
     #[test]

@@ -147,7 +147,7 @@ impl ProfileDraft {
 }
 
 /// The words a `?ok=` can carry, and the notice each one shows. Anything else shows nothing.
-const NOTICES: [(&str, &str); 8] = [
+const NOTICES: [(&str, &str); 9] = [
     ("added", "Added."),
     ("saved", "Saved."),
     ("deleted", "Deleted."),
@@ -156,6 +156,7 @@ const NOTICES: [(&str, &str); 8] = [
     ("moved", "Moved."),
     ("used", "New chats now start under it."),
     ("copied", "Copied."),
+    ("rejected", "Rejected."),
 ];
 
 /// The text of a notice word, if it is one.
@@ -203,9 +204,11 @@ h2{font-size:1.1rem;margin:1.5rem 0 .5rem}code{font:13px ui-monospace,monospace}
 .check{display:flex;gap:.5rem;align-items:baseline;color:var(--fg);margin:.2rem 0}fieldset{border:1px solid var(--line);border-radius:6px;margin:.75rem 0;padding:.25rem .75rem .5rem}\
 legend{color:var(--dim);padding:0 .3rem}.badge{border:1px solid var(--accent);color:var(--accent);border-radius:4px;padding:0 .4rem;font-size:.85rem}\
 .erd{overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--card);margin:.75rem 0;position:relative;left:50%;transform:translateX(-50%);width:min(1500px,calc(100vw - 32px))}\
+.diff .add{color:#1a7f37}.diff .del{color:#c0392b}\
+@media (prefers-color-scheme:dark){.diff .add{color:#7ee2a0}.diff .del{color:#ff8a7a}}\
 .erd .edge:hover .line{stroke-width:3;stroke:var(--accent);opacity:1}.card{background:var(--card);border:1px solid var(--line);border-radius:6px;margin:.6rem 0;padding:.5rem .75rem}.card p{margin:.2rem 0}";
 
-const PAGES: [(&str, &str); 11] = [
+const PAGES: [(&str, &str); 12] = [
     ("/", "Home"),
     ("/profiles", "Profiles"),
     ("/prompts", "Prompts"),
@@ -213,6 +216,7 @@ const PAGES: [(&str, &str); 11] = [
     ("/personalities", "Personalities"),
     ("/glossary", "Glossary"),
     ("/context", "Context"),
+    ("/inbox", "Inbox"),
     ("/tools", "Tools"),
     ("/usage", "Usage"),
     ("/database", "Database"),
@@ -280,7 +284,7 @@ pub fn simple(title: &str, text: &str) -> String {
     page("", title, &format!("<p>{}</p>", escape(text)))
 }
 
-fn banner(view: &View<'_>) -> String {
+pub(crate) fn banner(view: &View<'_>) -> String {
     let mut out = String::new();
     if let Some(text) = view.ok.and_then(notice) {
         out.push_str(&format!(
@@ -297,7 +301,7 @@ fn banner(view: &View<'_>) -> String {
     out
 }
 
-fn hidden(name: &str, value: &str) -> String {
+pub(crate) fn hidden(name: &str, value: &str) -> String {
     format!(
         "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
         escape(name),
@@ -315,7 +319,13 @@ fn button_form(view: &View<'_>, action: &str, fields: &[(&str, &str)], label: &s
     )
 }
 
-fn text_field(label: &str, name: &str, value: &str, max_chars: usize, required: bool) -> String {
+pub(crate) fn text_field(
+    label: &str,
+    name: &str,
+    value: &str,
+    max_chars: usize,
+    required: bool,
+) -> String {
     format!(
         "<label for=\"f-{name}\">{}</label><input type=\"text\" id=\"f-{name}\" name=\"{name}\" value=\"{}\" maxlength=\"{max_chars}\"{}>",
         escape(label),
@@ -840,7 +850,7 @@ const HELP_TOP: &str = "\
 <li>To use it inside a repository, run <code>src/harness.sh</code> from that folder (or link it onto your PATH). Your chats, providers and entries are kept in <code>~/.local/share/aharness</code>, not in the repository; the only thing added there is <code>.Aharness/</code> (subagent notes), which ignores itself.</li>\
 <li>A provider is a base URL, a model, a key and the API it speaks: <code>/provider add &lt;name&gt; &lt;base_url&gt; &lt;model&gt; [openai|anthropic]</code>. <code>openai</code> (the default) is chat completions, which OpenRouter and most routers speak; for Claude models on OpenRouter use an id such as <code>anthropic/claude-...</code> and the program asks for prompt caching by itself. <code>anthropic</code> is Anthropic\'s own Messages API (base URL <code>https://api.anthropic.com/v1</code>). The providers menu asks for the name, URL, which API and the key, then lists the models the provider offers so you pick the default (type to filter) instead of typing it; it can change the API later.</li>\
 <li>Esc (or Ctrl-C) while the model works cancels the message. <code>@</code> in the box attaches a file or folder of the working directory. A line starting with <code>/</code> lists the matching commands: Tab completes one, Enter completes a part of a command and sends a finished one.</li>\
-<li><code>/new</code> starts a fresh chat, <code>/resume</code> goes back to a saved one, <code>/compact</code> replaces a long chat with a summary.</li>\
+<li><code>/new</code> starts a fresh chat, <code>/resume</code> goes back to a saved one, <code>/compact</code> replaces a long chat with a summary. The model you choose with <code>/model</code> is the one the next start uses.</li>\
 <li><code>/approve</code> chooses how much the model may do alone: <em>manual</em> asks before every file change, saved glossary word or context entry, and command (answer <em>always</em> to stop being asked for glossary words or context for the rest of the run); <em>auto</em> lets file changes and saved words and entries run and still asks for commands. <code>/tools</code> shows what the model has, and the <a href=\"/tools\">Tools</a> page lists the same.</li>\
 </ul>\
 <h2>This web view</h2>\
@@ -864,6 +874,13 @@ const HELP_TOP: &str = "\
 <li><strong>For</strong>: an entry belongs to one project (the folder the chat was started in) or to every project. A project entry hides an every-project entry of the same name.</li>\
 <li><strong>Preload</strong>: an entry marked preload is put in the starting prompt of every subagent (shapes are on by default; about 2,000 tokens at most, the rest is named as left out). Use it sparingly, because it costs tokens on every subagent.</li>\
 <li>Limits: a name is up to 60 letters, digits, <code>.</code>, <code>-</code> or <code>_</code>; the text up to 8,000 bytes; the quote up to 1,000 characters.</li>\
+</ul>\
+<h2>Inbox</h2>\
+<p>Another harness (Claude Code, for example) that uses this program\'s MCP server can only <em>propose</em>: its <code>submit</code> tool puts an entry in the <a href=\"/inbox\">Inbox</a> and changes nothing else. You open each one, see it next to what is stored now, and accept or reject it; a rejection keeps your note. Who sent it and why are what the sender says, not checked, and text with control or invisible characters is refused. In the terminal: <code>/inbox</code>, <code>/inbox show N</code>, <code>/inbox accept N</code>, <code>/inbox reject N [note]</code>.</p>\
+<ul>\
+<li>The server is started by the other harness: <code>--mcp-serve</code> (read and propose, the default), <code>--mcp-serve --read-only</code> (read only) or <code>--mcp-serve --direct</code> (read and write with no review).</li>\
+<li>With <code>--decider llm[:PROVIDER[:MODEL]]</code> or <code>--decider jev[:PROVIDER[:MODEL]]</code> a model also suggests <em>accept</em>, <em>reject</em> or <em>unsure</em> for each entry. It is only a suggestion, shown next to the entry and never to the sender, and it never applies anything. It sends the entry\'s text to that provider, so it is off unless you start the server with it.</li>\
+<li><code>--eval-decider SPEC</code> tries a decider on 18 labelled cases and prints how it did.</li>\
 </ul>\
 <h2>Subagents</h2>\
 <ul>\

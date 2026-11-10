@@ -172,17 +172,24 @@ pub struct HttpProvider {
     agent: ureq::Agent,
 }
 
+/// How long a request to a router or to Jev may take.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The HTTP agent every outgoing request uses. By default ureq turns a 4xx/5xx reply into an error
+/// and drops the body; the body is wanted for the log and for the error text, so that is off.
+pub(crate) fn http_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
+}
+
 impl HttpProvider {
     /// `api_key` is `None` for a router that needs none (the owner's 9router):
     /// then no `Authorization` header is sent at all.
     pub fn new(base_url: &str, api_key: Option<&str>, timeout: Duration) -> Self {
-        // By default ureq turns a 4xx/5xx reply into an error and drops the
-        // body; we want to keep it for the log, so that is switched off.
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(timeout))
-            .build()
-            .into();
+        let agent = http_agent(timeout);
         Self {
             endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             models_endpoint: format!("{}/models", base_url.trim_end_matches('/')),

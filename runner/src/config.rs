@@ -117,6 +117,78 @@ pub fn names_a_provider(get: impl Fn(&str) -> Option<String>) -> bool {
         .any(|name| get(name).is_some_and(|v| !v.trim().is_empty()))
 }
 
+/// What `--decider` and `--eval-decider` name (issues 48 and 49).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeciderSpec {
+    /// No model: today's behaviour, and what no `--decider` means.
+    None,
+    /// A normal model behind a saved provider. `provider` is `None` for the one the chat used
+    /// last; `model` is `None` for that provider's default model.
+    Llm {
+        provider: Option<String>,
+        model: Option<String>,
+    },
+    /// OpenRouter's Jev decisions model (issue 49). `provider` is `None` for the one the chat used
+    /// last; it supplies the address and the key and must be an OpenRouter one. `model` is `None`
+    /// for the pinned snapshot (`jev::MODEL`); the provider's own chat model is never used.
+    Jev {
+        provider: Option<String>,
+        model: Option<String>,
+    },
+}
+
+impl DeciderSpec {
+    /// `none`, `llm`, `llm:PROVIDER`, `llm:PROVIDER:MODEL`, `jev`, `jev:PROVIDER` or
+    /// `jev:PROVIDER:MODEL`. Split on the first two colons only: a model may hold `:` and `/`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        let (kind, rest) = text
+            .split_once(':')
+            .map_or((text, None), |(k, r)| (k, Some(r)));
+        match (kind, rest) {
+            ("none", None) => Ok(DeciderSpec::None),
+            ("llm", rest) => {
+                let (provider, model) = provider_and_model("llm", rest)?;
+                Ok(DeciderSpec::Llm { provider, model })
+            }
+            ("jev", rest) => {
+                let (provider, model) = provider_and_model("jev", rest)?;
+                Ok(DeciderSpec::Jev { provider, model })
+            }
+            _ => Err(format!(
+                "'{text}' is not a decider: none, llm, llm:PROVIDER, llm:PROVIDER:MODEL, jev, jev:PROVIDER or jev:PROVIDER:MODEL"
+            )),
+        }
+    }
+}
+
+/// What follows `kind:` in a spec: a provider name and then a model (which may hold `:`).
+fn provider_and_model(
+    kind: &str,
+    rest: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let Some(rest) = rest else {
+        return Ok((None, None));
+    };
+    let (provider, model) = rest
+        .split_once(':')
+        .map_or((rest, None), |(p, m)| (p, Some(m)));
+    if provider.trim().is_empty() {
+        return Err(format!(
+            "{kind}: needs a provider name: {kind}:PROVIDER[:MODEL]"
+        ));
+    }
+    if model.is_some_and(|m| m.trim().is_empty()) {
+        return Err(format!(
+            "{kind}:PROVIDER: needs a model after the second colon"
+        ));
+    }
+    Ok((
+        Some(provider.trim().to_owned()),
+        model.map(|m| m.trim().to_owned()),
+    ))
+}
+
 /// What was typed after the program name.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -124,6 +196,20 @@ pub struct Options {
     pub resume: bool,
     /// Serve the web page (view and edit) on this port instead of starting a chat (issue 28).
     pub serve: Option<u16>,
+    /// Run as an MCP server on standard input and output instead of starting a chat (issue 45).
+    /// Without `direct` or `read_only` it is the buffer mode (issue 47): the read tools and `submit`.
+    pub mcp_serve: bool,
+    /// With `--mcp-serve`: offer the tools that write instead of `submit` (issue 46).
+    pub direct: bool,
+    /// With `--mcp-serve`: offer the read tools alone (issue 47). Excludes `direct`.
+    pub read_only: bool,
+    /// With `--mcp-serve` in the buffer mode: the decider that suggests accept, reject or unsure
+    /// for each new submission (issue 48). `None` when the flag was not given, which is the same
+    /// as `--decider none`.
+    pub decider: Option<DeciderSpec>,
+    /// Run the labelled cases through this decider and print how it did, then exit (issue 48).
+    /// Excludes every other option and writes nothing.
+    pub eval_decider: Option<DeciderSpec>,
     /// MCP servers to add before the chat starts (issue 44), in the order given.
     pub mcp: Vec<McpRequest>,
 }
@@ -139,7 +225,17 @@ pub enum McpRequest {
 }
 
 /// The options that end the words of `--mcp-add`.
-const OWN_OPTIONS: [&str; 4] = ["--resume", "--serve", "--mcp", "--mcp-add"];
+const OWN_OPTIONS: [&str; 9] = [
+    "--resume",
+    "--serve",
+    "--mcp",
+    "--mcp-add",
+    "--mcp-serve",
+    "--direct",
+    "--read-only",
+    "--decider",
+    "--eval-decider",
+];
 
 /// The port `--serve` uses when none is given.
 pub const DEFAULT_WEB_PORT: u16 = 8787;
@@ -165,6 +261,25 @@ impl Options {
                     };
                     options.serve = Some(port);
                 }
+                "--mcp-serve" => options.mcp_serve = true,
+                "--direct" => options.direct = true,
+                "--read-only" => options.read_only = true,
+                "--decider" => {
+                    let spec = args.next_if(|next| !next.starts_with("--")).ok_or(
+                        "--decider needs a value: none, llm[:PROVIDER[:MODEL]] or jev[:PROVIDER[:MODEL]]",
+                    )?;
+                    options.decider =
+                        Some(DeciderSpec::parse(&spec).map_err(|why| format!("--decider: {why}"))?);
+                }
+                "--eval-decider" => {
+                    let spec = args.next_if(|next| !next.starts_with("--")).ok_or(
+                        "--eval-decider needs a value: llm[:PROVIDER[:MODEL]] or jev[:PROVIDER[:MODEL]]",
+                    )?;
+                    options.eval_decider = Some(
+                        DeciderSpec::parse(&spec)
+                            .map_err(|why| format!("--eval-decider: {why}"))?,
+                    );
+                }
                 "--mcp" => {
                     let name = args
                         .next_if(|next| !next.starts_with("--"))
@@ -188,14 +303,75 @@ impl Options {
                 }
                 other => {
                     return Err(format!(
-                        "unknown option '{other}': the options are --resume, --serve [port], --mcp NAME and --mcp-add NAME COMMAND [ARGS]"
+                        "unknown option '{other}': the options are --resume, --serve [port], --mcp NAME, --mcp-add NAME COMMAND [ARGS] and --mcp-serve [--read-only | --direct | --decider SPEC] and --eval-decider SPEC"
                     ));
                 }
+            }
+        }
+        if let Some(spec) = &options.eval_decider {
+            if *spec == DeciderSpec::None {
+                return Err(
+                    "--eval-decider none has nothing to measure: name a decider, for example llm, llm:PROVIDER:MODEL or jev"
+                        .to_owned(),
+                );
+            }
+            if options.resume
+                || options.serve.is_some()
+                || options.mcp_serve
+                || options.direct
+                || options.read_only
+                || options.decider.is_some()
+                || !options.mcp.is_empty()
+            {
+                return Err(
+                    "--eval-decider runs the labelled cases and exits: it takes no other option"
+                        .to_owned(),
+                );
+            }
+        }
+        if options.decider.is_some() {
+            if !options.mcp_serve {
+                return Err(
+                    "--decider only goes with --mcp-serve: it chooses who suggests what to do with a submission"
+                        .to_owned(),
+                );
+            }
+            if options.read_only || options.direct {
+                return Err(
+                    "--decider needs the buffer mode: it excludes --read-only and --direct, which have no inbox"
+                        .to_owned(),
+                );
             }
         }
         if options.serve.is_some() && options.resume {
             return Err(
                 "--serve shows a web page and starts no chat: it takes no --resume".to_owned(),
+            );
+        }
+        if options.mcp_serve
+            && (options.resume || options.serve.is_some() || !options.mcp.is_empty())
+        {
+            return Err(
+                "--mcp-serve runs an MCP server and starts no chat: it takes no --resume, --serve, --mcp or --mcp-add"
+                    .to_owned(),
+            );
+        }
+        if options.direct && options.read_only {
+            return Err(
+                "--read-only and --direct exclude each other: --read-only serves the reads alone, --direct lets the server write"
+                    .to_owned(),
+            );
+        }
+        if options.read_only && !options.mcp_serve {
+            return Err(
+                "--read-only only goes with --mcp-serve: it limits that server to the read tools"
+                    .to_owned(),
+            );
+        }
+        if options.direct && !options.mcp_serve {
+            return Err(
+                "--direct only goes with --mcp-serve: it lets that server write to the database"
+                    .to_owned(),
             );
         }
         Ok(options)
@@ -403,6 +579,239 @@ mod tests {
         assert!(args(&["--serve", "70000"]).is_err());
         assert!(args(&["--serve", "x"]).is_err());
         assert!(args(&["--serve", "--resume"]).is_err());
+    }
+
+    #[test]
+    fn mcp_serve_is_alone_and_ends_the_words_of_mcp_add() {
+        assert!(args(&["--mcp-serve"]).unwrap().mcp_serve);
+        assert!(!args(&[]).unwrap().mcp_serve);
+        // It starts no chat, so nothing that belongs to a chat or to the web page goes with it.
+        for other in [
+            &["--resume"][..],
+            &["--serve"],
+            &["--mcp", "rust-docs"],
+            &["--mcp-add", "d", "p"],
+        ] {
+            let mut list = vec!["--mcp-serve"];
+            list.extend_from_slice(other);
+            let why = args(&list).unwrap_err();
+            assert!(why.contains("--mcp-serve"), "{why}");
+        }
+        // It is not swallowed as a word of the server --mcp-add describes.
+        let why = args(&["--mcp-add", "docs", "prog", "--mcp-serve"]).unwrap_err();
+        assert!(why.contains("--mcp-serve"), "{why}");
+    }
+
+    #[test]
+    fn direct_goes_only_with_mcp_serve() {
+        let options = args(&["--mcp-serve", "--direct"]).unwrap();
+        assert!(options.mcp_serve && options.direct);
+        assert!(args(&["--direct", "--mcp-serve"]).unwrap().direct);
+        assert!(!args(&["--mcp-serve"]).unwrap().direct);
+        for alone in [
+            &["--direct"][..],
+            &["--direct", "--resume"],
+            &["--resume", "--direct"],
+        ] {
+            let why = args(alone).unwrap_err();
+            assert!(
+                why.contains("--direct") && why.contains("--mcp-serve"),
+                "{why}"
+            );
+        }
+        // It is not swallowed as a word of the server --mcp-add describes.
+        assert!(args(&["--mcp-add", "d", "p", "--direct"]).is_err());
+    }
+
+    #[test]
+    fn read_only_goes_only_with_mcp_serve_and_excludes_direct() {
+        let options = args(&["--mcp-serve", "--read-only"]).unwrap();
+        assert!(options.mcp_serve && options.read_only && !options.direct);
+        assert!(args(&["--read-only", "--mcp-serve"]).unwrap().read_only);
+        // The default is neither flag: the buffer mode.
+        let plain = args(&["--mcp-serve"]).unwrap();
+        assert!(!plain.read_only && !plain.direct);
+        for alone in [
+            &["--read-only"][..],
+            &["--read-only", "--resume"],
+            &["--resume", "--read-only"],
+        ] {
+            let why = args(alone).unwrap_err();
+            assert!(
+                why.contains("--read-only") && why.contains("--mcp-serve"),
+                "{why}"
+            );
+        }
+        for both in [
+            &["--mcp-serve", "--read-only", "--direct"][..],
+            &["--mcp-serve", "--direct", "--read-only"],
+            &["--read-only", "--direct"],
+        ] {
+            let why = args(both).unwrap_err();
+            assert!(
+                why.contains("--read-only") && why.contains("--direct"),
+                "{why}"
+            );
+        }
+        // It is not swallowed as a word of the server --mcp-add describes.
+        assert!(args(&["--mcp-add", "d", "p", "--read-only"]).is_err());
+    }
+
+    fn llm(provider: Option<&str>, model: Option<&str>) -> DeciderSpec {
+        DeciderSpec::Llm {
+            provider: provider.map(str::to_owned),
+            model: model.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_decider_spec_is_none_llm_llm_provider_or_llm_provider_model() {
+        assert_eq!(DeciderSpec::parse("none"), Ok(DeciderSpec::None));
+        assert_eq!(DeciderSpec::parse("llm"), Ok(llm(None, None)));
+        assert_eq!(
+            DeciderSpec::parse("llm:openrouter"),
+            Ok(llm(Some("openrouter"), None))
+        );
+        assert_eq!(
+            DeciderSpec::parse("llm:openrouter:deepseek-chat"),
+            Ok(llm(Some("openrouter"), Some("deepseek-chat")))
+        );
+        // Split on the first two colons only: a model may hold ':' and '/'.
+        assert_eq!(
+            DeciderSpec::parse("llm:openrouter:deepseek/deepseek-chat:free"),
+            Ok(llm(Some("openrouter"), Some("deepseek/deepseek-chat:free")))
+        );
+        assert_eq!(
+            DeciderSpec::parse("llm:p:a:b:c"),
+            Ok(llm(Some("p"), Some("a:b:c")))
+        );
+    }
+
+    fn jev(provider: Option<&str>, model: Option<&str>) -> DeciderSpec {
+        DeciderSpec::Jev {
+            provider: provider.map(str::to_owned),
+            model: model.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_bad_decider_spec_is_refused() {
+        for bad in [
+            "", "LLM", "gpt", "none:x", "llm:", "llm::m", "llm:p:", "llm: :m", "JEV", "jev:",
+            "jev::m", "jev:p:", "jev: :m",
+        ] {
+            assert!(DeciderSpec::parse(bad).is_err(), "{bad:?}");
+        }
+        let why = args(&["--mcp-serve", "--decider", "jev:"]).unwrap_err();
+        assert!(why.contains("--decider") && why.contains("jev"), "{why}");
+    }
+
+    #[test]
+    fn a_jev_spec_is_jev_jev_provider_or_jev_provider_model() {
+        assert_eq!(DeciderSpec::parse("jev"), Ok(jev(None, None)));
+        assert_eq!(
+            DeciderSpec::parse("jev:openrouter"),
+            Ok(jev(Some("openrouter"), None))
+        );
+        assert_eq!(
+            DeciderSpec::parse("jev:openrouter:typesafe/jev-1.14-20261014"),
+            Ok(jev(Some("openrouter"), Some("typesafe/jev-1.14-20261014")))
+        );
+        // Split on the first two colons only: a model may hold ':' and '/'.
+        assert_eq!(
+            DeciderSpec::parse("jev:p:a/b:c"),
+            Ok(jev(Some("p"), Some("a/b:c")))
+        );
+        for flag in ["--decider", "--eval-decider"] {
+            for (spec, want) in [
+                ("jev", jev(None, None)),
+                ("jev:p", jev(Some("p"), None)),
+                ("jev:p:m", jev(Some("p"), Some("m"))),
+            ] {
+                let list: Vec<&str> = if flag == "--decider" {
+                    vec!["--mcp-serve", flag, spec]
+                } else {
+                    vec![flag, spec]
+                };
+                let options = args(&list).unwrap();
+                let got = if flag == "--decider" {
+                    options.decider
+                } else {
+                    options.eval_decider
+                };
+                assert_eq!(got, Some(want), "{list:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn decider_goes_only_with_the_buffer_mode_of_mcp_serve() {
+        let options = args(&["--mcp-serve", "--decider", "llm:p:m"]).unwrap();
+        assert_eq!(options.decider, Some(llm(Some("p"), Some("m"))));
+        assert_eq!(
+            args(&["--decider", "none", "--mcp-serve"]).unwrap().decider,
+            Some(DeciderSpec::None)
+        );
+        // The default is no flag, which is the same as none.
+        assert_eq!(args(&["--mcp-serve"]).unwrap().decider, None);
+        for alone in [
+            &["--decider", "llm"][..],
+            &["--resume", "--decider", "llm"],
+            &["--serve", "--decider", "none"],
+        ] {
+            let why = args(alone).unwrap_err();
+            assert!(
+                why.contains("--decider") && why.contains("--mcp-serve"),
+                "{why}"
+            );
+        }
+        for mode in ["--read-only", "--direct"] {
+            let why = args(&["--mcp-serve", mode, "--decider", "llm"]).unwrap_err();
+            assert!(why.contains("--decider") && why.contains(mode), "{why}");
+            assert!(args(&["--decider", "llm", "--mcp-serve", mode]).is_err());
+        }
+        // A value is needed, and it is not another option.
+        assert!(args(&["--mcp-serve", "--decider"]).is_err());
+        assert!(args(&["--mcp-serve", "--decider", "--read-only"]).is_err());
+        // It is not swallowed as a word of the server --mcp-add describes.
+        assert!(args(&["--mcp-add", "d", "p", "--decider", "llm"]).is_err());
+    }
+
+    #[test]
+    fn eval_decider_excludes_every_other_option_and_none() {
+        let options = args(&["--eval-decider", "llm:p:m:free"]).unwrap();
+        assert_eq!(options.eval_decider, Some(llm(Some("p"), Some("m:free"))));
+        assert!(options.decider.is_none() && !options.mcp_serve);
+        let why = args(&["--eval-decider", "none"]).unwrap_err();
+        assert!(
+            why.contains("--eval-decider") && why.contains("none"),
+            "{why}"
+        );
+        for other in [
+            &["--resume"][..],
+            &["--serve"],
+            &["--mcp-serve"],
+            &["--mcp-serve", "--read-only"],
+            &["--mcp-serve", "--direct"],
+            &["--mcp-serve", "--decider", "llm"],
+            &["--mcp", "rust-docs"],
+            &["--mcp-add", "d", "p"],
+        ] {
+            for first in [true, false] {
+                let mut list = vec!["--eval-decider", "llm"];
+                if first {
+                    list.splice(0..0, other.iter().copied());
+                } else {
+                    list.extend_from_slice(other);
+                }
+                let why = args(&list).unwrap_err();
+                assert!(why.contains("--eval-decider"), "{list:?}: {why}");
+            }
+        }
+        assert!(args(&["--eval-decider"]).is_err());
+        assert!(args(&["--eval-decider", "jev", "--mcp-serve"]).is_err());
+        assert!(args(&["--eval-decider", "jev", "--decider", "jev"]).is_err());
+        assert!(args(&["--mcp-add", "d", "p", "--eval-decider", "llm"]).is_err());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::providers::ProviderDef;
 use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, earlier_line};
 
 /// The schema version this program writes. It is kept in SQLite's `user_version`.
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 27;
 
 /// How long a write waits for another writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -233,6 +233,49 @@ CREATE TABLE IF NOT EXISTS mcp_tool_rules (
     tool      TEXT NOT NULL,
     rule      TEXT NOT NULL CHECK (rule IN ('ask', 'free', 'off')),
     PRIMARY KEY (server_id, tool)
+) STRICT;
+";
+
+// Issue 47: the inbox of the buffer mode of `--mcp-serve`. A row is a submission from outside
+// that the owner has not decided yet (`pending`), or the trail of one that was (`applied`,
+// `rejected`). Rows are never deleted; after the insert only `status`, `decided_at` and
+// `decision_note` change. `entry_json` is stored as it was first serialised and never rewritten,
+// and a partial unique index makes an identical resubmission of a pending entry the same row.
+const SCHEMA_V26: &str = "
+CREATE TABLE IF NOT EXISTS buffer_entries (
+    id             INTEGER PRIMARY KEY,
+    kind           TEXT NOT NULL CHECK (kind IN ('context', 'glossary', 'skill', 'personality', 'prompt')),
+    action         TEXT NOT NULL CHECK (action IN ('set', 'delete')),
+    name           TEXT NOT NULL,
+    project        TEXT NOT NULL DEFAULT '',
+    entry_json     TEXT NOT NULL,
+    why            TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'rejected')),
+    content_sha256 TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    decided_at     INTEGER,
+    decision_note  TEXT NOT NULL DEFAULT ''
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS buffer_entries_pending
+    ON buffer_entries (content_sha256) WHERE status = 'pending';
+";
+
+// Issue 48: what a decider (a model, later Jev) suggested about an inbox entry. One row per
+// (entry, decider), written once and never changed or deleted. The suggestion that a screen shows
+// (accept, reject or unsure) is derived from `verdict` and `confidence` when it is read, so the
+// thresholds can change without asking a model again; `raw` is the reply exactly as received.
+const SCHEMA_V27: &str = "
+CREATE TABLE IF NOT EXISTS buffer_suggestions (
+    id         INTEGER PRIMARY KEY,
+    buffer_id  INTEGER NOT NULL REFERENCES buffer_entries (id),
+    decider    TEXT NOT NULL,
+    verdict    TEXT NOT NULL CHECK (verdict IN ('accept', 'reject', 'unsure')),
+    confidence REAL CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    reason     TEXT NOT NULL,
+    raw        TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (buffer_id, decider)
 ) STRICT;
 ";
 
@@ -1317,6 +1360,18 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             p::BUILTIN_PROMPT.replace('\'', "''"),
             p::BASE_NAME,
             p::BUILTIN_PROMPT_V23.replace('\'', "''"),
+        ))?;
+    }
+    if version < 26 {
+        // Issue 47: the inbox table of the buffer mode.
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V26} PRAGMA user_version = 26; COMMIT;"
+        ))?;
+    }
+    if version < 27 {
+        // Issue 48: the suggestions of the deciders.
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V27} PRAGMA user_version = 27; COMMIT;"
         ))?;
     }
     Ok(())
