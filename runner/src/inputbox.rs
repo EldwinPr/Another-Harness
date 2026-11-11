@@ -1,18 +1,21 @@
-//! The box around the main prompt (issue 17), drawn only at a real terminal:
+//! The prompt line (issue 17, a prompt line instead of a box since issue 51), drawn only at a real
+//! terminal:
 //!
 //! ```text
-//! ╭──────────────────╮
-//! │ what you type    │
-//! │ and it wraps     │
-//! ╰──────────────────╯
+//! ────────────────────
+//! > what you type
+//!   and it wraps
+//! ────────────────────
 //!  model · provider │ approve: manual │ ...
 //! ```
 //!
-//! The box is as wide as the terminal and grows taller as the text wraps; when it would not fit
-//! the screen, the rows around the cursor are shown. Every key redraws the whole box: the cursor
-//! goes back up to the top, everything below is cleared and the box is printed again. After Enter
-//! the box is erased and what was typed is printed as a line of its own; while the model works a
-//! box with `working…` stays at the bottom and the output scrolls above it.
+//! The rules are as wide as the terminal and the prompt grows taller as the text wraps (rows are not
+//! padded, there are no sides). The text wraps at the last space that fits, so a word is cut only
+//! when it is longer than a whole row; when it would not fit the screen, the rows around the cursor are
+//! shown. Every key redraws the whole prompt: the cursor goes back up to the rule, everything below
+//! is cleared and the prompt is printed again. After Enter the prompt is erased and what was typed
+//! is printed as a line of its own; while the model works a prompt with `working…` stays at the
+//! bottom and the output scrolls above it.
 //! Each character counts as one column (wide characters are not measured).
 
 use std::io::{BufRead, Write};
@@ -52,21 +55,61 @@ pub fn command_matches(words: &[String], typed: &str, limit: usize) -> Vec<Strin
         .collect()
 }
 
-/// The narrowest box worth drawing.
-const MIN_WIDTH: usize = 20;
+/// The narrowest prompt drawn: enough columns that the text has room beside the `> `.
+const MIN_WIDTH: usize = 4;
 
-/// Rows of the screen the box leaves free: the two rules, the info line and one spare.
+/// The width the prompt is drawn at for a terminal `columns` wide: one column short of the edge
+/// (so a full row never depends on how the terminal wraps), but never below [`MIN_WIDTH`].
+fn drawn_width(columns: usize) -> usize {
+    columns.saturating_sub(1).max(MIN_WIDTH)
+}
+
+/// Rows of the screen the prompt leaves free: the rule, the info line and one spare.
 const SCREEN_MARGIN: usize = 4;
 
-/// One drawing of the box.
+/// What starts the first row of the text, and the same width in spaces for the rows after it.
+const PROMPT: &str = "> ";
+const PROMPT_WIDTH: usize = 2;
+
+/// Where each row of the text starts and ends (`start..end` into `chars`), `inner` columns wide.
+/// A row ends after the last space that fits, so a word is cut only when it is longer than a
+/// whole row. A row that would be exactly full leaves the cursor its place on the next one, so
+/// the last row is always shorter than `inner`.
+pub fn wrap(chars: &[char], inner: usize) -> Vec<(usize, usize)> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while chars.len() - start >= inner {
+        let window = &chars[start..start + inner];
+        let end = match window.iter().rposition(|&c| c == ' ') {
+            Some(i) if i > 0 => start + i + 1,
+            _ => start + inner,
+        };
+        rows.push((start, end));
+        start = end;
+    }
+    rows.push((start, chars.len()));
+    rows
+}
+
+/// The row and column of the cursor at `cursor` in the rows of [`wrap`]: the last row that starts at
+/// or before it (a cursor at a break is at the start of the next row).
+fn cursor_place(rows: &[(usize, usize)], cursor: usize) -> (usize, usize) {
+    let row = rows
+        .iter()
+        .rposition(|&(start, _)| start <= cursor)
+        .unwrap_or(0);
+    (row, cursor - rows[row].0)
+}
+
+/// One drawing of the prompt.
 pub struct Frame {
-    /// What to print: it starts at the top-left of the box and ends with the cursor in place.
+    /// What to print: it starts at the left end of the rule and ends with the cursor in place.
     pub text: String,
-    /// The cursor's row counted from the top rule (0): the next redraw goes up this far.
+    /// The cursor's row counted from the rule (0): the next redraw goes up this far.
     pub cursor_row: usize,
 }
 
-/// Draws the box for `chars` with the cursor at `cursor`. `scroll` is the first content row shown
+/// Draws the prompt for `chars` with the cursor at `cursor`. `scroll` is the first content row shown
 /// (kept between calls, moved only when the cursor would leave the window). `redraw_from` is the
 /// cursor row of the previous drawing, or `None` the first time.
 // Everything the drawing depends on is passed in, so a test can draw without a terminal.
@@ -86,11 +129,12 @@ pub fn frame(
     // The first line of `info` goes under the box; any more are a list under the choices.
     let (info, panel) = info.split_once('\n').unwrap_or((info, ""));
     let panel: Vec<&str> = panel.lines().collect();
-    // One column short of the edge, so a full row never depends on how the terminal wraps.
-    let width = width.max(MIN_WIDTH).saturating_sub(1).max(MIN_WIDTH);
-    let inner = width - 4;
-    let total = chars.len() / inner + 1;
-    let (cursor_row, cursor_col) = (cursor / inner, cursor % inner);
+    let width = drawn_width(width);
+    // shortcut: counts chars, not terminal columns, so wide text (CJK, emoji) miscounts rows; upgrade with unicode-width.
+    let inner = width - PROMPT_WIDTH;
+    let rows = wrap(chars, inner);
+    let total = rows.len();
+    let (cursor_row, cursor_col) = cursor_place(&rows, cursor);
     let visible = total.min(
         height
             .saturating_sub(SCREEN_MARGIN + choices.len() + panel.len())
@@ -104,16 +148,16 @@ pub fn frame(
     }
     *scroll = (*scroll).min(total - visible);
 
-    let rule = "─".repeat(width - 2);
-    let mut lines = vec![style.cyan(&format!("╭{rule}╮"))];
-    for row in *scroll..*scroll + visible {
-        let start = (row * inner).min(chars.len());
-        let end = ((row + 1) * inner).min(chars.len());
+    let mut lines = vec![style.cyan(&"─".repeat(width))];
+    for (row, &(start, end)) in rows.iter().enumerate().skip(*scroll).take(visible) {
         let text: String = chars[start..end].iter().collect();
-        let pad = " ".repeat(inner - (end - start));
-        lines.push(style.cyan(&format!("│ {text}{pad} │")));
+        lines.push(if row == 0 {
+            format!("{}{text}", style.cyan(PROMPT))
+        } else {
+            format!("{}{text}", " ".repeat(PROMPT_WIDTH))
+        });
     }
-    lines.push(style.cyan(&format!("╰{rule}╯")));
+    lines.push(style.cyan(&"─".repeat(width)));
     lines.push(style.dim(&format!(
         " {}",
         crate::toolview::cut(info, width.saturating_sub(2))
@@ -149,17 +193,17 @@ pub fn frame(
     if last > target {
         text.push_str(&format!("\x1b[{}A", last - target));
     }
-    text.push_str(&format!("\r\x1b[{}C", 2 + cursor_col));
+    text.push_str(&format!("\r\x1b[{}C", PROMPT_WIDTH + cursor_col));
     Frame {
         text,
         cursor_row: target,
     }
 }
 
-/// The box left at the bottom of the screen while the model works: `text` in it, the info line
-/// under it (and, if `info` has more lines, a list under that), `above` (already styled lines, such
-/// as a checklist) over it, and the cursor on the row below. Returns what to print and how many
-/// rows it has, which [`erase`] needs.
+/// The prompt left at the bottom of the screen while the model works: `text` after the `>`, the
+/// info line under it (and, if `info` has more lines, a list under that), `above` (already styled
+/// lines, such as a checklist) over it, and the cursor on the row below. Returns what to print and
+/// how many rows it has, which [`erase`] needs.
 pub fn static_box(
     style: Style,
     size: (usize, usize),
@@ -167,20 +211,12 @@ pub fn static_box(
     info: &str,
     above: &[String],
 ) -> (String, usize) {
-    let width = size.1.max(MIN_WIDTH).saturating_sub(1).max(MIN_WIDTH);
-    let inner = width - 4;
-    let rule = "─".repeat(width - 2);
-    let shown = crate::toolview::cut(text, inner);
-    let pad = " ".repeat(inner - shown.chars().count());
+    let width = drawn_width(size.1);
+    let shown = crate::toolview::cut(text, width - PROMPT_WIDTH);
     let mut lines: Vec<String> = above.to_vec();
-    lines.push(style.cyan(&format!("╭{rule}╮")));
-    lines.push(format!(
-        "{}{}{}",
-        style.cyan("│ "),
-        style.dim(&format!("{shown}{pad}")),
-        style.cyan(" │")
-    ));
-    lines.push(style.cyan(&format!("╰{rule}╯")));
+    lines.push(style.cyan(&"─".repeat(width)));
+    lines.push(format!("{}{}", style.cyan(PROMPT), style.dim(&shown)));
+    lines.push(style.cyan(&"─".repeat(width)));
     for line in info.lines() {
         lines.push(style.dim(&format!(
             " {}",
@@ -190,7 +226,7 @@ pub fn static_box(
     (format!("{}\r\n", lines.join("\r\n")), lines.len())
 }
 
-/// What takes a drawn box off the screen: the cursor goes up `rows` rows to the top-left corner
+/// What takes a drawn prompt off the screen: the cursor goes up `rows` rows to the start of the rule
 /// and everything below is cleared.
 pub fn erase(rows: usize) -> String {
     if rows > 0 {
@@ -609,81 +645,121 @@ mod tests {
     }
 
     #[test]
-    fn a_short_line_is_a_closed_box_with_the_info_under_it() {
+    fn a_short_line_is_a_rule_and_a_prompt_with_the_info_under_it() {
         let (line, screen) = run_keys(30, 24, b"hello\r");
         assert_eq!(line.as_deref(), Some("hello"));
         let rows = screen.lines();
-        assert_eq!(rows[0], format!("╭{}╮", "─".repeat(27)));
-        assert_eq!(rows[1], format!("│ hello{} │", " ".repeat(20)));
-        assert_eq!(rows[2], format!("╰{}╯", "─".repeat(27)));
+        assert_eq!(rows[0], "─".repeat(29));
+        assert_eq!(rows[1], "> hello");
+        assert_eq!(rows[2], "─".repeat(29), "a rule closes the text too");
         assert_eq!(rows[3], " info line");
         assert_eq!(rows.len(), 4);
     }
 
     #[test]
-    fn a_long_line_wraps_and_the_box_grows_taller_instead_of_scrolling_sideways() {
-        // Width 30 gives 25 columns of text per row: 60 characters need 3 rows.
+    fn a_long_line_wraps_and_the_prompt_grows_taller_instead_of_scrolling_sideways() {
+        // Width 30 gives 27 columns of text per row: 60 characters need 3 rows.
         let text = "abcdefghij".repeat(6);
         let (line, screen) = run_keys(30, 24, format!("{text}\r").as_bytes());
         assert_eq!(line.as_deref(), Some(text.as_str()));
         let rows = screen.lines();
-        assert_eq!(rows[1], "│ abcdefghijabcdefghijabcde │");
-        assert_eq!(rows[2], "│ fghijabcdefghijabcdefghij │");
-        assert_eq!(rows[3], "│ abcdefghij                │");
-        assert_eq!(rows[4], format!("╰{}╯", "─".repeat(27)));
+        assert_eq!(rows[1], "> abcdefghijabcdefghijabcdefg");
+        assert_eq!(rows[2], "  hijabcdefghijabcdefghijabcd");
+        assert_eq!(rows[3], "  efghij");
+        assert_eq!(rows[4], "─".repeat(29));
+        assert_eq!(rows[5], " info line");
         assert_eq!(rows.len(), 6);
-        assert!(
-            rows.iter().take(5).all(|r| r.chars().count() == 29),
-            "{rows:?}"
-        );
+        // Only the rules span the width; the text rows are not padded.
+        assert!(rows.iter().all(|r| r.chars().count() <= 29), "{rows:?}");
     }
 
     #[test]
     fn a_line_that_exactly_fills_a_row_makes_room_for_the_cursor_on_the_next() {
-        let (_, screen) = run_keys(30, 24, format!("{}\r", "x".repeat(25)).as_bytes());
+        let (_, screen) = run_keys(30, 24, format!("{}\r", "x".repeat(27)).as_bytes());
         let rows = screen.lines();
-        assert_eq!(rows[1], format!("│ {} │", "x".repeat(25)));
-        assert_eq!(rows[2], format!("│ {} │", " ".repeat(25)));
-        assert_eq!(rows[3], format!("╰{}╯", "─".repeat(27)));
+        assert_eq!(rows[1], format!("> {}", "x".repeat(27)));
+        assert_eq!(rows[2], "", "the row for the cursor is empty");
+        assert_eq!(rows[3], "─".repeat(29));
+        assert_eq!(rows[4], " info line");
     }
 
     #[test]
-    fn editing_redraws_the_box_in_place_and_leaves_one_box_on_screen() {
+    fn a_long_line_wraps_at_spaces_and_a_word_is_cut_only_when_longer_than_a_row() {
+        // Width 30: 27 columns of text per row.
+        let text = "the quick brown fox jumps over the lazy dog again";
+        let (line, screen) = run_keys(30, 24, format!("{text}\r").as_bytes());
+        assert_eq!(line.as_deref(), Some(text));
+        let rows = screen.lines();
+        assert_eq!(rows[1], "> the quick brown fox jumps");
+        assert_eq!(rows[2], "  over the lazy dog again");
+        assert_eq!(rows[3], "─".repeat(29));
+        // A word longer than a whole row is still cut.
+        let long = format!("hi {}", "w".repeat(40));
+        let (_, screen) = run_keys(30, 24, format!("{long}\r").as_bytes());
+        let rows = screen.lines();
+        assert_eq!(rows[1], "> hi");
+        assert_eq!(rows[2], format!("  {}", "w".repeat(27)));
+        assert_eq!(rows[3], format!("  {}", "w".repeat(13)));
+    }
+
+    #[test]
+    fn wrap_gives_rows_that_cover_the_text_and_leave_the_cursor_a_place() {
+        let chars = |s: &str| s.chars().collect::<Vec<_>>();
+        assert_eq!(wrap(&chars(""), 5), [(0, 0)]);
+        assert_eq!(wrap(&chars("abc"), 5), [(0, 3)]);
+        // Exactly full: the cursor needs the next row.
+        assert_eq!(wrap(&chars("abcde"), 5), [(0, 5), (5, 5)]);
+        assert_eq!(wrap(&chars("ab cdefg"), 5), [(0, 3), (3, 8), (8, 8)]);
+        assert_eq!(wrap(&chars("ab cdef"), 5), [(0, 3), (3, 7)]);
+        // A space only at the start of the window is no place to break.
+        assert_eq!(wrap(&chars(" abcdefg"), 5), [(0, 5), (5, 8)]);
+        for (text, inner) in [("a b c d e f g h", 4), ("xxxxxxxxxxxx", 5), ("a  b  c", 3)] {
+            let rows = wrap(&chars(text), inner);
+            assert_eq!(rows[0].0, 0);
+            assert_eq!(rows.last().unwrap().1, text.chars().count());
+            assert!(rows.windows(2).all(|w| w[0].1 == w[1].0), "{rows:?}");
+            assert!(rows.iter().all(|&(a, b)| b - a <= inner), "{rows:?}");
+            assert!(rows.last().map(|&(a, b)| b - a < inner).unwrap());
+        }
+    }
+
+    #[test]
+    fn editing_redraws_the_prompt_in_place_and_leaves_one_prompt_on_screen() {
         // Type, move left twice, delete the character before the cursor, add one in its place.
         let (line, screen) = run_keys(30, 24, b"hello\x1b[D\x1b[D\x7fX\r");
         assert_eq!(line.as_deref(), Some("heXlo"));
         let rows = screen.lines();
         assert_eq!(rows.len(), 4, "{rows:?}");
-        assert_eq!(rows[1], format!("│ heXlo{} │", " ".repeat(20)));
+        assert_eq!(rows[1], "> heXlo");
     }
 
     #[test]
-    fn deleting_back_over_a_wrap_shrinks_the_box_again() {
-        let keys = format!("{}\x7f\x7f\r", "y".repeat(26));
+    fn deleting_back_over_a_wrap_shrinks_the_prompt_again() {
+        let keys = format!("{}\x7f\x7f\x7f\r", "y".repeat(29));
         let (line, screen) = run_keys(30, 24, keys.as_bytes());
-        assert_eq!(line.as_deref(), Some(&*"y".repeat(24)));
+        assert_eq!(line.as_deref(), Some(&*"y".repeat(26)));
         let rows = screen.lines();
         assert_eq!(rows.len(), 4, "{rows:?}");
     }
 
     #[test]
-    fn a_box_taller_than_the_screen_shows_the_rows_around_the_cursor() {
-        // Height 8 leaves 4 content rows; 150 characters are 6 rows of 25.
-        let text: String = (0..150)
-            .map(|i| char::from(b'a' + (i / 25) as u8))
+    fn a_prompt_taller_than_the_screen_shows_the_rows_around_the_cursor() {
+        // Height 8 leaves 4 text rows; 162 characters are 6 rows of 27 and an empty seventh.
+        let text: String = (0..162)
+            .map(|i| char::from(b'a' + (i / 27) as u8))
             .collect();
         let (line, screen) = run_keys(30, 8, format!("{text}\r").as_bytes());
         assert_eq!(line.as_deref(), Some(text.as_str()));
         let rows = screen.lines();
-        // 7 rows of text (the last one empty, holding the cursor): the last 4 are shown.
-        assert_eq!(rows.len(), 4 + 3, "{rows:?}");
+        // The last 4 of the 7 rows are shown, a rule over them and one under, then the info line.
+        assert_eq!(rows.len(), 1 + 4 + 1 + 1, "{rows:?}");
         assert!(rows[1].contains("ddddd"), "{rows:?}");
         assert!(rows[3].contains("fffff"), "{rows:?}");
-        assert_eq!(rows[4], format!("│ {} │", " ".repeat(25)));
+        assert_eq!(rows[4], "");
     }
 
     #[test]
-    fn the_end_of_the_input_leaves_the_box_and_returns_none() {
+    fn the_end_of_the_input_leaves_the_prompt_and_returns_none() {
         let (line, screen) = run_keys(30, 24, b"\x04");
         assert_eq!(line, None);
         assert_eq!(screen.lines().len(), 4);
@@ -744,7 +820,8 @@ mod tests {
     }
 
     #[test]
-    fn more_lines_in_the_info_are_a_list_under_the_box_and_the_working_box_takes_rows_for_them() {
+    fn more_lines_in_the_info_are_a_list_under_the_prompt_and_the_working_prompt_takes_rows_for_them()
+     {
         let (shown, rows) = static_box(
             Style::plain(),
             (24, 30),
@@ -758,7 +835,9 @@ mod tests {
         let lines = screen.lines();
         assert_eq!(lines[0], " steps 0/1");
         assert_eq!(lines[1], "  ▸ read");
-        assert_eq!(lines[2], format!("╭{}╮", "─".repeat(27)));
+        assert_eq!(lines[2], "─".repeat(29));
+        assert_eq!(lines[3], "> working…");
+        assert_eq!(lines[4], "─".repeat(29));
         assert_eq!(lines[5], " info");
         assert_eq!(lines[6], " ● s1  sleep");
         assert_eq!(lines[7], " ● a2  reviewer");
@@ -778,13 +857,14 @@ mod tests {
         let mut screen = Screen::new(30);
         screen.feed(drawn.text.as_bytes());
         let lines = screen.lines();
+        assert_eq!(lines[2], "─".repeat(29));
         assert_eq!(lines[3], " info");
         assert_eq!(lines[4], " listed task");
-        assert_eq!(screen.row, 1, "the cursor is in the box");
+        assert_eq!(screen.row, 1, "the cursor is on the prompt");
     }
 
     #[test]
-    fn erasing_takes_the_whole_box_off_the_screen_and_leaves_the_text_above_it() {
+    fn erasing_takes_the_whole_prompt_off_the_screen_and_leaves_the_text_above_it() {
         let mut input = Cursor::new(b"hello".to_vec());
         let mut output = b"earlier output\r\n".to_vec();
         let (line, row) = read_boxed(
@@ -805,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn the_box_for_the_time_the_model_works_sits_under_the_output_and_can_be_replaced() {
+    fn the_prompt_for_the_time_the_model_works_sits_under_the_output_and_can_be_replaced() {
         let (shown, rows) = static_box(Style::plain(), (24, 30), "working…", "info", &[]);
         assert_eq!(rows, 4);
         let mut output = shown.into_bytes();
@@ -821,22 +901,30 @@ mod tests {
         screen.feed(&output);
         let lines = screen.lines();
         assert_eq!(lines[0], "a tool line");
-        assert_eq!(lines[1], format!("╭{}╮", "─".repeat(27)));
-        assert_eq!(lines[2], format!("│ working…{} │", " ".repeat(17)));
+        assert_eq!(lines[1], "─".repeat(29));
+        assert_eq!(lines[2], "> working…");
+        assert_eq!(lines[3], "─".repeat(29));
         assert_eq!(lines[4], " info");
         assert_eq!(lines.len(), 5);
         assert_eq!(screen.row, 5);
     }
 
     #[test]
-    fn a_narrow_terminal_still_draws_a_box() {
+    fn a_narrow_terminal_still_draws_a_prompt() {
         let (line, screen) = run_keys(20, 24, b"ok\r");
         assert_eq!(line.as_deref(), Some("ok"));
-        assert!(screen.lines()[0].starts_with('╭'));
+        assert!(screen.lines()[0].starts_with('─'));
+        assert_eq!(screen.lines()[1], "> ok");
+        // A terminal of 10 columns: the prompt is drawn 9 wide and wraps the text beside the `> `.
+        let (line, screen) = run_keys(10, 24, b"ab cdefghij\r");
+        assert_eq!(line.as_deref(), Some("ab cdefghij"));
+        let rows = screen.lines();
+        assert!(rows.iter().all(|r| r.chars().count() <= 9), "{rows:?}");
+        assert_eq!(rows[0], "─".repeat(9));
     }
 
     #[test]
-    fn colour_paints_the_box_cyan_and_the_info_dim() {
+    fn colour_paints_the_rule_and_the_prompt_cyan_and_the_info_dim() {
         let mut scroll = 0;
         let chars: Vec<char> = "hi".chars().collect();
         let drawn = frame(
@@ -849,8 +937,12 @@ mod tests {
             None,
             (&[], 0),
         );
-        assert!(drawn.text.starts_with("\x1b[36m╭"), "{:?}", drawn.text);
-        assert!(drawn.text.contains("\x1b[36m│ hi"), "{:?}", drawn.text);
+        assert!(drawn.text.starts_with("\x1b[36m──"), "{:?}", drawn.text);
+        assert!(
+            drawn.text.contains("\x1b[36m> \x1b[0mhi"),
+            "{:?}",
+            drawn.text
+        );
         assert!(
             drawn.text.contains("\x1b[2m info\x1b[0m"),
             "{:?}",
@@ -884,7 +976,7 @@ mod tests {
         // files in it are the choices now.
         let (_, screen) = run_with_files(40, b"@do\t", &files);
         let rows = screen.lines();
-        assert_eq!(rows[1], format!("│ @docs/{} │", " ".repeat(35 - 6)));
+        assert_eq!(rows[1], "> @docs/");
         assert_eq!(rows[4], " ▸ docs/a.md");
         // Tab on a file puts a space after it.
         let (line, _) = run_with_files(40, b"@do\t\t\r", &files);
@@ -896,7 +988,8 @@ mod tests {
         // No Enter: the last drawing stays on screen.
         let (_, screen) = run_with_files(40, b"look @ma", FILES);
         let rows = screen.lines();
-        assert_eq!(rows[1], format!("│ look @ma{} │", " ".repeat(35 - 8)));
+        assert_eq!(rows[1], "> look @ma");
+        assert_eq!(rows[2], "─".repeat(39));
         assert_eq!(rows[3], " info line");
         assert_eq!(rows[4], " ▸ src/main.rs");
         assert_eq!(rows[5], "   docs/main.md");
@@ -959,11 +1052,11 @@ mod tests {
     fn the_list_leaves_nothing_behind_when_it_closes() {
         let (_, screen) = run_with_files(40, b"@ma \x7f\x7f\x7f", FILES);
         // Back to the plain word "@" + nothing: the list for an empty query is open, but the text
-        // above is the box; make sure only one box is on screen.
+        // above is the prompt; make sure only one prompt (a rule over it and one under) is on screen.
         let rows = screen.lines();
         assert_eq!(
-            rows.iter().filter(|r| r.starts_with('╭')).count(),
-            1,
+            rows.iter().filter(|r| r.starts_with('─')).count(),
+            2,
             "{rows:?}"
         );
     }

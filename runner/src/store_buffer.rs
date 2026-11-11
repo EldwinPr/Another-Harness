@@ -24,8 +24,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::decider::{Opinion, Verdict, derive};
 use crate::store::{Edit, Store, StoreError, now_secs, sha256_hex};
-use crate::store_context::{Saved, check_kind, check_name, check_quote, check_scope, check_text};
+use crate::store_context::{
+    Quote, Saved, check_kind, check_name, check_quote, check_quotes, check_scope,
+    check_shape_evidence, check_text,
+};
 use crate::store_glossary::{check_area, check_definition, check_term};
+use crate::store_gotchas::{check_gotcha_text, check_type};
 use crate::store_profiles::check_description;
 use crate::store_prompts::{PromptType, check_prompt_name, check_prompt_text};
 
@@ -38,7 +42,14 @@ pub const MAX_RAW_CHARS: usize = 20_000;
 /// The longest `source`, in characters.
 pub const MAX_SOURCE_CHARS: usize = 100;
 /// What can be submitted. Profiles cannot: only the owner changes what a chat starts with.
-pub const KINDS: [&str; 5] = ["context", "glossary", "skill", "personality", "prompt"];
+pub const KINDS: [&str; 6] = [
+    "context",
+    "glossary",
+    "skill",
+    "personality",
+    "prompt",
+    "gotcha",
+];
 /// What a submission can ask for: add or replace, or delete.
 pub const ACTIONS: [&str; 2] = ["set", "delete"];
 
@@ -46,7 +57,7 @@ pub const ACTIONS: [&str; 2] = ["set", "delete"];
 /// that goes into `entry_json`, in this field order.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {
-    /// `context`, `glossary`, `skill`, `personality` or `prompt` (a system prompt).
+    /// `context`, `glossary`, `skill`, `personality`, `prompt` (a system prompt) or `gotcha`.
     pub kind: String,
     /// `set` (add or replace) or `delete`.
     pub action: String,
@@ -64,6 +75,13 @@ pub struct Submission {
     pub quote: String,
     /// The business area of a context entry or glossary term; `None` keeps the stored one.
     pub area: Option<String>,
+    /// A gotcha's type (`convention`, `hazard`, `trap`, ...); empty for other kinds. Left out of
+    /// the stored JSON when empty, so an older row and its hash read as they did.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gotcha_type: String,
+    /// The owner's dated words a shape rests on (issue 50); empty for other entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quotes: Vec<Quote>,
 }
 
 /// Characters that draw nothing or reorder what is drawn: the soft hyphen, zero-width and
@@ -105,8 +123,19 @@ impl Submission {
             ("quote", self.quote.as_str()),
             ("area", self.area.as_deref().unwrap_or_default()),
             ("project", self.project.as_str()),
+            ("gotcha_type", self.gotcha_type.as_str()),
         ] {
             check_visible(field, text)?;
+        }
+        for q in &self.quotes {
+            for (field, text) in [
+                ("quotes", q.quote.as_str()),
+                ("quotes", q.said_on.as_str()),
+                ("quotes", q.claim.as_str()),
+                ("quotes", q.replaces.as_str()),
+            ] {
+                check_visible(field, text)?;
+            }
         }
         let kind = self.kind.trim().to_lowercase();
         let action = self.action.trim().to_lowercase();
@@ -122,12 +151,15 @@ impl Submission {
         let delete = action == "delete";
         let allowed: &[&str] = match (kind.as_str(), delete) {
             (_, true) => &[],
-            ("context", false) => &["context_kind", "text", "quote", "area"],
+            ("context", false) => &["context_kind", "text", "quote", "area", "quotes"],
             ("glossary", false) => &["text", "area"],
+            ("gotcha", false) => &["gotcha_type", "text"],
             _ => &["text", "description"],
         };
         let given = [
             ("context_kind", !self.context_kind.trim().is_empty()),
+            ("gotcha_type", !self.gotcha_type.trim().is_empty()),
+            ("quotes", !self.quotes.is_empty()),
             ("text", !self.text.trim().is_empty()),
             ("description", !self.description.trim().is_empty()),
             ("quote", !self.quote.trim().is_empty()),
@@ -159,6 +191,20 @@ impl Submission {
                     checked.text = check_text(&self.text)?;
                     checked.quote = check_quote(&self.quote)?;
                     checked.area = self.area.as_deref().map(check_area).transpose()?;
+                    checked.quotes = check_quotes(&self.quotes)?;
+                    if checked.context_kind == "shape" {
+                        check_shape_evidence(&checked.text, &checked.quote, &checked.quotes)?;
+                    } else if !checked.quotes.is_empty() {
+                        return Err("only a shape has quotes".to_owned());
+                    }
+                }
+            }
+            "gotcha" => {
+                checked.name = check_name(&self.name)?;
+                checked.project = check_scope(&self.project)?;
+                if !delete {
+                    checked.gotcha_type = check_type(&self.gotcha_type)?;
+                    checked.text = check_gotcha_text(&self.text)?;
                 }
             }
             "glossary" => {
@@ -202,6 +248,7 @@ impl Submission {
         match self.kind.as_str() {
             "context" => format!("context entry '{}' for {}", self.name, scope(&self.project)),
             "glossary" => format!("glossary term '{}' for {}", self.name, scope(&self.project)),
+            "gotcha" => format!("gotcha '{}' for {}", self.name, scope(&self.project)),
             "prompt" => format!("system prompt '{}'", self.name),
             other => format!("{other} '{}'", self.name),
         }
@@ -595,6 +642,8 @@ pub struct Stored {
     pub context_kind: String,
     pub quote: String,
     pub area: String,
+    /// The quotes a stored shape rests on (issue 50).
+    pub quotes: Vec<Quote>,
     /// A system prompt that is in the profile new chats start under: accepting changes what the
     /// next chat sends.
     pub on: bool,
@@ -613,11 +662,28 @@ pub fn current_target(store: &Store, sub: &Submission) -> Result<Option<Stored>,
             .map(|e| Stored {
                 id: e.id,
                 fingerprint: e.fingerprint(),
+                quotes: store.context_quotes(e.id).unwrap_or_default(),
                 text: e.text,
                 description: String::new(),
                 context_kind: e.kind,
                 quote: e.quote,
                 area: e.area,
+                on: false,
+            })),
+        "gotcha" => Ok(store
+            .list_all_gotchas()
+            .map_err(failed)?
+            .into_iter()
+            .find(|g| g.project == sub.project && g.name.eq_ignore_ascii_case(&sub.name))
+            .map(|g| Stored {
+                id: g.id,
+                fingerprint: g.fingerprint(),
+                text: g.text,
+                description: String::new(),
+                context_kind: g.kind,
+                quote: String::new(),
+                area: String::new(),
+                quotes: Vec::new(),
                 on: false,
             })),
         "glossary" => Ok(store
@@ -633,6 +699,7 @@ pub fn current_target(store: &Store, sub: &Submission) -> Result<Option<Stored>,
                 context_kind: String::new(),
                 quote: String::new(),
                 area: e.area,
+                quotes: Vec::new(),
                 on: false,
             })),
         _ => {
@@ -658,6 +725,7 @@ pub fn current_target(store: &Store, sub: &Submission) -> Result<Option<Stored>,
                     context_kind: String::new(),
                     quote: String::new(),
                     area: String::new(),
+                    quotes: Vec::new(),
                     on: p.enabled && p.prompt_type == PromptType::System,
                 })),
             }
@@ -701,6 +769,17 @@ pub fn apply_entry(
     id: i64,
     expected: Option<&str>,
 ) -> Result<ApplyOutcome, StoreError> {
+    apply_entry_noted(store, id, expected, "")
+}
+
+/// [`apply_entry`] that leaves `note` on the row when it is applied (the program's own words, for
+/// example that a decider accepted it automatically).
+pub fn apply_entry_noted(
+    store: &mut Store,
+    id: i64,
+    expected: Option<&str>,
+    note: &str,
+) -> Result<ApplyOutcome, StoreError> {
     let Some(row) = store.buffer_entry(id)? else {
         return Err(StoreError::new(format!("there is no submission #{id}")));
     };
@@ -718,7 +797,7 @@ pub fn apply_entry(
         ApplyOutcome::Applied(_) | ApplyOutcome::NoChange => {
             // Another window may have rejected the row between the write and this mark: say so,
             // since the trail would read "rejected" for a change that was made.
-            if !store.mark_buffer_applied(id, "")? {
+            if !store.mark_buffer_applied(id, note)? {
                 return Ok(ApplyOutcome::Failed(format!(
                     "#{id} was decided by someone else while it was being applied: check the item and the inbox"
                 )));
@@ -773,18 +852,35 @@ fn apply_pending(store: &mut Store, row: &BufferEntry, expected: Option<&str>) -
         })
     };
     match (sub.kind.as_str(), sub.action.as_str()) {
-        ("context", "set") => match store.set_context(
+        ("context", "set") => match store.set_context_with_quotes(
             &sub.project,
             &sub.name,
             &sub.context_kind,
             &sub.text,
             &sub.quote,
             sub.area.as_deref(),
+            &sub.quotes,
         ) {
             Ok(done) => saved(done),
             Err(e) => failed(e),
         },
         ("context", _) => match store.delete_context(&sub.project, &sub.name) {
+            Ok(done) => deleted(done),
+            Err(e) => failed(e),
+        },
+        ("gotcha", "set") => {
+            match store.set_gotcha_in(
+                &sub.project,
+                &sub.name,
+                &sub.gotcha_type,
+                &sub.text,
+                &row.source,
+            ) {
+                Ok(done) => saved(done),
+                Err(e) => failed(e),
+            }
+        }
+        ("gotcha", _) => match store.delete_gotcha_in(&sub.project, &sub.name) {
             Ok(done) => deleted(done),
             Err(e) => failed(e),
         },

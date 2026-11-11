@@ -312,6 +312,7 @@ fn what_is_stored_now_goes_with_a_replacement_and_a_system_prompt_in_use_is_mark
         context_kind: "rule".to_owned(),
         quote: "the owner said so".to_owned(),
         area: "writing".to_owned(),
+        quotes: Vec::new(),
         on: false,
     });
     decider.judge(&c).unwrap();

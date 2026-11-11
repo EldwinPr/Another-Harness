@@ -179,6 +179,8 @@ fn field_line(label: &str, stored: Option<&Stored>, submitted: &str) -> String {
         ("kind", Some(s)) => s.context_kind.clone(),
         ("area", Some(s)) => s.area.clone(),
         ("quote", Some(s)) => s.quote.clone(),
+        ("type", Some(s)) => s.context_kind.clone(),
+        ("quotes", Some(s)) => inbox_view::quotes_words(&s.quotes),
         (_, Some(s)) => s.description.clone(),
     };
     format!(
@@ -279,7 +281,7 @@ fn print_entry<R: BufRead, W: Write>(term: &Shared<R, W>, loaded: &Loaded) {
     }
     match stored {
         None => {
-            let off = if matches!(sub.kind.as_str(), "context" | "glossary") {
+            let off = if matches!(sub.kind.as_str(), "context" | "glossary" | "gotcha") {
                 ""
             } else {
                 "; a new item is saved switched off"

@@ -63,6 +63,7 @@ fn stored(text: &str) -> Stored {
         context_kind: String::new(),
         quote: String::new(),
         area: String::new(),
+        quotes: Vec::new(),
         on: false,
     }
 }

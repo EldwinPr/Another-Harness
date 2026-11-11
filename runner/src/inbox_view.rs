@@ -169,6 +169,28 @@ pub fn first_line(text: &str, limit: usize) -> String {
     shown
 }
 
+/// The quotes of a shape as plain lines: the day, the owner's words, and what each supports or
+/// replaces. Still to be escaped or made printable.
+pub fn quotes_words(quotes: &[crate::store_context::Quote]) -> String {
+    quotes
+        .iter()
+        .map(|q| {
+            let supports = if q.claim.is_empty() {
+                String::new()
+            } else {
+                format!(" [supports: {}]", q.claim)
+            };
+            let replaces = if q.replaces.is_empty() {
+                String::new()
+            } else {
+                format!(" [replaces: {}]", q.replaces)
+            };
+            format!("{}: {}{supports}{replaces}", q.said_on, q.quote)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The fields of a submission that a screen puts next to the stored ones, as (label, value), for a
 /// `set`. A field the submission leaves out is shown as what accepting does with it.
 pub fn submitted_fields(sub: &Submission) -> Vec<(&'static str, String)> {
@@ -182,11 +204,26 @@ pub fn submitted_fields(sub: &Submission) -> Vec<(&'static str, String)> {
     };
     let area = sub.area.clone().unwrap_or_else(|| keeps.clone());
     match sub.kind.as_str() {
-        "context" => vec![
-            ("kind", sub.context_kind.clone()),
-            ("area", area),
-            ("quote", or_keeps(&sub.quote)),
-        ],
+        "context" => {
+            let mut fields = vec![
+                ("kind", sub.context_kind.clone()),
+                ("area", area),
+                ("quote", or_keeps(&sub.quote)),
+            ];
+            if sub.context_kind == "shape" || !sub.quotes.is_empty() {
+                let words = quotes_words(&sub.quotes);
+                fields.push((
+                    "quotes",
+                    if words.is_empty() {
+                        "(none: keeps the stored ones)".to_owned()
+                    } else {
+                        words
+                    },
+                ));
+            }
+            fields
+        }
+        "gotcha" => vec![("type", sub.gotcha_type.clone())],
         "glossary" => vec![("area", area)],
         _ => vec![(
             "description",

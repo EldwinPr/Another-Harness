@@ -44,7 +44,7 @@ fn dsession(path: &Path, project: &str, lines: &[Value]) -> Vec<Value> {
 }
 
 /// Calls one tool on a direct server, started in `project`.
-fn dcall_in(path: &Path, project: &str, tool: &str, arguments: Value) -> (String, bool) {
+pub(super) fn dcall_in(path: &Path, project: &str, tool: &str, arguments: Value) -> (String, bool) {
     let reply = dsession(
         path,
         project,
@@ -106,7 +106,7 @@ fn names_of(path: &Path) -> Vec<String> {
 }
 
 #[test]
-fn direct_lists_the_eight_read_tools_then_the_ten_write_tools() {
+fn direct_lists_the_twelve_read_tools_then_the_ten_write_tools_and_the_notes_tools() {
     let (_dir, path) = seeded("direct-list");
     let names = names_of(&path);
     let read_names = [
@@ -118,12 +118,17 @@ fn direct_lists_the_eight_read_tools_then_the_ten_write_tools() {
         "library_get",
         "profile_list",
         "profile_get",
+        "gotchas_list",
+        "gotchas_get",
+        "logs_list",
+        "logs_get",
     ];
-    assert_eq!(names.len(), 18);
-    assert_eq!(names[..8], read_names);
-    assert_eq!(names[8..], WRITE_NAMES);
+    assert_eq!(names.len(), 25);
+    assert_eq!(names[..12], read_names);
+    assert_eq!(names[12..22], WRITE_NAMES);
+    assert_eq!(names[22..], ["gotcha_set", "gotcha_delete", "log_add"]);
     let reply = dsession(&path, "", &[request(1, "tools/list", Value::Null)]);
-    for tool in &reply[0]["result"]["tools"].as_array().unwrap()[8..] {
+    for tool in &reply[0]["result"]["tools"].as_array().unwrap()[12..] {
         let name = tool["name"].as_str().unwrap();
         assert!(
             tool["description"].as_str().unwrap().starts_with("Writes."),
@@ -132,8 +137,8 @@ fn direct_lists_the_eight_read_tools_then_the_ten_write_tools() {
         assert_eq!(tool["inputSchema"]["type"], "object", "{name}");
         assert!(tool["inputSchema"]["properties"].is_object(), "{name}");
     }
-    // The first eight are the ones the read-only server lists, unchanged.
-    for tool in &reply[0]["result"]["tools"].as_array().unwrap()[..8] {
+    // The first twelve are the ones the read-only server lists, unchanged.
+    for tool in &reply[0]["result"]["tools"].as_array().unwrap()[..12] {
         assert!(
             tool["description"]
                 .as_str()
@@ -168,7 +173,7 @@ fn without_direct_no_write_tool_is_listed_or_callable_and_the_file_is_untouched(
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(listed.len(), 8);
+    assert_eq!(listed.len(), 12);
     for name in WRITE_NAMES {
         assert!(!listed.contains(&name), "{name} is listed");
         let reply = super::tests::session(
@@ -1042,7 +1047,7 @@ fn nothing_a_write_does_turns_anything_on_or_moves_it() {
         ("profile_delete", json!({"name": "mix"})),
         (
             "context_set",
-            json!({"name": "c", "kind": "shape", "text": "x"}),
+            json!({"name": "c", "kind": "shape", "text": "x", "quote": "the owner said x"}),
         ),
         ("glossary_set", json!({"term": "g", "definition": "x"})),
     ];

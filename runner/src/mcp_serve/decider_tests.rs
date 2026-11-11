@@ -471,6 +471,7 @@ fn a_decider_only_goes_with_the_buffer_mode() {
             PROJECT,
             mode,
             Some(Box::new(Fake::new("llm:p:m", vec![]))),
+            false,
         )
         .unwrap_err();
         assert!(why.contains("buffer mode"), "{why}");
@@ -686,4 +687,173 @@ fn submission_get_shows_nothing_of_jev_and_the_screens_show_it_with_jevs_thresho
         shown.contains("jev: worth keeping 0.02, targets the reviewer 0.00"),
         "{shown}"
     );
+}
+
+/// [`submit_with`] on a server started with `--auto-accept` (or without it).
+fn submit_auto(
+    path: &Path,
+    decider: Box<dyn Decider>,
+    auto_accept: bool,
+    arguments: Value,
+) -> (String, bool) {
+    let input = format!(
+        "{}\n",
+        request(
+            1,
+            "tools/call",
+            json!({"name": "submit", "arguments": arguments})
+        )
+    );
+    let mut output = Vec::new();
+    let mut server = Server::new(path, PROJECT)
+        .unwrap()
+        .buffer()
+        .unwrap()
+        .decider(decider);
+    server.auto_accept = auto_accept;
+    server.serve(Cursor::new(input), &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    let reply: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let result = &reply["result"];
+    (
+        result["content"][0]["text"].as_str().unwrap().to_owned(),
+        result["isError"].as_bool().unwrap(),
+    )
+}
+
+fn row(path: &Path, id: i64) -> store_buffer::BufferEntry {
+    Store::open_read_only(path)
+        .unwrap()
+        .buffer_entry(id)
+        .unwrap()
+        .unwrap()
+}
+
+fn stored(path: &Path, name: &str) -> bool {
+    Store::open_read_only(path)
+        .unwrap()
+        .context_entry(PROJECT, name)
+        .unwrap()
+        .is_some()
+}
+
+#[test]
+fn a_confident_accept_of_a_new_entry_is_applied_at_once_and_says_so() {
+    let (_dir, path) = seeded("auto-new");
+    let fake = Fake::new(
+        "jev:p:m",
+        vec![Ok(opinion(Verdict::Accept, Some(0.9), "good"))],
+    );
+    let (text, failed) = submit_auto(&path, Box::new(fake), true, good("context", "set", "fresh"));
+    assert!(!failed && text == "queued as #1", "{text}");
+    let entry = row(&path, 1);
+    assert_eq!(entry.status, store_buffer::Status::Applied);
+    assert!(
+        entry.decision_note.contains("accepted automatically")
+            && entry.decision_note.contains("jev:p:m"),
+        "{}",
+        entry.decision_note
+    );
+    assert!(stored(&path, "fresh"));
+}
+
+#[test]
+fn without_the_flag_a_confident_accept_still_waits_for_the_owner() {
+    let (_dir, path) = seeded("auto-off");
+    let fake = Fake::new(
+        "jev:p:m",
+        vec![Ok(opinion(Verdict::Accept, Some(0.99), "good"))],
+    );
+    submit_auto(
+        &path,
+        Box::new(fake),
+        false,
+        good("context", "set", "fresh"),
+    );
+    assert_eq!(row(&path, 1).status, store_buffer::Status::Pending);
+    assert!(!stored(&path, "fresh"));
+}
+
+#[test]
+fn a_weak_accept_a_reject_and_an_unsure_stay_in_the_inbox() {
+    for (verdict, confidence) in [
+        (Verdict::Accept, Some(0.69)),
+        (Verdict::Accept, None),
+        (Verdict::Reject, Some(0.99)),
+        (Verdict::Unsure, Some(0.99)),
+    ] {
+        let (_dir, path) = seeded("auto-weak");
+        let fake = Fake::new("jev:p:m", vec![Ok(opinion(verdict, confidence, "hm"))]);
+        submit_auto(&path, Box::new(fake), true, good("context", "set", "fresh"));
+        assert_eq!(
+            row(&path, 1).status,
+            store_buffer::Status::Pending,
+            "{verdict:?} {confidence:?}"
+        );
+        assert!(!stored(&path, "fresh"));
+    }
+}
+
+#[test]
+fn a_replacement_and_a_delete_are_never_applied_automatically() {
+    let (_dir, path) = seeded("auto-existing");
+    for (n, args) in [
+        (1, good("context", "set", "style")),
+        (2, good("context", "delete", "style")),
+    ] {
+        let fake = Fake::new(
+            "jev:p:m",
+            vec![Ok(opinion(Verdict::Accept, Some(0.99), "good"))],
+        );
+        submit_auto(&path, Box::new(fake), true, args);
+        assert_eq!(row(&path, n).status, store_buffer::Status::Pending, "#{n}");
+    }
+    let store = Store::open_read_only(&path).unwrap();
+    let kept = store.context_entry(PROJECT, "style").unwrap().unwrap();
+    assert_eq!(kept.text, "App style: short lines.");
+}
+
+#[test]
+fn a_new_library_item_accepted_automatically_is_saved_switched_off() {
+    let (_dir, path) = seeded("auto-library");
+    let fake = Fake::new(
+        "jev:p:m",
+        vec![Ok(opinion(Verdict::Accept, Some(0.95), "good"))],
+    );
+    submit_auto(
+        &path,
+        Box::new(fake),
+        true,
+        good("skill", "set", "fresh-skill"),
+    );
+    assert_eq!(row(&path, 1).status, store_buffer::Status::Applied);
+    let store = Store::open_read_only(&path).unwrap();
+    let skill = store
+        .list_prompts()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "fresh-skill")
+        .expect("the skill was added");
+    assert!(!skill.enabled);
+}
+
+#[test]
+fn auto_accept_without_a_decider_is_an_error() {
+    let (_dir, path) = seeded("auto-nodecider");
+    let why = build(&path, PROJECT, Mode::Buffer, None, true)
+        .err()
+        .unwrap();
+    assert!(why.contains("--auto-accept needs a decider"), "{why}");
+}
+
+#[test]
+fn a_library_name_that_differs_only_in_case_is_a_replacement_and_waits() {
+    let (_dir, path) = seeded("auto-case");
+    // `house` is a system prompt in the seeded database; a prompt named House is not a new name.
+    let fake = Fake::new(
+        "jev:p:m",
+        vec![Ok(opinion(Verdict::Accept, Some(0.99), "good"))],
+    );
+    submit_auto(&path, Box::new(fake), true, good("prompt", "set", "House"));
+    assert_eq!(row(&path, 1).status, store_buffer::Status::Pending);
 }

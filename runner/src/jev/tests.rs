@@ -117,6 +117,7 @@ fn the_request_has_the_model_the_state_strings_in_order_and_the_two_questions_an
         context_kind: "rule".to_owned(),
         quote: String::new(),
         area: String::new(),
+        quotes: Vec::new(),
         on: false,
     });
     decider.judge(&c).unwrap();

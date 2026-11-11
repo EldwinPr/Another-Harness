@@ -122,6 +122,8 @@ fn stored_field(label: &str, stored: &Stored) -> String {
         "kind" => stored.context_kind.clone(),
         "area" => stored.area.clone(),
         "quote" => stored.quote.clone(),
+        "type" => stored.context_kind.clone(),
+        "quotes" => inbox_view::quotes_words(&stored.quotes),
         _ => stored.description.clone(),
     }
 }
@@ -176,7 +178,7 @@ fn comparison(sub: &Submission, stored: Option<&Stored>) -> String {
     match stored {
         None => {
             out.push_str("<p>Nothing is stored under this name: accepting adds it.");
-            if !matches!(sub.kind.as_str(), "context" | "glossary") {
+            if !matches!(sub.kind.as_str(), "context" | "glossary" | "gotcha") {
                 out.push_str(&format!(
                     " A new {} is saved switched off.",
                     escape(&sub.kind)

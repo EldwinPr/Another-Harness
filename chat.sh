@@ -22,11 +22,19 @@
 # switching one on). --read-only and --direct exclude each other. It stays in the folder it was
 # started from, so that folder is the project whose context entries and glossary it serves (a tool
 # can name another).
+#   ./chat.sh --mcp-serve -d [--port N]  # the same server in the background over HTTP on 127.0.0.1 (default
+#                                         # port 8788), so it outlives any harness; every request needs the token in
+#                                         # mcp-token in the data folder as  Authorization: Bearer <token>
+#   ./chat.sh --mcp-serve --http          # that HTTP server in the foreground
+#   ./chat.sh --mcp-stop [--port N]       # stop the detached server
 # Register it with a harness as a stdio server whose command is this script plus --mcp-serve.
 #   ./chat.sh --mcp-serve --decider SPEC   # a model suggests accept, reject or unsure for each new
 #                                          # submission; you still decide (see below)
 #   ./chat.sh --eval-decider SPEC          # run 18 labelled proposals through a model and print how
 #                                          # it did, then exit; reads the saved providers, writes nothing
+# --auto-accept (with --decider): a NEW entry (not a replacement or a delete) whose shown suggestion is
+# Accept is applied at once instead of waiting in the inbox; the row says it was accepted automatically.
+# Reject, unsure and weak accepts still wait for you, and nothing is rejected automatically.
 # SPEC is none (the default: no model, nothing is sent anywhere), llm (the provider the chat used
 # last, with its default model), llm:PROVIDER (a provider saved with /provider add, with its default
 # model) or llm:PROVIDER:MODEL (the model may hold ':' and '/'); or jev, jev:PROVIDER or

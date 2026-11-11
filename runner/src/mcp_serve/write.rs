@@ -19,7 +19,9 @@
 
 use serde_json::Value;
 
-use super::{Def, Server, failed, find_item, find_profile, kind_arg, required, string_arg};
+use super::{
+    Def, Server, failed, find_item, find_profile, kind_arg, quotes_arg, required, string_arg,
+};
 use crate::store::{Edit, Store};
 use crate::store_buffer::scope;
 use crate::store_glossary::Saved;
@@ -30,8 +32,8 @@ use crate::store_prompts::{Prompt, PromptType, check_prompt_name, check_prompt_t
 pub(super) const WRITE_TOOLS: [Def; 10] = [
     Def {
         name: "context_set",
-        description: "Writes. Add a context entry, or replace the one with the same name and project. A new shape is preloaded. Keep the owner's own words in quote when you have them.",
-        schema: r#"{"type":"object","properties":{"name":{"type":"string","description":"A short name: letters, digits, . - _"},"kind":{"type":"string","enum":["rule","decision","shape","guide"],"description":"rule: how to work here. decision: a choice and why. shape: how an area is thought of. guide: a longer how-to."},"text":{"type":"string","description":"What to remember"},"quote":{"type":"string","description":"The owner's own words this comes from (optional; an empty quote keeps the stored one)"},"area":{"type":"string","description":"The business area (optional; omitted keeps the stored one)"},"project":{"type":"string","description":"A project's folder path. Default: the folder the server was started in. Empty: for every project."}},"required":["name","kind","text"]}"#,
+        description: "Writes. Add a context entry, or replace the one with the same name and project. A new shape is preloaded. A shape needs the owner's own words (quote or quotes) or a '## Where the mechanism lives' section; keep their words when you have them.",
+        schema: r#"{"type":"object","properties":{"name":{"type":"string","description":"A short name: letters, digits, . - _"},"kind":{"type":"string","enum":["rule","decision","shape","guide"],"description":"rule: how to work here. decision: a choice and why. shape: how an area is thought of. guide: a longer how-to."},"text":{"type":"string","description":"What to remember"},"quote":{"type":"string","description":"The owner's own words this comes from (optional; an empty quote keeps the stored one)"},"area":{"type":"string","description":"The business area (optional; omitted keeps the stored one)"},"quotes":{"type":"array","description":"A shape: the owner's words it rests on, each with the day said and the claim it supports. Added to the ones stored.","items":{"type":"object","properties":{"quote":{"type":"string"},"said_on":{"type":"string","description":"YYYY-MM-DD"},"claim":{"type":"string"},"replaces":{"type":"string"}},"required":["quote","said_on"]}},"project":{"type":"string","description":"A project's folder path. Default: the folder the server was started in. Empty: for every project."}},"required":["name","kind","text"]}"#,
     },
     Def {
         name: "context_delete",
@@ -100,7 +102,7 @@ impl Server {
 
     /// A fresh connection that may write: nothing is created or migrated, and a database of
     /// another schema version is refused.
-    fn writer(&self) -> Result<Store, String> {
+    pub(super) fn writer(&self) -> Result<Store, String> {
         Store::open_for_writing(&self.db)
             .map_err(|e| format!("error: cannot write the database: {e}"))
     }
@@ -111,10 +113,25 @@ impl Server {
         let text = required(arguments, "text")?;
         let quote = string_arg(arguments, "quote")?.unwrap_or_default();
         let area = string_arg(arguments, "area")?;
+        let quotes = quotes_arg(arguments)?;
         let project = self.project_of(arguments)?;
+        // Evidence is asked of what arrives from outside, as `submit` does; the owner's own
+        // screens do not ask it.
+        if kind.trim().eq_ignore_ascii_case("shape") {
+            crate::store_context::check_shape_evidence(&text, &quote, &quotes)
+                .map_err(|e| format!("error: {e}"))?;
+        }
         let saved = self
             .writer()?
-            .set_context(&project, &name, &kind, &text, &quote, area.as_deref())
+            .set_context_with_quotes(
+                &project,
+                &name,
+                &kind,
+                &text,
+                &quote,
+                area.as_deref(),
+                &quotes,
+            )
             .map_err(failed)?;
         let what = format!("context entry '{name}' for {}", scope(&project));
         Ok(saved_words(saved, &what))

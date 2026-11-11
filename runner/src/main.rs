@@ -7,6 +7,7 @@
 //! cd src && ./chat.sh --mcp-serve     # no chat: an MCP server on stdin/stdout: reads, and submit to the owner's inbox (issues 45, 47)
 //! cd src && ./chat.sh --mcp-serve --read-only   # the same, with the read tools alone (issue 47)
 //! cd src && ./chat.sh --mcp-serve --direct   # the same, with tools that write instead of submit (issue 46)
+//! cd src && ./chat.sh --mcp-serve -d [--port N]   # the same over HTTP on localhost, in the background (issue 52); --mcp-stop ends it
 //! cd src && ./chat.sh --mcp-serve --decider llm:PROVIDER[:MODEL]   # a model suggests accept/reject for each submission (issue 48)
 //! cd src && ./chat.sh --mcp-serve --decider jev[:PROVIDER[:MODEL]]   # the same with OpenRouter's Jev decisions model (issue 49)
 //! cd src && ./chat.sh --eval-decider llm:PROVIDER[:MODEL]   # run the labelled cases through a model, write nothing (issue 48)
@@ -85,6 +86,30 @@ fn decider_for(
     runner::decider::resolve(spec, &store, &build_provider)
 }
 
+/// `--mcp-serve -d`: checks what the child would check (the mode against the database, the decider,
+/// the token file, the port), then starts the child in the background and says how to reach it.
+fn detach(
+    db: &std::path::Path,
+    dir: &std::path::Path,
+    project: &str,
+    mode: runner::mcp_serve::Mode,
+    decider: Option<Box<dyn runner::decider::Decider>>,
+    auto_accept: bool,
+    port: u16,
+) -> Result<(), String> {
+    runner::mcp_serve::build(db, project, mode, decider, auto_accept)?;
+    runner::mcp_serve::http::token(dir)?;
+    // The port must be free now, and no server noted for it may still be running.
+    drop(runner::mcp_serve::http::bind(port)?);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let pid = runner::mcp_serve::spawn_detached(dir, &args, port)?;
+    print!(
+        "{}",
+        runner::mcp_serve::http::announce(port, pid, mode.label(), project, dir)
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let options = match Options::from_args(std::env::args().skip(1)) {
         Ok(options) => options,
@@ -128,6 +153,20 @@ fn main() -> ExitCode {
             }
         };
     }
+    // `--mcp-stop` ends the detached MCP server on a port (issue 52).
+    if options.mcp_stop {
+        let port = options.port.unwrap_or(config::DEFAULT_MCP_PORT);
+        return match runner::mcp_serve::stop_detached(&log_dir, port) {
+            Ok(said) => {
+                println!("{said}");
+                ExitCode::SUCCESS
+            }
+            Err(why) => {
+                eprintln!("mcp: {why}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // `--mcp-serve` answers another harness over standard input and output and starts no chat and
     // needs no provider (issue 45). By default it reads and queues submissions for the owner
     // (issue 47); `--read-only` reads alone and `--direct` offers the write tools (issue 46). The
@@ -165,7 +204,34 @@ fn main() -> ExitCode {
                 decider.name()
             );
         }
-        return match runner::mcp_serve::run(&db_path, &project, mode, decider) {
+        // Over HTTP (issue 52) it is reached on a localhost port; `-d` starts that in the
+        // background, after the same checks, and returns.
+        let outcome = if options.detach {
+            let port = options.port.unwrap_or(config::DEFAULT_MCP_PORT);
+            detach(
+                &db_path,
+                &log_dir,
+                &project,
+                mode,
+                decider,
+                options.auto_accept,
+                port,
+            )
+        } else if options.http {
+            let port = options.port.unwrap_or(config::DEFAULT_MCP_PORT);
+            runner::mcp_serve::run_http(
+                &db_path,
+                &log_dir,
+                &project,
+                mode,
+                decider,
+                options.auto_accept,
+                port,
+            )
+        } else {
+            runner::mcp_serve::run(&db_path, &project, mode, decider, options.auto_accept)
+        };
+        return match outcome {
             Ok(()) => ExitCode::SUCCESS,
             Err(why) => {
                 eprintln!("error: {why}");

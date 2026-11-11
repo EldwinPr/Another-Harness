@@ -41,6 +41,8 @@ pub mod store;
 pub mod store_buffer;
 pub mod store_context;
 pub mod store_glossary;
+pub mod store_gotchas;
+pub mod store_logs;
 pub mod store_mcp;
 pub mod store_models;
 pub mod store_profiles;

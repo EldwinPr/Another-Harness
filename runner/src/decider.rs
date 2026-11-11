@@ -218,12 +218,18 @@ pub fn proposal_block(case: &Case) -> String {
         }
     ));
     field(&mut out, "context_kind", &sub.context_kind);
+    field(&mut out, "gotcha_type", &sub.gotcha_type);
     field(&mut out, "area", sub.area.as_deref().unwrap_or(""));
     field(&mut out, "description", &sub.description);
     field(
         &mut out,
         "quote (the sender's claim of the owner's own words, unverified)",
         &sub.quote,
+    );
+    field(
+        &mut out,
+        "quotes (the sender's claim of the owner's own words, unverified)",
+        &crate::inbox_view::quotes_words(&sub.quotes),
     );
     field(
         &mut out,
@@ -251,6 +257,11 @@ pub fn stored_block(case: &Case) -> String {
             field(&mut out, "area", &stored.area);
             field(&mut out, "description", &stored.description);
             field(&mut out, "quote", &stored.quote);
+            field(
+                &mut out,
+                "quotes",
+                &crate::inbox_view::quotes_words(&stored.quotes),
+            );
             out.push_str(&format!("text:\n{}\n", defang(&stored.text)));
         }
     }

@@ -20,8 +20,28 @@ pub const MAX_TEXT_BYTES: usize = 8_000;
 pub const MAX_QUOTE_CHARS: usize = 1_000;
 /// The kinds of entry; a label that says what it is, it does not change what happens.
 pub const KINDS: [&str; 4] = ["rule", "decision", "shape", "guide"];
+/// The longest `claim` or `replaces` of a quote, in characters.
+pub const MAX_CLAIM_CHARS: usize = 300;
+/// The most quotes one submission carries.
+pub const MAX_QUOTES: usize = 20;
 /// The most tokens (estimated) the entries put in a subagent's starting prompt.
 pub const PRELOAD_TOKENS: usize = 2_000;
+
+/// One piece of evidence for a shape (issue 50): what the owner said, when, and the one claim of
+/// the entry it supports. A shape rests on several; `context_entries.quote` holds only one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Quote {
+    /// The owner's words as said, typos left alone.
+    pub quote: String,
+    /// The day it was said, `YYYY-MM-DD`.
+    pub said_on: String,
+    /// The line of the entry this quote supports.
+    #[serde(default)]
+    pub claim: String,
+    /// The earlier claim this reverses, when it does.
+    #[serde(default)]
+    pub replaces: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextEntry {
@@ -115,6 +135,81 @@ pub fn check_quote(quote: &str) -> Result<String, String> {
         return Err(format!("a quote is at most {MAX_QUOTE_CHARS} characters"));
     }
     Ok(quote.to_owned())
+}
+
+/// A date as `YYYY-MM-DD` (the day and month are in range; the calendar is not consulted).
+pub fn check_day(day: &str) -> Result<String, String> {
+    let day = day.trim();
+    let b = day.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    let ok = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && digits(0..4)
+        && digits(5..7)
+        && digits(8..10)
+        && (1..=12).contains(&day[5..7].parse::<u8>().unwrap_or(0))
+        && (1..=31).contains(&day[8..10].parse::<u8>().unwrap_or(0));
+    if ok {
+        Ok(day.to_owned())
+    } else {
+        Err("a date is written YYYY-MM-DD".to_owned())
+    }
+}
+
+fn check_line(what: &str, text: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.chars().any(char::is_control) {
+        return Err(format!("{what} is one line of plain text"));
+    }
+    if text.chars().count() > MAX_CLAIM_CHARS {
+        return Err(format!("{what} is at most {MAX_CLAIM_CHARS} characters"));
+    }
+    Ok(text.to_owned())
+}
+
+impl Quote {
+    /// The quote as it will be stored: the words (1 to [`MAX_QUOTE_CHARS`] characters), the day,
+    /// and the one-line claim and replaced claim, which may be empty.
+    pub fn check(&self) -> Result<Quote, String> {
+        let quote = check_quote(&self.quote)?;
+        if quote.is_empty() {
+            return Err("a quote is empty: give the owner's words".to_owned());
+        }
+        Ok(Quote {
+            quote,
+            said_on: check_day(&self.said_on)?,
+            claim: check_line("a claim", &self.claim)?,
+            replaces: check_line("'replaces'", &self.replaces)?,
+        })
+    }
+}
+
+/// The quotes of a submission, each checked; at most [`MAX_QUOTES`].
+pub fn check_quotes(quotes: &[Quote]) -> Result<Vec<Quote>, String> {
+    if quotes.len() > MAX_QUOTES {
+        return Err(format!("at most {MAX_QUOTES} quotes in one entry"));
+    }
+    quotes.iter().map(Quote::check).collect()
+}
+
+/// The evidence rule for a shape that arrives from outside (`context/shape/README.md`): the
+/// owner's words, or a "Where the mechanism lives" section that points at the system. A shape with
+/// neither is an agent's inference and is refused. The owner's own screens do not ask for it: what
+/// the owner types is their word.
+pub fn check_shape_evidence(text: &str, quote: &str, quotes: &[Quote]) -> Result<(), String> {
+    let pointer = text.lines().any(|line| {
+        line.trim()
+            .trim_start_matches('#')
+            .trim()
+            .eq_ignore_ascii_case("where the mechanism lives")
+            && line.trim_start().starts_with("##")
+    });
+    if !quote.trim().is_empty() || !quotes.is_empty() || pointer {
+        Ok(())
+    } else {
+        Err("a shape needs the owner's words (a quote) or a '## Where the mechanism lives' section pointing at the system: without either it is an inference and does not go in".to_owned())
+    }
 }
 
 /// What the web form holds for an entry, as typed.
@@ -253,11 +348,33 @@ impl Store {
         quote: &str,
         area: Option<&str>,
     ) -> Result<Saved, StoreError> {
+        self.set_context_with_quotes(scope, name, kind, text, quote, area, &[])
+    }
+
+    /// Like [`Store::set_context`], and adds `quotes` (issue 50) to the entry's evidence in the
+    /// same transaction. Only a shape has quotes; one already stored (same words, same day) is not
+    /// added twice. Quotes are never removed by a replace: a reversal keeps the old ones, and the
+    /// new quote's `replaces` names the claim it reverses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_context_with_quotes(
+        &mut self,
+        scope: &str,
+        name: &str,
+        kind: &str,
+        text: &str,
+        quote: &str,
+        area: Option<&str>,
+        quotes: &[Quote],
+    ) -> Result<Saved, StoreError> {
         let name = check_name(name).map_err(err)?;
         let kind = check_kind(kind).map_err(err)?;
         let text = check_text(text).map_err(err)?;
         let quote = check_quote(quote).map_err(err)?;
         let area = area.map(check_area).transpose().map_err(err)?;
+        let quotes = check_quotes(quotes).map_err(err)?;
+        if !quotes.is_empty() && kind != "shape" {
+            return Err(err("only a shape has quotes"));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -269,7 +386,7 @@ impl Store {
                 read_entry,
             )
             .optional()?;
-        let saved = match there {
+        let (mut saved, entry_id) = match there {
             None => {
                 tx.execute(
                     "INSERT INTO context_entries \
@@ -286,7 +403,7 @@ impl Store {
                         now
                     ],
                 )?;
-                Saved::Added
+                (Saved::Added, tx.last_insert_rowid())
             }
             Some(old) => {
                 let new_area = area.unwrap_or_else(|| old.area.clone());
@@ -295,7 +412,7 @@ impl Store {
                 } else {
                     quote
                 };
-                if old.kind == kind
+                let saved = if old.kind == kind
                     && old.text == text
                     && old.area == new_area
                     && old.quote == new_quote
@@ -308,11 +425,47 @@ impl Store {
                         params![old.id, kind, text, new_quote, new_area, now],
                     )?;
                     Saved::Changed
-                }
+                };
+                (saved, old.id)
             }
         };
+        for q in &quotes {
+            let there: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM context_quotes \
+                 WHERE entry_id = ?1 AND quote = ?2 AND said_on = ?3",
+                params![entry_id, q.quote, q.said_on],
+                |row| row.get(0),
+            )?;
+            if there == 0 {
+                tx.execute(
+                    "INSERT INTO context_quotes (entry_id, quote, said_on, claim, replaces, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![entry_id, q.quote, q.said_on, q.claim, q.replaces, now],
+                )?;
+                if saved == Saved::Same {
+                    saved = Saved::Changed;
+                }
+            }
+        }
         tx.commit()?;
         Ok(saved)
+    }
+
+    /// The quotes a shape rests on, oldest first.
+    pub fn context_quotes(&self, entry_id: i64) -> Result<Vec<Quote>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT quote, said_on, claim, replaces FROM context_quotes \
+             WHERE entry_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([entry_id], |row| {
+            Ok(Quote {
+                quote: row.get(0)?,
+                said_on: row.get(1)?,
+                claim: row.get(2)?,
+                replaces: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Deletes the entry `name` of this `scope`; false when there was none.
@@ -626,5 +779,144 @@ mod tests {
         );
         assert!(store.delete_context("/p", "a-rule").unwrap());
         assert!(!store.delete_context("/p", "a-rule").unwrap());
+    }
+
+    fn quote(words: &str, day: &str, claim: &str) -> Quote {
+        Quote {
+            quote: words.to_owned(),
+            said_on: day.to_owned(),
+            claim: claim.to_owned(),
+            replaces: String::new(),
+        }
+    }
+
+    fn shape(store: &mut Store, quotes: &[Quote]) -> Saved {
+        store
+            .set_context_with_quotes(
+                "/p",
+                "orders",
+                "shape",
+                "The app is always right.",
+                "",
+                Some("orders"),
+                quotes,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_shape_keeps_its_quotes_oldest_first_and_a_repeat_is_not_added_twice() {
+        let (_dir, mut store) = store("ctx-quotes");
+        let first = quote("the app is always right", "2026-11-05", "the app wins");
+        assert_eq!(
+            shape(&mut store, std::slice::from_ref(&first)),
+            Saved::Added
+        );
+        let id = store.context_entry("/p", "orders").unwrap().unwrap().id;
+        assert_eq!(
+            store.context_quotes(id).unwrap(),
+            std::slice::from_ref(&first)
+        );
+        assert_eq!(shape(&mut store, std::slice::from_ref(&first)), Saved::Same);
+        let second = quote("not the PDF", "2026-11-06", "the PDF loses");
+        assert_eq!(
+            shape(&mut store, &[first.clone(), second.clone()]),
+            Saved::Changed
+        );
+        assert_eq!(store.context_quotes(id).unwrap(), [first, second]);
+    }
+
+    #[test]
+    fn a_reversal_replaces_the_text_and_keeps_the_old_quote() {
+        let (_dir, mut store) = store("ctx-reversal");
+        let old = quote("the app is always right", "2026-11-05", "the app wins");
+        shape(&mut store, std::slice::from_ref(&old));
+        let mut new = quote("no, the PDF wins now", "2026-11-09", "the PDF wins");
+        new.replaces = "the app wins".to_owned();
+        store
+            .set_context_with_quotes(
+                "/p",
+                "orders",
+                "shape",
+                "The PDF is right.",
+                "",
+                None,
+                &[new.clone()],
+            )
+            .unwrap();
+        let entry = store.context_entry("/p", "orders").unwrap().unwrap();
+        assert_eq!(entry.text, "The PDF is right.");
+        assert_eq!(store.context_quotes(entry.id).unwrap(), [old, new]);
+    }
+
+    #[test]
+    fn deleting_an_entry_deletes_its_quotes() {
+        let (_dir, mut store) = store("ctx-quotes-delete");
+        shape(&mut store, &[quote("words", "2026-11-05", "")]);
+        assert!(store.delete_context("/p", "orders").unwrap());
+        let left: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM context_quotes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn only_a_shape_has_quotes_and_a_bad_quote_writes_nothing() {
+        let (_dir, mut store) = store("ctx-quotes-bad");
+        let q = quote("words", "2026-11-05", "");
+        assert!(
+            store
+                .set_context_with_quotes("/p", "r", "rule", "t", "", None, &[q])
+                .is_err()
+        );
+        for bad in [
+            quote("", "2026-11-05", ""),
+            quote("words", "yesterday", ""),
+            quote("words", "2026-13-01", ""),
+            quote("words", "2026-11-32", ""),
+            quote("words", "2026-1-05", ""),
+            quote(&"w".repeat(MAX_QUOTE_CHARS + 1), "2026-11-05", ""),
+            quote("words", "2026-11-05", &"c".repeat(MAX_CLAIM_CHARS + 1)),
+            quote("words", "2026-11-05", "two\nlines"),
+        ] {
+            assert!(
+                store
+                    .set_context_with_quotes("/p", "s", "shape", "t", "", None, &[bad])
+                    .is_err()
+            );
+        }
+        let many = vec![quote("words", "2026-11-05", ""); MAX_QUOTES + 1];
+        assert!(
+            store
+                .set_context_with_quotes("/p", "s", "shape", "t", "", None, &many)
+                .is_err()
+        );
+        assert!(
+            store.list_all_context().unwrap().is_empty(),
+            "a refusal wrote nothing"
+        );
+    }
+
+    #[test]
+    fn the_evidence_rule_wants_a_quote_or_a_mechanism_section() {
+        let q = [quote("words", "2026-11-05", "")];
+        assert!(check_shape_evidence("A claim.", "", &[]).is_err());
+        assert!(check_shape_evidence("A claim.", "the owner said", &[]).is_ok());
+        assert!(check_shape_evidence("A claim.", "  ", &q).is_ok());
+        assert!(
+            check_shape_evidence(
+                "A claim.\n\n## Where the mechanism lives\nsrc/x.rs",
+                "",
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(check_shape_evidence("## where the MECHANISM lives", "", &[]).is_ok());
+        assert!(
+            check_shape_evidence("Where the mechanism lives is not a heading here.", "", &[])
+                .is_err(),
+            "the words in a sentence are not the section"
+        );
     }
 }

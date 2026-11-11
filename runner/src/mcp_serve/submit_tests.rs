@@ -12,7 +12,7 @@ use super::*;
 use crate::store_buffer::{self, ApplyOutcome, MAX_PENDING};
 use crate::tools::testutil::Scratch;
 
-const READ_NAMES: [&str; 8] = [
+const READ_NAMES: [&str; 12] = [
     "context_list",
     "context_get",
     "glossary_list",
@@ -21,6 +21,10 @@ const READ_NAMES: [&str; 8] = [
     "library_get",
     "profile_list",
     "profile_get",
+    "gotchas_list",
+    "gotchas_get",
+    "logs_list",
+    "logs_get",
 ];
 
 const WRITE_NAMES: [&str; 10] = [
@@ -37,7 +41,7 @@ const WRITE_NAMES: [&str; 10] = [
 ];
 
 /// Sends the lines to a buffer server and returns what it wrote, one value per answer.
-fn bsession(path: &Path, project: &str, lines: &[Value]) -> Vec<Value> {
+pub(super) fn bsession(path: &Path, project: &str, lines: &[Value]) -> Vec<Value> {
     let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
     let mut output = Vec::new();
     Server::new(path, project)
@@ -54,7 +58,7 @@ fn bsession(path: &Path, project: &str, lines: &[Value]) -> Vec<Value> {
 }
 
 /// Calls one tool on a buffer server started in `project`: the text and whether it failed.
-fn bcall_in(path: &Path, project: &str, tool: &str, arguments: Value) -> (String, bool) {
+pub(super) fn bcall_in(path: &Path, project: &str, tool: &str, arguments: Value) -> (String, bool) {
     let reply = bsession(
         path,
         project,
@@ -145,18 +149,18 @@ fn good(kind: &str, action: &str, name: &str) -> Value {
 // ---- the three modes ----
 
 #[test]
-fn the_default_buffer_mode_lists_the_eight_reads_then_submit_and_submission_get() {
+fn the_default_buffer_mode_lists_the_twelve_reads_then_submit_submission_get_and_log_add() {
     let (_dir, path) = seeded("buffer-list");
     let reply = bsession(&path, "", &[request(1, "tools/list", Value::Null)]);
     let listed = names(&reply[0]);
-    assert_eq!(listed.len(), 10);
-    assert_eq!(listed[..8], READ_NAMES);
-    assert_eq!(listed[8..], ["submit", "submission_get"]);
+    assert_eq!(listed.len(), 15);
+    assert_eq!(listed[..12], READ_NAMES);
+    assert_eq!(listed[12..], ["submit", "submission_get", "log_add"]);
     let tools = reply[0]["result"]["tools"].as_array().unwrap();
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
     }
-    for tool in &tools[..8] {
+    for tool in &tools[..12] {
         assert!(
             tool["description"]
                 .as_str()
@@ -164,13 +168,13 @@ fn the_default_buffer_mode_lists_the_eight_reads_then_submit_and_submission_get(
                 .starts_with("Read-only.")
         );
     }
-    let description = tools[8]["description"].as_str().unwrap();
+    let description = tools[12]["description"].as_str().unwrap();
     assert!(description.starts_with("Queues."), "{description}");
     assert!(
         description.contains("The owner reviews it and nothing changes until then"),
         "{description}"
     );
-    let fields: Vec<&str> = tools[8]["inputSchema"]["properties"]
+    let fields: Vec<&str> = tools[12]["inputSchema"]["properties"]
         .as_object()
         .unwrap()
         .keys()
@@ -185,18 +189,27 @@ fn the_default_buffer_mode_lists_the_eight_reads_then_submit_and_submission_get(
         "quote",
         "area",
         "project",
+        "gotcha_type",
+        "quotes",
         "why",
         "source",
     ] {
         assert!(fields.contains(&field), "{field}");
     }
     assert_eq!(
-        tools[8]["inputSchema"]["required"],
+        tools[12]["inputSchema"]["required"],
         json!(["kind", "action", "name", "why", "source"])
     );
     assert_eq!(
-        tools[8]["inputSchema"]["properties"]["kind"]["enum"],
-        json!(["context", "glossary", "skill", "personality", "prompt"])
+        tools[12]["inputSchema"]["properties"]["kind"]["enum"],
+        json!([
+            "context",
+            "glossary",
+            "gotcha",
+            "skill",
+            "personality",
+            "prompt"
+        ])
     );
     // No write tool of the direct mode, and nothing that could switch anything on.
     for name in WRITE_NAMES {
@@ -211,7 +224,7 @@ fn the_read_only_mode_lists_only_the_reads_and_submit_is_an_unknown_tool() {
     let reply = session(&path, PROJECT, &[request(1, "tools/list", Value::Null)]);
     let listed = names(&reply[0]);
     assert_eq!(listed, READ_NAMES);
-    for tool in ["submit", "submission_get"] {
+    for tool in ["submit", "submission_get", "log_add"] {
         let reply = session(
             &path,
             PROJECT,
@@ -261,9 +274,10 @@ fn the_direct_mode_lists_the_reads_and_the_ten_writes_and_no_submit() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     let listed = names(&reply[0]);
-    assert_eq!(listed.len(), 18);
-    assert_eq!(listed[..8], READ_NAMES);
-    assert_eq!(listed[8..], WRITE_NAMES);
+    assert_eq!(listed.len(), 25);
+    assert_eq!(listed[..12], READ_NAMES);
+    assert_eq!(listed[12..22], WRITE_NAMES);
+    assert_eq!(listed[22..], ["gotcha_set", "gotcha_delete", "log_add"]);
     assert!(!listed.contains(&"submit".to_owned()));
     assert!(!listed.contains(&"submission_get".to_owned()));
     assert_eq!(reply[1]["error"]["message"], "unknown tool 'submit'");

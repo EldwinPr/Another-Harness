@@ -22,7 +22,7 @@ use crate::providers::ProviderDef;
 use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, earlier_line};
 
 /// The schema version this program writes. It is kept in SQLite's `user_version`.
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 28;
 
 /// How long a write waits for another writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -277,6 +277,69 @@ CREATE TABLE IF NOT EXISTS buffer_suggestions (
     created_at INTEGER NOT NULL,
     UNIQUE (buffer_id, decider)
 ) STRICT;
+";
+
+// Issue 50: gotchas, the project work log, and the quotes a shape rests on. `buffer_entries` is
+// rebuilt only to let `kind` be `gotcha` (SQLite cannot change a CHECK); the migration turns
+// foreign keys off around it, as the SQLite documentation says to, and checks them afterwards.
+// `work_logs` is append-only: nothing in the program updates or deletes a row of it.
+const SCHEMA_V28: &str = "
+CREATE TABLE IF NOT EXISTS gotchas (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL COLLATE NOCASE,
+    type       TEXT NOT NULL CHECK (type IN ('convention', 'hazard', 'trap', 'ownership', 'decision', 'tooling', 'workflow')),
+    text       TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT '',
+    project    TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (project, name)
+) STRICT;
+CREATE TABLE IF NOT EXISTS work_logs (
+    id         INTEGER PRIMARY KEY,
+    project    TEXT NOT NULL DEFAULT '',
+    tag        TEXT NOT NULL CHECK (tag IN ('STATUS', 'DECISION', 'DISCOVERY', 'TODO', 'NOTE')),
+    title      TEXT NOT NULL,
+    summary    TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT '',
+    session    INTEGER,
+    created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS work_logs_project ON work_logs (project, id);
+CREATE TABLE IF NOT EXISTS context_quotes (
+    id         INTEGER PRIMARY KEY,
+    entry_id   INTEGER NOT NULL REFERENCES context_entries (id) ON DELETE CASCADE,
+    quote      TEXT NOT NULL,
+    said_on    TEXT NOT NULL,
+    claim      TEXT NOT NULL DEFAULT '',
+    replaces   TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS context_quotes_entry ON context_quotes (entry_id);
+DROP TABLE IF EXISTS buffer_entries_new;
+CREATE TABLE buffer_entries_new (
+    id             INTEGER PRIMARY KEY,
+    kind           TEXT NOT NULL CHECK (kind IN ('context', 'glossary', 'skill', 'personality', 'prompt', 'gotcha')),
+    action         TEXT NOT NULL CHECK (action IN ('set', 'delete')),
+    name           TEXT NOT NULL,
+    project        TEXT NOT NULL DEFAULT '',
+    entry_json     TEXT NOT NULL,
+    why            TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'rejected')),
+    content_sha256 TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    decided_at     INTEGER,
+    decision_note  TEXT NOT NULL DEFAULT ''
+) STRICT;
+INSERT INTO buffer_entries_new
+    (id, kind, action, name, project, entry_json, why, source, status, content_sha256, created_at, decided_at, decision_note)
+    SELECT id, kind, action, name, project, entry_json, why, source, status, content_sha256, created_at, decided_at, decision_note
+    FROM buffer_entries;
+DROP TABLE buffer_entries;
+ALTER TABLE buffer_entries_new RENAME TO buffer_entries;
+CREATE UNIQUE INDEX IF NOT EXISTS buffer_entries_pending
+    ON buffer_entries (content_sha256) WHERE status = 'pending';
 ";
 
 const SCHEMA_V11: &str = "CREATE TABLE IF NOT EXISTS glossary (
@@ -1373,6 +1436,22 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(&format!(
             "BEGIN; {SCHEMA_V27} PRAGMA user_version = 27; COMMIT;"
         ))?;
+    }
+    if version < 28 {
+        // Issue 50: gotchas, work logs and shape quotes; `buffer_entries` takes the kind `gotcha`.
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF; BEGIN; {SCHEMA_V28} PRAGMA user_version = 28; COMMIT;"
+        ))?;
+        let broken: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        if broken > 0 {
+            return Err(err(format!(
+                "the upgrade to version 28 left {broken} broken reference(s): restore the .before-28 copy"
+            )));
+        }
     }
     Ok(())
 }

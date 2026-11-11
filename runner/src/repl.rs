@@ -4200,12 +4200,12 @@ mod tests {
     }
 
     #[test]
-    fn the_working_box_stays_under_the_output_and_goes_when_the_work_ends() {
+    fn the_working_prompt_stays_under_the_output_and_goes_when_the_work_ends() {
         let term = blank_term();
         term.borrow_mut().enable_menus(true);
         term.borrow_mut().begin_working(|_| "the info".to_owned());
         let after_begin = screen(&term);
-        assert!(after_begin.contains("│ working…"), "{after_begin:?}");
+        assert!(after_begin.contains("> working…"), "{after_begin:?}");
         assert!(after_begin.ends_with(" the info\r\n"), "{after_begin:?}");
 
         term.borrow_mut().say("a tool line\n");
@@ -4215,11 +4215,11 @@ mod tests {
         // Each line: the box is erased, the line printed, the box drawn again below it.
         let erase = crate::inputbox::erase(4);
         assert!(
-            added.starts_with(&format!("{erase}a tool line\n╭")),
+            added.starts_with(&format!("{erase}a tool line\n─")),
             "{added:?}"
         );
         assert!(
-            added.contains(&format!("{erase}no newline\r\n╭")),
+            added.contains(&format!("{erase}no newline\r\n─")),
             "{added:?}"
         );
 
@@ -4240,8 +4240,8 @@ mod tests {
     }
 
     #[test]
-    fn steps_are_over_the_working_box_and_tasks_under_it_and_the_steps_are_printed_once_at_the_end()
-    {
+    fn steps_are_over_the_working_prompt_and_tasks_under_it_and_the_steps_are_printed_once_at_the_end()
+     {
         let dir = Scratch::new("repl-pinned");
         let shells = crate::tools::ShellTasks::new();
         shells.start("sleep 30", dir.path()).unwrap();
@@ -4257,13 +4257,14 @@ mod tests {
             r#"{"steps":[{"text":"read","status":"doing"},{"text":"write","status":"todo"}]}"#;
         observer.tool_call(&call("steps", first));
         let shown = screen(&term);
-        // The checklist is the first thing of the drawing, then the box, the info, the task.
+        // The checklist is the first thing of the drawing, then the prompt, the info, the task.
         let drawn = shown.rsplit("\x1b[J").next().unwrap();
         let rows: Vec<&str> = drawn.split("\r\n").collect();
         assert_eq!(rows[0], " steps 0/2");
         assert_eq!(rows[1], "  ▸ read");
         assert_eq!(rows[2], "  ○ write");
-        assert!(rows[3].starts_with('╭'), "{rows:?}");
+        assert!(rows[3].starts_with('─'), "{rows:?}");
+        assert!(rows[5].starts_with('─'), "{rows:?}");
         assert_eq!(rows[6], " the info");
         assert!(rows[7].starts_with(" ● s1  sleep 30 · "), "{rows:?}");
         let second =

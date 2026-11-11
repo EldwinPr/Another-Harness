@@ -9,6 +9,9 @@
 //! - **direct** (`--direct`, issue 46): the read tools and the write tools of [`write`], and no
 //!   `submit`.
 //!
+//! Gotchas and the project work log (issue 50, `notes.rs`) add four read tools to every mode, and
+//! `log_add` to the buffer and direct modes: a log is only ever appended, so it is not queued.
+//!
 //! Another harness starts `chat.sh --mcp-serve` and talks to it over standard input and output,
 //! one JSON-RPC message per line, the other half of what `mcp.rs` does as a client. It can list
 //! and fetch the context entries, glossary terms, skills, personalities, system prompts and
@@ -41,9 +44,15 @@ use crate::store_context::check_scope;
 use crate::store_profiles::Profile;
 use crate::store_prompts::{Prompt, PromptType};
 
+mod daemon;
+pub mod http;
+mod notes;
 mod submit;
 mod write;
 
+pub use daemon::{child_args, spawn as spawn_detached, stop as stop_detached};
+
+use notes::{GOTCHA_WRITE_TOOLS, LOG_TOOLS};
 use submit::SUBMIT_TOOLS;
 use write::WRITE_TOOLS;
 
@@ -58,7 +67,7 @@ struct Def {
 }
 
 /// The tools, in the order `tools/list` gives them. All of them only read.
-const TOOLS: [Def; 8] = [
+const TOOLS: [Def; 12] = [
     Def {
         name: "context_list",
         description: "Read-only. List the rules, decisions, shapes and guides the owner keeps for a project: one line each, name and kind. Fetch one with context_get.",
@@ -99,6 +108,26 @@ const TOOLS: [Def; 8] = [
         description: "Read-only. Get one profile by name (case does not matter): its system prompts, the skills it turns on and its personality.",
         schema: r#"{"type":"object","properties":{"name":{"type":"string","description":"The name of the profile"}},"required":["name"]}"#,
     },
+    Def {
+        name: "gotchas_list",
+        description: "Read-only. List the gotchas (things learned the hard way) the owner keeps for a project: one line each, name and type. Fetch one with gotchas_get.",
+        schema: r#"{"type":"object","properties":{"type":{"type":"string","enum":["convention","hazard","trap","ownership","decision","tooling","workflow"],"description":"Only gotchas of this type"},"project":{"type":"string","description":"A project's folder path. Default: the folder the server was started in. Empty: only the gotchas for every project."}}}"#,
+    },
+    Def {
+        name: "gotchas_get",
+        description: "Read-only. Get one gotcha by name (case does not matter): its type and its text.",
+        schema: r#"{"type":"object","properties":{"name":{"type":"string","description":"The name of the gotcha"},"project":{"type":"string","description":"A project's folder path. Default: the folder the server was started in."}},"required":["name"]}"#,
+    },
+    Def {
+        name: "logs_list",
+        description: "Read-only. List the project's work log, newest first: one line each, number, day, tag and title. It is a record of what agents did and why, like pm/log.md. Fetch one with logs_get.",
+        schema: r#"{"type":"object","properties":{"tag":{"type":"string","enum":["STATUS","DECISION","DISCOVERY","TODO","NOTE"],"description":"Only entries with this tag"},"limit":{"type":"integer","description":"How many, 1 to 100 (default 20)"},"project":{"type":"string","description":"A project's folder path. Default: the folder the server was started in. Empty: only the entries for every project."}}}"#,
+    },
+    Def {
+        name: "logs_get",
+        description: "Read-only. Get one work log entry by its number: tag, title, summary, who wrote it and the chat it is about.",
+        schema: r#"{"type":"object","properties":{"id":{"type":"integer","description":"The number of the entry"},"project":{"type":"string","description":"A project's folder path. Default: the folder the server was started in."}},"required":["id"]}"#,
+    },
 ];
 
 /// JSON-RPC error codes.
@@ -126,6 +155,9 @@ pub struct Server {
     mode: Mode,
     /// Suggests accept, reject or unsure for each new submission (issue 48); buffer mode only.
     decider: Option<Box<dyn Decider>>,
+    /// Applies a new entry the decider confidently accepts, at once (`--auto-accept`); needs a
+    /// decider. See `submit.rs`.
+    auto_accept: bool,
 }
 
 /// Runs the server on the real standard input and output until the client closes its end.
@@ -138,11 +170,35 @@ pub fn run(
     project: &str,
     mode: Mode,
     decider: Option<Box<dyn Decider>>,
+    auto_accept: bool,
 ) -> Result<(), String> {
+    let server = build(db, project, mode, decider, auto_accept)?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    server
+        .serve(stdin.lock(), stdout.lock())
+        .map_err(|e| format!("the connection failed: {e}"))
+}
+
+/// The server for `mode`, checked at once: a database that cannot be read (or, in buffer and direct
+/// mode, written) or a decider outside the buffer mode is an error here, before anything is served.
+pub fn build(
+    db: &Path,
+    project: &str,
+    mode: Mode,
+    decider: Option<Box<dyn Decider>>,
+    auto_accept: bool,
+) -> Result<Server, String> {
     if decider.is_some() && mode != Mode::Buffer {
         return Err("a decider goes with the buffer mode only".to_owned());
     }
+    if auto_accept && decider.is_none() {
+        return Err(
+            "--auto-accept needs a decider: it applies what the decider accepts".to_owned(),
+        );
+    }
     let mut server = Server::new(db, project)?;
+    server.auto_accept = auto_accept;
     if let Some(decider) = decider {
         server = server.decider(decider);
     }
@@ -151,11 +207,45 @@ pub fn run(
         Mode::Buffer => server = server.buffer()?,
         Mode::Direct => server = server.direct()?,
     }
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    server
-        .serve(stdin.lock(), stdout.lock())
-        .map_err(|e| format!("the connection failed: {e}"))
+    Ok(server)
+}
+
+/// Serves over HTTP on `port` (issue 52) until the process is stopped; prints how to reach it and
+/// notes itself in `dir` (the log folder, which also holds the token). The port being taken, or
+/// the token file being wrong, is an error before anything is served.
+pub fn run_http(
+    db: &Path,
+    dir: &Path,
+    project: &str,
+    mode: Mode,
+    decider: Option<Box<dyn Decider>>,
+    auto_accept: bool,
+    port: u16,
+) -> Result<(), String> {
+    let server = build(db, project, mode, decider, auto_accept)?;
+    let token = http::token(dir)?;
+    let listener = http::bind(port)?;
+    let label = mode.label();
+    daemon::write_state(dir, port, label, project)?;
+    print!(
+        "{}",
+        http::announce(port, std::process::id(), label, project, dir)
+    );
+    let _ = io::stdout().flush();
+    http::serve_on(&listener, &server, &token, port, None);
+    let _ = std::fs::remove_file(daemon::state_path(dir, port));
+    Ok(())
+}
+
+impl Mode {
+    /// The word for the mode in what the server prints.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::ReadOnly => "read-only",
+            Mode::Buffer => "buffer",
+            Mode::Direct => "direct",
+        }
+    }
 }
 
 impl Server {
@@ -174,6 +264,7 @@ impl Server {
             project: project.to_owned(),
             mode: Mode::ReadOnly,
             decider: None,
+            auto_accept: false,
         })
     }
 
@@ -222,7 +313,15 @@ impl Server {
             Mode::Buffer => &SUBMIT_TOOLS,
             Mode::Direct => &WRITE_TOOLS,
         };
-        TOOLS.iter().chain(more)
+        let gotchas: &'static [Def] = match self.mode {
+            Mode::Direct => &GOTCHA_WRITE_TOOLS,
+            Mode::ReadOnly | Mode::Buffer => &[],
+        };
+        let log: &'static [Def] = match self.mode {
+            Mode::ReadOnly => &[],
+            Mode::Buffer | Mode::Direct => &LOG_TOOLS,
+        };
+        TOOLS.iter().chain(more).chain(gotchas).chain(log)
     }
 
     /// Answers every line of `input` on `output` until `input` ends. A blank line is skipped.
@@ -314,6 +413,13 @@ impl Server {
             "library_get" => self.library_get(arguments),
             "profile_list" => self.profile_list(),
             "profile_get" => self.profile_get(arguments),
+            "gotchas_list" => self.gotchas_list(arguments),
+            "gotchas_get" => self.gotchas_get(arguments),
+            "logs_list" => self.logs_list(arguments),
+            "logs_get" => self.logs_get(arguments),
+            "log_add" if self.mode != Mode::ReadOnly => self.log_add(arguments),
+            "gotcha_set" if self.mode == Mode::Direct => self.gotcha_set(arguments),
+            "gotcha_delete" if self.mode == Mode::Direct => self.gotcha_delete(arguments),
             other if self.mode == Mode::Direct => self.call_write(other, arguments),
             other if self.mode == Mode::Buffer => self.call_submit(other, arguments),
             other => Err(format!("error: unknown tool '{other}'")),
@@ -371,8 +477,29 @@ impl Server {
             } else {
                 format!("\nthe owner said: {}", entry.quote)
             };
+            let quotes = store
+                .context_quotes(entry.id)
+                .map_err(failed)?
+                .iter()
+                .map(|q| {
+                    let supports = if q.claim.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (supports: {})", q.claim)
+                    };
+                    let replaces = if q.replaces.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (replaces: {})", q.replaces)
+                    };
+                    format!(
+                        "\nthe owner said on {}: {}{supports}{replaces}",
+                        q.said_on, q.quote
+                    )
+                })
+                .collect::<String>();
             return Ok(format!(
-                "{} ({}{area})\n{}{quote}",
+                "{} ({}{area})\n{}{quote}{quotes}",
                 entry.name, entry.kind, entry.text
             ));
         }
@@ -630,6 +757,36 @@ fn string_arg(arguments: &Value, key: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// The `quotes` argument of a shape: a list of `{quote, said_on, claim, replaces}` objects (the
+/// last two may be left out). Absent or null is no quotes.
+fn quotes_arg(arguments: &Value) -> Result<Vec<crate::store_context::Quote>, String> {
+    let Some(value) = arguments.get("quotes").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(items) = value else {
+        return Err(
+            "error: 'quotes' must be a list of {quote, said_on, claim, replaces}".to_owned(),
+        );
+    };
+    items
+        .iter()
+        .map(|item| {
+            let text = |key: &str| string_arg(item, key).map(Option::unwrap_or_default);
+            if !item.is_object() {
+                return Err(
+                    "error: each of 'quotes' is {quote, said_on, claim, replaces}".to_owned(),
+                );
+            }
+            Ok(crate::store_context::Quote {
+                quote: text("quote")?,
+                said_on: text("said_on")?,
+                claim: text("claim")?,
+                replaces: text("replaces")?,
+            })
+        })
+        .collect()
+}
+
 /// A string argument that has to be there and say something.
 fn required(arguments: &Value, key: &str) -> Result<String, String> {
     string_arg(arguments, key)?
@@ -676,6 +833,10 @@ fn or_none(names: &[String]) -> String {
 
 #[cfg(test)]
 mod decider_tests;
+#[cfg(test)]
+mod http_tests;
+#[cfg(test)]
+mod notes_tests;
 #[cfg(test)]
 mod submit_tests;
 #[cfg(test)]
@@ -832,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_list_is_the_eight_read_tools_with_valid_schemas() {
+    fn the_tool_list_is_the_twelve_read_tools_with_valid_schemas() {
         let (_dir, path) = seeded("serve-list");
         let reply = session(&path, "", &[request(1, "tools/list", Value::Null)]);
         let tools = reply[0]["result"]["tools"].as_array().unwrap();
@@ -847,7 +1008,11 @@ mod tests {
                 "library_list",
                 "library_get",
                 "profile_list",
-                "profile_get"
+                "profile_get",
+                "gotchas_list",
+                "gotchas_get",
+                "logs_list",
+                "logs_get"
             ]
         );
         for tool in tools {

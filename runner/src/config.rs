@@ -207,6 +207,18 @@ pub struct Options {
     /// for each new submission (issue 48). `None` when the flag was not given, which is the same
     /// as `--decider none`.
     pub decider: Option<DeciderSpec>,
+    /// With `--mcp-serve --decider SPEC`: apply a new entry the decider confidently accepts, at
+    /// once, instead of leaving it for the owner (`--auto-accept`).
+    pub auto_accept: bool,
+    /// With `--mcp-serve`: speak MCP over HTTP on a localhost port instead of standard input and
+    /// output (issue 52). `detach` implies it.
+    pub http: bool,
+    /// With `--mcp-serve`: start that HTTP server in the background and return (issue 52).
+    pub detach: bool,
+    /// With `--http`, `--detach` or `--mcp-stop`: the port (`DEFAULT_MCP_PORT` when not given).
+    pub port: Option<u16>,
+    /// Stop the detached MCP server on the port and exit (issue 52). Takes only `--port`.
+    pub mcp_stop: bool,
     /// Run the labelled cases through this decider and print how it did, then exit (issue 48).
     /// Excludes every other option and writes nothing.
     pub eval_decider: Option<DeciderSpec>,
@@ -225,7 +237,7 @@ pub enum McpRequest {
 }
 
 /// The options that end the words of `--mcp-add`.
-const OWN_OPTIONS: [&str; 9] = [
+const OWN_OPTIONS: [&str; 13] = [
     "--resume",
     "--serve",
     "--mcp",
@@ -235,10 +247,17 @@ const OWN_OPTIONS: [&str; 9] = [
     "--read-only",
     "--decider",
     "--eval-decider",
+    "--http",
+    "--detach",
+    "--mcp-stop",
+    "--auto-accept",
 ];
 
 /// The port `--serve` uses when none is given.
 pub const DEFAULT_WEB_PORT: u16 = 8787;
+
+/// The port the MCP server uses over HTTP when none is given (issue 52); the web page has 8787.
+pub const DEFAULT_MCP_PORT: u16 = 8788;
 
 impl Options {
     /// Reads the command-line arguments (without the program name).
@@ -262,6 +281,24 @@ impl Options {
                     options.serve = Some(port);
                 }
                 "--mcp-serve" => options.mcp_serve = true,
+                "--http" => options.http = true,
+                "--auto-accept" => options.auto_accept = true,
+                "-d" | "--detach" => options.detach = true,
+                "--mcp-stop" => options.mcp_stop = true,
+                "--port" => {
+                    let number = args
+                        .next_if(|next| {
+                            !next.is_empty() && next.chars().all(|c| c.is_ascii_digit())
+                        })
+                        .ok_or("--port needs a number (1 to 65535)")?;
+                    options.port = Some(
+                        number
+                            .parse::<u16>()
+                            .ok()
+                            .filter(|port| *port > 0)
+                            .ok_or_else(|| format!("'{number}' is not a port (1 to 65535)"))?,
+                    );
+                }
                 "--direct" => options.direct = true,
                 "--read-only" => options.read_only = true,
                 "--decider" => {
@@ -303,10 +340,41 @@ impl Options {
                 }
                 other => {
                     return Err(format!(
-                        "unknown option '{other}': the options are --resume, --serve [port], --mcp NAME, --mcp-add NAME COMMAND [ARGS] and --mcp-serve [--read-only | --direct | --decider SPEC] and --eval-decider SPEC"
+                        "unknown option '{other}': the options are --resume, --serve [port], --mcp NAME, --mcp-add NAME COMMAND [ARGS] and --mcp-serve [--read-only | --direct | --decider SPEC] [--http | -d] [--port N], --mcp-stop and --eval-decider SPEC"
                     ));
                 }
             }
+        }
+        if options.mcp_stop {
+            if options.resume
+                || options.serve.is_some()
+                || options.mcp_serve
+                || options.http
+                || options.detach
+                || options.direct
+                || options.read_only
+                || options.decider.is_some()
+                || options.eval_decider.is_some()
+                || !options.mcp.is_empty()
+            {
+                return Err(
+                    "--mcp-stop stops the detached MCP server and exits: it takes only --port"
+                        .to_owned(),
+                );
+            }
+        } else if (options.http || options.detach || options.port.is_some()) && !options.mcp_serve {
+            return Err(
+                "--http, --detach (-d) and --port only go with --mcp-serve: they choose how that server is reached"
+                    .to_owned(),
+            );
+        } else if options.port.is_some() && !options.http && !options.detach {
+            return Err(
+                "--port needs --http or --detach: over standard input and output there is no port"
+                    .to_owned(),
+            );
+        }
+        if options.detach {
+            options.http = true;
         }
         if let Some(spec) = &options.eval_decider {
             if *spec == DeciderSpec::None {
@@ -321,6 +389,7 @@ impl Options {
                 || options.direct
                 || options.read_only
                 || options.decider.is_some()
+                || options.mcp_stop
                 || !options.mcp.is_empty()
             {
                 return Err(
@@ -328,6 +397,17 @@ impl Options {
                         .to_owned(),
                 );
             }
+        }
+        if options.auto_accept
+            && options
+                .decider
+                .as_ref()
+                .is_none_or(|spec| *spec == DeciderSpec::None)
+        {
+            return Err(
+                "--auto-accept needs a decider: add --decider llm or --decider jev (it applies what the decider accepts)"
+                    .to_owned(),
+            );
         }
         if options.decider.is_some() {
             if !options.mcp_serve {
@@ -600,6 +680,84 @@ mod tests {
         // It is not swallowed as a word of the server --mcp-add describes.
         let why = args(&["--mcp-add", "docs", "prog", "--mcp-serve"]).unwrap_err();
         assert!(why.contains("--mcp-serve"), "{why}");
+    }
+
+    #[test]
+    fn http_detach_and_port_go_with_mcp_serve_and_detach_implies_http() {
+        let plain = args(&["--mcp-serve"]).unwrap();
+        assert!(!plain.http && !plain.detach && plain.port.is_none());
+        let http = args(&["--mcp-serve", "--http"]).unwrap();
+        assert!(http.http && !http.detach);
+        for word in ["-d", "--detach"] {
+            let options = args(&["--mcp-serve", word, "--direct"]).unwrap();
+            assert!(options.detach && options.http && options.direct, "{word}");
+        }
+        assert_eq!(
+            args(&["--mcp-serve", "-d", "--port", "9000"]).unwrap().port,
+            Some(9000)
+        );
+        for alone in [
+            &["--http"][..],
+            &["-d"],
+            &["--detach"],
+            &["--port", "9000"],
+            &["--resume", "-d"],
+        ] {
+            let why = args(alone).unwrap_err();
+            assert!(why.contains("--mcp-serve"), "{alone:?}: {why}");
+        }
+        // A port over standard input and output has nothing to open.
+        assert!(args(&["--mcp-serve", "--port", "9000"]).is_err());
+        for bad in [
+            &["--port"][..],
+            &["--port", "0"],
+            &["--port", "70000"],
+            &["--port", "x"],
+        ] {
+            let mut list = vec!["--mcp-serve", "--http"];
+            list.extend_from_slice(bad);
+            assert!(args(&list).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn auto_accept_needs_a_decider() {
+        let options = args(&["--mcp-serve", "--decider", "jev", "--auto-accept"]).unwrap();
+        assert!(options.auto_accept);
+        assert!(
+            !args(&["--mcp-serve", "--decider", "jev"])
+                .unwrap()
+                .auto_accept
+        );
+        for alone in [
+            &["--mcp-serve", "--auto-accept"][..],
+            &["--mcp-serve", "--decider", "none", "--auto-accept"],
+            &["--auto-accept"],
+        ] {
+            let why = args(alone).unwrap_err();
+            assert!(why.contains("--auto-accept"), "{alone:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn mcp_stop_takes_only_a_port() {
+        let options = args(&["--mcp-stop"]).unwrap();
+        assert!(options.mcp_stop && options.port.is_none());
+        assert_eq!(args(&["--mcp-stop", "--port", "9"]).unwrap().port, Some(9));
+        for other in [
+            &["--mcp-serve"][..],
+            &["--resume"],
+            &["--serve"],
+            &["--http"],
+            &["-d"],
+            &["--direct"],
+            &["--eval-decider", "llm"],
+        ] {
+            let mut list = vec!["--mcp-stop"];
+            list.extend_from_slice(other);
+            let why = args(&list).unwrap_err();
+            assert!(why.contains("--mcp-stop"), "{other:?}: {why}");
+        }
     }
 
     #[test]

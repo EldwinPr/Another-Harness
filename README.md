@@ -126,7 +126,7 @@ flowchart TB
 | `runner/src/store*.rs` | Persistence and the library. Versioned migrations (`PRAGMA user_version`), a backup written before each one, and your edited prompts are never overwritten by an upgrade. |
 | `runner/src/provider.rs`, `anthropic.rs` | One chat-completions style (OpenRouter and compatible routers) and the Anthropic Messages API, with prompt-cache markers where the provider wants them. |
 | `runner/src/jobs.rs`, `subagent.rs`, `tools/tasks.rs` | Background subagents and background shell commands. |
-| `runner/src/repl.rs`, `inputbox.rs`, `markdown.rs`, `lineedit.rs` | The terminal: boxed input, live status, menus, and Markdown rendering (headings, code, tables, lists, links). |
+| `runner/src/repl.rs`, `inputbox.rs`, `markdown.rs`, `lineedit.rs` | The terminal: the `>` prompt under a rule, live status, menus, and Markdown rendering (headings, code, tables, lists, links). |
 | `runner/src/web*.rs` | A small localhost-only server for editing the library in a browser, and for reviewing the inbox. |
 | `runner/src/mcp.rs`, `mcp_serve*`, `store_buffer*` | The MCP client (this chat uses other servers' tools) and the MCP server (other harnesses use this store): read-only, buffer and direct modes, and the inbox table. |
 | `runner/src/decider*.rs`, `jev.rs` | The optional models that suggest an answer for an inbox entry, and the labelled cases that measure them. |
@@ -160,7 +160,7 @@ subagent, or keep discussing.
 its own, under a profile of your choosing, on a background thread. It gets only the tools that look,
 cannot ask you anything, and returns only a short final answer that is added to your chat at your
 next message. Up to three at a time. `/tasks` shows subagents and background commands together, under
-the input box.
+the prompt.
 
 **Stopping a model that is stuck.** A call is bad if it failed or repeats the one before it exactly.
 Three bad calls in a row add a note telling the model to stop and ask you; five end the message.
@@ -193,12 +193,37 @@ A **decider** can suggest an answer for each entry, never decide it:
 claude mcp add aharness -- /path/to/src/target/debug/runner --mcp-serve --decider llm:openrouter
 ```
 
+**Detached (issue 52).** Over standard input and output a server lives and dies with the harness that
+started it, and keeps the binary it started with. `--mcp-serve -d` (`--detach`) instead starts it in
+the background as an HTTP server on `127.0.0.1:8788` (`--port N` changes it) and returns; it takes
+the same `--read-only`, `--direct` and `--decider` and serves the folder it was started in.
+`--http` runs the same server in the foreground. Stop it with `--mcp-stop [--port N]`; after a
+rebuild stop it and start it again, and the harness registration stays valid.
+
+```bash
+./chat.sh --mcp-serve -d
+claude mcp add --transport http aharness http://127.0.0.1:8788/mcp \
+  --header "Authorization: Bearer $(cat ~/.local/share/aharness/mcp-token)"
+./chat.sh --mcp-stop
+```
+
+Every request must carry the token in `mcp-token` (made on first use, readable by you only, kept
+across restarts; delete the file for a new one); a wrong `Host`, or any `Origin` header (a web page),
+is refused. The pid and settings are in `mcp-serve-PORT.json` and what it printed in
+`mcp-serve-PORT.log`, both in the data folder. One request is answered at a time; there is no
+streaming or session. Unix only.
+
+
 `--decider` is `none` (the default), `llm[:PROVIDER[:MODEL]]` (any saved provider) or
 `jev[:PROVIDER[:MODEL]]` (OpenRouter's Jev decision model). The suggestion is stored once and shown
 next to the entry; it is never shown to the sender and never applied. A decider sends the entry's text
 to its provider and costs tokens, which is why it is off unless you ask. `--eval-decider SPEC` runs 18
 labelled cases through a decider and prints how it did, so a model is measured before it is trusted.
 Jev's API is an alpha; see `context/index/decisions/` (11 to 15) for the reasons behind each choice.
+
+`--auto-accept` (with `--decider`) lets a confident Accept apply a **new** entry at once; a replacement,
+a delete, a reject, an unsure or a weak accept still waits for you. The row says it was accepted
+automatically. It is off unless you pass it (decision 14, amendment).
 
 The other direction works too: `/mcp add NAME COMMAND` lets this chat use another MCP server's tools,
 each tool set to ask, run free or be off.

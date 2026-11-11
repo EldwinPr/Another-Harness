@@ -22,17 +22,19 @@
 
 use serde_json::Value;
 
-use super::{Def, Server, failed, required, string_arg};
+use super::{Def, Server, failed, quotes_arg, required, string_arg};
 use crate::decider::Case;
 use crate::store::Store;
-use crate::store_buffer::{Checked, Status, Submission, Submitted, current_target};
+use crate::store_buffer::{
+    ApplyOutcome, Checked, Status, Submission, Submitted, apply_entry_noted, current_target,
+};
 
 /// `submit` and `submission_get`, after the read tools in `tools/list`.
 pub(super) const SUBMIT_TOOLS: [Def; 2] = [
     Def {
         name: "submit",
-        description: "Queues. Propose to add, replace or delete a context entry, a glossary term, a skill, a personality or a system prompt. The owner reviews it and nothing changes until then; check later with submission_get. A new skill, personality or prompt is saved switched off. Profiles cannot be submitted. Answers: 'queued as #N', 'already queued as #N' or 'error: <reason>' (fix and resend).",
-        schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["context","glossary","skill","personality","prompt"],"description":"What it is for. prompt is a system prompt."},"action":{"type":"string","enum":["set","delete"],"description":"set adds the entry or replaces the one with the same name and project; delete takes no text."},"name":{"type":"string","description":"The entry's name (letters, digits, . - _) or the glossary term"},"text":{"type":"string","description":"The whole text (a glossary term's definition). Not for a delete."},"description":{"type":"string","description":"One line: what a skill, personality or prompt is for"},"context_kind":{"type":"string","enum":["rule","decision","shape","guide"],"description":"A context entry's own kind; needed for a context set. rule: how to work here. decision: a choice and why. shape: how an area is thought of. guide: a longer how-to."},"quote":{"type":"string","description":"A context entry: the owner's own words this comes from, when you have them"},"area":{"type":"string","description":"A context entry or glossary term: the business area"},"project":{"type":"string","description":"A context entry or glossary term: a project's folder path. Default: the folder the server was started in. Empty: for every project."},"why":{"type":"string","description":"Why you propose this (required, at most 1000 characters)"},"source":{"type":"string","description":"Your own name, for example claude-code (required, at most 100 characters)"}},"required":["kind","action","name","why","source"]}"#,
+        description: "Queues. Propose to add, replace or delete a context entry, a glossary term, a gotcha, a skill, a personality or a system prompt. The owner reviews it and nothing changes until then; check later with submission_get. A new skill, personality or prompt is saved switched off. Profiles cannot be submitted. Answers: 'queued as #N', 'already queued as #N' or 'error: <reason>' (fix and resend).",
+        schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["context","glossary","gotcha","skill","personality","prompt"],"description":"What it is for. prompt is a system prompt. gotcha is something learned the hard way."},"action":{"type":"string","enum":["set","delete"],"description":"set adds the entry or replaces the one with the same name and project; delete takes no text."},"name":{"type":"string","description":"The entry's name (letters, digits, . - _) or the glossary term"},"text":{"type":"string","description":"The whole text (a glossary term's definition; a gotcha says what is true, why, and what to do differently). Not for a delete."},"description":{"type":"string","description":"One line: what a skill, personality or prompt is for"},"context_kind":{"type":"string","enum":["rule","decision","shape","guide"],"description":"A context entry's own kind; needed for a context set. rule: how to work here. decision: a choice and why. shape: how an area is thought of. guide: a longer how-to."},"quote":{"type":"string","description":"A context entry: the owner's own words this comes from, when you have them"},"gotcha_type":{"type":"string","enum":["convention","hazard","trap","ownership","decision","tooling","workflow"],"description":"A gotcha's type; needed for a gotcha set"},"quotes":{"type":"array","description":"A shape (context_kind shape): the owner's own words it rests on, each with the day said and the claim it supports. A shape needs a quote here or in 'quote', or a '## Where the mechanism lives' section.","items":{"type":"object","properties":{"quote":{"type":"string","description":"The owner's words as said"},"said_on":{"type":"string","description":"YYYY-MM-DD"},"claim":{"type":"string","description":"The one line of the text this quote supports"},"replaces":{"type":"string","description":"The earlier claim this reverses, if it does"}},"required":["quote","said_on"]}},"area":{"type":"string","description":"A context entry or glossary term: the business area"},"project":{"type":"string","description":"A context entry, glossary term or gotcha: a project's folder path. Default: the folder the server was started in. Empty: for every project."},"why":{"type":"string","description":"Why you propose this (required, at most 1000 characters)"},"source":{"type":"string","description":"Your own name, for example claude-code (required, at most 100 characters)"}},"required":["kind","action","name","why","source"]}"#,
     },
     Def {
         name: "submission_get",
@@ -60,7 +62,11 @@ impl Server {
         // Context and glossary belong to a folder; the library kinds do not have one.
         let project = match string_arg(arguments, "project")? {
             Some(given) => given,
-            None if matches!(kind.to_lowercase().as_str(), "context" | "glossary") => {
+            None if matches!(
+                kind.to_lowercase().as_str(),
+                "context" | "glossary" | "gotcha"
+            ) =>
+            {
                 self.project.clone()
             }
             None => String::new(),
@@ -75,6 +81,8 @@ impl Server {
             description: string_arg(arguments, "description")?.unwrap_or_default(),
             quote: string_arg(arguments, "quote")?.unwrap_or_default(),
             area: string_arg(arguments, "area")?,
+            gotcha_type: string_arg(arguments, "gotcha_type")?.unwrap_or_default(),
+            quotes: quotes_arg(arguments)?,
         };
         let checked = Checked::new(&raw, &why, &source).map_err(|e| format!("error: {e}"))?;
         // The one write this server makes in buffer mode: a new row in the inbox.
@@ -127,6 +135,56 @@ impl Server {
         store
             .add_suggestion(id, &decider.name(), &opinion)
             .map_err(|e| e.to_string())?;
+        if self.auto_accept {
+            self.accept_if_sure(&mut store, id, &case, decider.name(), &opinion)?;
+        }
+        Ok(())
+    }
+
+    /// `--auto-accept`: applies the row at once when the decider's shown suggestion is Accept (its
+    /// confidence over the decider's threshold) and the entry is a `set` of something that is not
+    /// stored yet. A replacement or a delete changes what the owner already keeps, and a
+    /// reject or unsure suggestion is not acted on either: all of those stay in the inbox. The
+    /// change goes through the same `apply_entry` as the owner's Accept, so a library item is
+    /// still saved switched off, and the row says it was accepted automatically.
+    fn accept_if_sure(
+        &self,
+        store: &mut Store,
+        id: i64,
+        case: &Case,
+        decider: String,
+        opinion: &crate::decider::Opinion,
+    ) -> Result<(), String> {
+        let shown = crate::decider::derive(&decider, opinion.verdict, opinion.confidence);
+        if shown != crate::decider::Verdict::Accept
+            || case.stored.is_some()
+            || !case.submission.action.eq_ignore_ascii_case("set")
+        {
+            return Ok(());
+        }
+        // The library lookup is case-sensitive but names that differ only in case read as one
+        // item to the owner: "Deploy" next to "deploy" is a replacement, so it waits.
+        if matches!(
+            case.submission.kind.as_str(),
+            "skill" | "personality" | "prompt"
+        ) && store
+            .list_prompts()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case(&case.submission.name))
+        {
+            return Ok(());
+        }
+        let note = format!(
+            "accepted automatically: {decider} said accept ({:.2})",
+            opinion.confidence.unwrap_or_default()
+        );
+        match apply_entry_noted(store, id, None, &note).map_err(|e| e.to_string())? {
+            ApplyOutcome::Applied(_) | ApplyOutcome::NoChange => {}
+            ApplyOutcome::Stale | ApplyOutcome::Failed(_) => {
+                eprintln!("auto-accept: #{id} was left in the inbox: it could not be applied");
+            }
+        }
         Ok(())
     }
 
