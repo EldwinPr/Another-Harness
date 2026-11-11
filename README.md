@@ -14,8 +14,8 @@ profile to a subagent. Ask the model to improve it. Edit it in a browser. Nothin
 binary except one default prompt, and that one is a row in the database like the rest.
 
 > **Status: early, and one person's tool.** It is used daily by its author against OpenRouter and
-> the Anthropic Messages API, and has a large test suite (1,000+ tests, none touch the network), but
-> few other people have run it. Expect rough edges, and read the [limits](#limits) before you point
+> the Anthropic Messages API, and has a large test suite (1,000+ tests, none touch the network).
+> Expect rough edges, and read the [limits](#limits) before you point
 > it at anything you care about.
 
 ---
