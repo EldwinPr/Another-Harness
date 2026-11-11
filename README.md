@@ -242,7 +242,21 @@ each tool set to ask, run free or be off.
   next message, and the model you pick is the one the next start uses. Providers are saved in the
   database; their keys are asked for once.
 
-## Quick start
+## Install
+
+**Linux x86_64 (no Rust or C compiler needed).** Download a package from the
+[Releases page](https://github.com/EldwinPr/Another-Harness/releases):
+
+```bash
+sudo apt install ./aharness_0.1.0-1_amd64.deb     # Debian, Ubuntu
+sudo dnf install ./aharness-0.1.0-1.x86_64.rpm    # Fedora, RHEL
+tar xzf aharness-v0.1.0-linux-x86_64.tar.gz       # or just unpack and run ./aharness
+```
+
+Then run `aharness` in any folder. Check the download against `SHA256SUMS`. Windows is not
+supported yet and macOS is untested; build from source there.
+
+## Quick start (from source)
 
 You need a Rust toolchain (the version is pinned in `rust-toolchain.toml`, so `rustup` picks it up)
 and a C compiler, because SQLite is built from bundled source.

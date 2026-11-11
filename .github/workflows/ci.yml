@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the version (and rustfmt/clippy), so rustup installs exactly that.
+      - name: Install the pinned toolchain
+        run: rustup show
+      - run: cargo build
+      - run: cargo test
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check

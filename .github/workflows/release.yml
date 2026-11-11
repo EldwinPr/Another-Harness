@@ -1,0 +1,43 @@
+name: Release
+
+# Push a tag like v0.1.0 to build the Linux packages and attach them to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    # Built on an older Ubuntu so the binary runs on older glibc systems too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the crate version
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="runner"))')
+          test "v$v" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != version v$v"; exit 1; }
+      - run: rustup show
+      - name: Test before releasing
+        run: cargo test
+      - run: cargo build --release -p runner
+      - run: cargo install cargo-deb cargo-generate-rpm --locked
+      - run: cargo deb -p runner --no-build
+      - run: cargo generate-rpm -p runner
+      - name: Collect assets
+        run: |
+          mkdir -p dist/aharness-${GITHUB_REF_NAME}-linux-x86_64
+          cp target/release/runner dist/aharness-${GITHUB_REF_NAME}-linux-x86_64/aharness
+          cp README.md LICENSE dist/aharness-${GITHUB_REF_NAME}-linux-x86_64/
+          tar -C dist -czf dist/aharness-${GITHUB_REF_NAME}-linux-x86_64.tar.gz aharness-${GITHUB_REF_NAME}-linux-x86_64
+          rm -r dist/aharness-${GITHUB_REF_NAME}-linux-x86_64
+          cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+          cd dist && sha256sum * > SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" --prerelease \
+            --notes "Early release. Linux x86_64 only. See CHANGELOG.md. Install: the .deb, the .rpm, or unpack the .tar.gz and run \`aharness\`."

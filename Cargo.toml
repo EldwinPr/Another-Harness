@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.99"
 publish = false
 license = "AGPL-3.0-only"
+repository = "https://github.com/EldwinPr/Another-Harness"
 
 # Exact pins: determinism work does not take silent upgrades (see testing.md).
 [workspace.dependencies]
@@ -18,3 +19,8 @@ ureq = { version = "=3.5.1" }
 # runs the same SQLite version. sha2 hashes requests and prompts for the store.
 rusqlite = { version = "=0.41.1", features = ["bundled"] }
 sha2 = { version = "=0.11.1" }
+
+# Release builds are stripped so the downloadable binary is small. Nothing else changes: the
+# request builder is pure, so optimisation settings do not affect what is sent.
+[profile.release]
+strip = true

@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "A modular, deterministic prompt harness for building your own terminal coding agent"
+readme = "../README.md"
 # Several binaries exist (runner, hello, cache_check, mcp_fake); this says which one a bare `cargo run` starts.
 default-run = "runner"
 
@@ -15,3 +18,26 @@ serde_json.workspace = true
 ureq.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
+
+# Linux packages (cargo deb -p runner / cargo generate-rpm -p runner). The program is installed as
+# `aharness`, the name of its data folder (~/.local/share/aharness). SQLite is compiled in, so the
+# only runtime need is libc.
+[package.metadata.deb]
+name = "aharness"
+maintainer = "Eldwin Pradipta <117251859+EldwinPr@users.noreply.github.com>"
+section = "devel"
+priority = "optional"
+extended-description = "Assembles a coding agent from system prompts, skills, personalities and profiles stored in a database, and builds byte-identical requests from them."
+assets = [
+    ["target/release/runner", "usr/bin/aharness", "755"],
+    ["../README.md", "usr/share/doc/aharness/README.md", "644"],
+    ["../LICENSE", "usr/share/doc/aharness/copyright", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "aharness"
+assets = [
+    { source = "../target/release/runner", dest = "/usr/bin/aharness", mode = "755" },
+    { source = "../README.md", dest = "/usr/share/doc/aharness/README.md", mode = "644", doc = true },
+    { source = "../LICENSE", dest = "/usr/share/licenses/aharness/LICENSE", mode = "644", license = true },
+]
