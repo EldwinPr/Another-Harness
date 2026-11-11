@@ -1,7 +1,7 @@
 # Another Harness
 
 **You Only Prompt Once.** A modular prompt system for building your own coding agent, in a
-terminal, in about 60,000 lines of Rust (a good part of it tests) and five dependencies.
+terminal, in about 70,000 lines of Rust (a good part of it tests) and five dependencies.
 
 Most agent harnesses are a prompt you cannot see, wrapped around a loop you cannot change. This one
 is the other way round. The agent is **assembled from parts you own**: system prompts, skills,
@@ -253,7 +253,7 @@ sudo dnf install ./aharness-0.1.0-1.x86_64.rpm    # Fedora, RHEL
 tar xzf aharness-v0.1.0-linux-x86_64.tar.gz       # or just unpack and run ./aharness
 ```
 
-Then run `aharness` in any folder. Check the download against `SHA256SUMS`. Windows is not
+Then run `aharness` in any folder (`aharness --serve` opens the local web page; `aharness --mcp-serve` is the MCP server). Check the download against `SHA256SUMS`. Windows is not
 supported yet and macOS is untested; build from source there.
 
 ## Quick start (from source)

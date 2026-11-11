@@ -846,7 +846,7 @@ const HELP_TOP: &str = "\
 <p class=\"dim\">How to use the harness. The chat is in the terminal; this page is its settings and notebook.</p>\
 <h2>Chatting</h2>\
 <ul>\
-<li>Start it with <code>cd src &amp;&amp; ./chat.sh</code>. Pick a provider with <code>/provider</code>, then type a message. <code>/help</code> lists every command.</li>\
+<li>Start it with <code>aharness</code> (installed from the .deb, .rpm or .tar.gz) or, from a source checkout, <code>cd src &amp;&amp; ./chat.sh</code>. Pick a provider with <code>/provider</code>, then type a message. <code>/help</code> lists every command.</li>\
 <li>To use it inside a repository, run <code>src/harness.sh</code> from that folder (or link it onto your PATH). Your chats, providers and entries are kept in <code>~/.local/share/aharness</code>, not in the repository; the only thing added there is <code>.Aharness/</code> (subagent notes), which ignores itself.</li>\
 <li>A provider is a base URL, a model, a key and the API it speaks: <code>/provider add &lt;name&gt; &lt;base_url&gt; &lt;model&gt; [openai|anthropic]</code>. <code>openai</code> (the default) is chat completions, which OpenRouter and most routers speak; for Claude models on OpenRouter use an id such as <code>anthropic/claude-...</code> and the program asks for prompt caching by itself. <code>anthropic</code> is Anthropic\'s own Messages API (base URL <code>https://api.anthropic.com/v1</code>). The providers menu asks for the name, URL, which API and the key, then lists the models the provider offers so you pick the default (type to filter) instead of typing it; it can change the API later.</li>\
 <li>Esc (or Ctrl-C) while the model works cancels the message. <code>@</code> in the box attaches a file or folder of the working directory. A line starting with <code>/</code> lists the matching commands: Tab completes one, Enter completes a part of a command and sends a finished one.</li>\
@@ -855,7 +855,7 @@ const HELP_TOP: &str = "\
 </ul>\
 <h2>This web view</h2>\
 <ul>\
-<li>Start it from the chat with <code>/web</code> (stop with <code>/web stop</code>), or on its own with <code>./chat.sh --serve</code>. It answers only on this computer (<code>127.0.0.1</code>).</li>\
+<li>Start it from the chat with <code>/web</code> (stop with <code>/web stop</code>), or on its own with <code>aharness --serve</code> (<code>./chat.sh --serve</code> from source). It answers only on this computer (<code>127.0.0.1</code>).</li>\
 <li>You can add, change and delete here; the terminal sees the change at once. A chat that is already open keeps the system prompt it started with, so use <code>/new</code> to pick up an edited prompt.</li>\
 <li>An edit or delete is refused if someone changed the same item meanwhile, and the page shows what you had typed.</li>\
 </ul>\

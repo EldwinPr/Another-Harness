@@ -17,6 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -150,6 +151,8 @@ fn spawn(server: &McpServer, cwd: &Path) -> Result<(Transport, Process), String>
     };
     let tail = Arc::new(Mutex::new(VecDeque::new()));
     let keep = Arc::clone(&tail);
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&finished);
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             let mut tail = keep.lock().unwrap_or_else(|e| e.into_inner());
@@ -158,6 +161,7 @@ fn spawn(server: &McpServer, cwd: &Path) -> Result<(Transport, Process), String>
             }
             tail.push_back(line);
         }
+        done.store(true, Ordering::Release);
     });
     let group = child.id();
     Ok((
@@ -166,6 +170,7 @@ fn spawn(server: &McpServer, cwd: &Path) -> Result<(Transport, Process), String>
             child,
             group,
             stderr: tail,
+            stderr_done: finished,
         },
     ))
 }
@@ -184,6 +189,19 @@ struct Process {
     child: Child,
     group: u32,
     stderr: Arc<Mutex<VecDeque<String>>>,
+    /// Set by the reader thread once the server's stderr has ended.
+    stderr_done: Arc<AtomicBool>,
+}
+
+impl Process {
+    /// Waits a moment for the stderr reader to take in everything the server wrote before it
+    /// stopped; without this a slow machine can report an exit with nothing it wrote.
+    fn settle_stderr(&self) {
+        let until = Instant::now() + Duration::from_millis(300);
+        while !self.stderr_done.load(Ordering::Acquire) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 struct Inner {
@@ -415,6 +433,7 @@ impl McpClient {
         let Some(process) = &inner.process else {
             return String::new();
         };
+        process.settle_stderr();
         let tail = process.stderr.lock().unwrap_or_else(|e| e.into_inner());
         let text = tail
             .iter()
@@ -535,6 +554,7 @@ impl McpClient {
                 }
                 thread::sleep(Duration::from_millis(10));
             }
+            process.settle_stderr();
             let tail = process.stderr.lock().unwrap_or_else(|e| e.into_inner());
             let last: Vec<&str> = tail.iter().rev().take(3).rev().map(|l| l.trim()).collect();
             if !last.is_empty() {
