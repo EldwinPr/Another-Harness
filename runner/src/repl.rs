@@ -149,7 +149,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/mcp",
-        "list the MCP servers the chat starts and what the model may do with their tools: each tool asks first, runs freely or is off; changes apply the next time the program starts",
+        "switch MCP servers on or off in this chat, like /skills (a terminal shows a checklist, Enter toggles; typed: /mcp on NAME, /mcp off NAME). A chat starts with none on. Once the chat has replies, turning one on makes the router read the chat again, and turning one off keeps its tools listed but refuses the calls",
     ),
     (
         "/mcp config",
@@ -160,8 +160,8 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
         "list the ready-made MCP toolsets (rust-docs) and add one with its rules already set",
     ),
     (
-        "/mcp <add|remove|enable|disable|tools|restart|rule> ...",
-        "the same by typing (also without a terminal): add NAME COMMAND [ARGS] [--env N=v] [--timeout S], tools NAME, rule NAME TOOL|* ask|free|off",
+        "/mcp <on|off|add|remove|enable|disable|tools|restart|rule> ...",
+        "the same by typing (also without a terminal): on NAME, off NAME, add NAME COMMAND [ARGS] [--env N=v] [--timeout S], tools NAME, rule NAME TOOL|* ask|free|off",
     ),
     (
         "/inbox",
@@ -173,7 +173,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/tools [name]",
-        "list the tools the model has, and what a subagent gets; with a name, show that tool in full",
+        "switch built-in tools on or off in this chat, like /skills (a terminal shows a checklist; typed: /tools on|off NAME, /tools save for the profile). A tool that is off has no definition in the request. With a name, show that tool in full",
     ),
     (
         "/web [port]",
@@ -492,8 +492,6 @@ pub struct Terminal<R, W> {
     watcher: Option<Watcher>,
     /// The working directory: the `@file` list is made from it and `@path` words are read from it.
     root: std::path::PathBuf,
-    /// The MCP servers this chat started, by name, for `/mcp restart` (issue 44).
-    mcp: Vec<(String, Rc<crate::mcp::McpClient>)>,
 }
 
 /// The box at the bottom of the screen while the model works: output is printed above it.
@@ -564,7 +562,6 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
             cancel: None,
             watcher: None,
             root: std::env::current_dir().unwrap_or_default(),
-            mcp: Vec::new(),
         }))
     }
 
@@ -695,18 +692,6 @@ impl<R: BufRead, W: Write> Terminal<R, W> {
 
     pub fn set_root(&mut self, root: std::path::PathBuf) {
         self.root = root;
-    }
-
-    /// Gives the MCP servers this chat started, so `/mcp restart` can start one again.
-    pub fn set_mcp(&mut self, clients: Vec<(String, Rc<crate::mcp::McpClient>)>) {
-        self.mcp = clients;
-    }
-
-    pub fn mcp_client(&self, name: &str) -> Option<Rc<crate::mcp::McpClient>> {
-        self.mcp
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, c)| Rc::clone(c))
     }
 
     /// Gives the flag that Esc and Ctrl-C set while the model works.
@@ -1890,6 +1875,7 @@ fn info_text(agent: &Agent, width: Option<usize>) -> String {
             model: agent.ready().then(|| agent.model()),
             provider: &agent.target().name,
             approve: &approve,
+            profile: agent.chat_profile(),
             always: agent.always_labels().len(),
             subagents: agent.running_subagents(),
             shells: agent.shells().running(),
@@ -5657,7 +5643,7 @@ mod tests {
         );
         run(&mut r.agent, &r.term).unwrap();
         let out = screen(&r.term);
-        assert!(out.contains("tools the model has"), "{out}");
+        assert!(out.contains("built-in tools,"), "{out}");
         assert!(out.contains("read_file(lines?, path, start?)"), "{out}");
         assert!(out.contains("/tools <name> shows one in full"), "{out}");
         assert!(out.contains("there is no tool 'nope'"), "{out}");

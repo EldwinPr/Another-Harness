@@ -222,7 +222,12 @@ pub fn assemble(config: &Config, messages: &[Message]) -> Vec<u8> {
         });
     let request = Request {
         model: &config.model,
-        messages: messages.iter().map(wire_message).collect(),
+        // An empty system prompt is no message at all (issue 54: the `bare` profile).
+        messages: messages
+            .iter()
+            .filter(|m| !matches!(m, Message::System(text) if text.trim().is_empty()))
+            .map(wire_message)
+            .collect(),
         tools: config.tools.iter().map(wire_tool).collect(),
         max_tokens: config.max_tokens,
         provider,

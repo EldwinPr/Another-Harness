@@ -338,7 +338,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 31);
         let rows: Vec<(i64, String, String, Option<i64>, String)> = s
             .conn
             .prepare("SELECT id, kind, status, decided_at, decision_note FROM buffer_entries ORDER BY id")
@@ -398,7 +398,7 @@ mod tests {
             )
             .unwrap();
         assert!(s.context_entry("/p", "style").unwrap().is_some());
-        assert!(dir.path().join("harness.db.before-28").exists());
+        assert!(dir.path().join("harness.db.before-31").exists());
         s.set_gotcha_in("/p", "ok", "hazard", "Works.", "").unwrap();
     }
 }

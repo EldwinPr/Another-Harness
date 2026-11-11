@@ -63,6 +63,8 @@ impl PromptInfo {
         );
         if self.fallback {
             format!("the built-in text, the profile has no system prompt; {size}")
+        } else if self.names.is_empty() {
+            "no system prompt: the profile has none and nothing is sent".to_owned()
         } else {
             format!(
                 "{} on ({}); {size}",
@@ -255,6 +257,58 @@ pub struct Agent {
     keeps_cancel: bool,
     /// The chat that delegated to this one, when this agent is a subagent.
     parent_id: Option<i64>,
+    /// Starts an MCP server when `/mcp on` asks (issue 53); `None` means the chat has no servers.
+    mcp_launcher: Option<McpLauncher>,
+    /// The MCP servers started in this chat.
+    mcp_running: Vec<RunningMcp>,
+    /// The tools the program has built in (and `delegate`), as opposed to an MCP server's.
+    builtin: Vec<String>,
+    /// Which of them the chat may use (issue 54); `None` is every one.
+    tools_on: Option<Vec<String>>,
+    /// Which of them have a definition in the request. A tool switched off after the chat had
+    /// replies stays here (a different list makes the router read the chat again) but its calls
+    /// are refused.
+    tools_listed: Vec<String>,
+    /// The definition of `delegate`, when the chat can delegate.
+    delegate_spec: Option<kernel::ToolSpec>,
+    /// Servers that did not start when a saved chat was resumed, for the resume report.
+    mcp_notes: Vec<String>,
+}
+
+/// A started MCP server (issue 53): its tools, ready to add to the chat, and the client that keeps
+/// the process.
+pub struct McpLaunch {
+    pub tools: Vec<Box<dyn Tool>>,
+    pub client: std::rc::Rc<crate::mcp::McpClient>,
+    /// How many tools the model is given, and about how many tokens they add to every call.
+    pub count: usize,
+    pub tokens: usize,
+}
+
+/// Starts one MCP server with the rules the owner set for its tools. Built by `main` (it holds the
+/// working directory, the stop flag and the approver); a chat without one cannot start servers.
+pub type McpLauncher = std::rc::Rc<
+    dyn Fn(
+        &crate::store_mcp::McpServer,
+        &[(String, crate::store_mcp::Rule)],
+    ) -> Result<McpLaunch, String>,
+>;
+
+/// An MCP server in this chat. `blocked` is a server turned off after the chat had replies: its
+/// tools stay in every request so the router's cache stays valid, and the calls are refused.
+struct RunningMcp {
+    name: String,
+    client: std::rc::Rc<crate::mcp::McpClient>,
+    tools: Vec<String>,
+    blocked: bool,
+}
+
+/// What `/mcp on|off` did, in words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListChange {
+    pub message: String,
+    /// Set when the request now differs from the one the router cached.
+    pub warning: Option<String>,
 }
 
 /// Said when the personality changes in a chat that already has replies.
@@ -272,6 +326,9 @@ const CANCELLED_NOTE: &str = "[cancelled by the user]";
 pub const PLAN_TEXT: &str = "Plan mode is on. Nothing may be changed: file changes, commands that are not looking commands, and saving to the glossary, context, library or profiles are all refused. Look at what you need (read_file, ls, grep, find, git log), then answer with a plan: the goal in one line; numbered steps, each naming the files it touches; and what you are unsure of. Do not start the work.";
 
 pub const WAKE_TEXT: &str = "A subagent you started has finished; its answer is in the message above. Carry on with what the user asked: use it, or tell the user what it found. If nothing more is needed, say so briefly.";
+
+/// Said when `/mcp on` changes the tools of a chat that already has replies.
+pub const MCP_LIST_WARNING: &str = "the tool list changed: the next message makes the router read the whole chat again at full price";
 
 pub const PERSONALITY_WARNING: &str = "changing the personality in the middle of a chat can be troublesome: earlier replies keep the old style and the model may keep following them. /new starts a clean chat.";
 
@@ -301,6 +358,7 @@ impl Agent {
             tools: tools.iter().map(|t| t.spec().clone()).collect(),
             ..Config::default()
         };
+        let builtin: Vec<String> = tools.iter().map(|t| t.spec().name.clone()).collect();
         Self {
             config,
             history: vec![Message::System(SYSTEM_PROMPT.to_owned())],
@@ -323,6 +381,13 @@ impl Agent {
             auto_wakes: 0,
             keeps_cancel: false,
             parent_id: None,
+            mcp_launcher: None,
+            mcp_running: Vec::new(),
+            mcp_notes: Vec::new(),
+            tools_listed: builtin.clone(),
+            builtin,
+            tools_on: None,
+            delegate_spec: None,
         }
     }
 
@@ -357,8 +422,11 @@ impl Agent {
     }
 
     pub fn with_subagents(mut self, tools: SubagentTools) -> Self {
-        self.config.tools.push(crate::subagent::delegate_spec());
+        self.delegate_spec = Some(crate::subagent::delegate_spec());
+        self.builtin.push(crate::subagent::DELEGATE.to_owned());
+        self.tools_listed.push(crate::subagent::DELEGATE.to_owned());
         self.subagent_tools = Some(tools);
+        self.refresh_specs();
         self
     }
 
@@ -477,6 +545,7 @@ impl Agent {
                 .chat_prompts(resumed.info.id)
                 .unwrap_or_default();
         }
+        self.stop_all_mcp();
         self.history = std::iter::once(Message::System(resumed.info.system_prompt))
             .chain(resumed.messages)
             .collect();
@@ -490,6 +559,13 @@ impl Agent {
             .as_ref()
             .and_then(|s| s.store.chat_usage(resumed_id).ok())
             .unwrap_or_default();
+        self.start_saved_mcp(resumed_id);
+        let saved_tools = self
+            .stored
+            .as_ref()
+            .and_then(|s| s.store.session_tools(resumed_id).ok())
+            .unwrap_or(None);
+        self.set_start_tools(saved_tools);
     }
 
     /// The router options in use, as the text the store compares against a saved chat.
@@ -509,6 +585,7 @@ impl Agent {
                 assembled: assemble_prompts(&[]),
                 profile: String::new(),
                 chat: ChatPrompts::default(),
+                tools: None,
             }),
         }
     }
@@ -531,6 +608,7 @@ impl Agent {
     }
 
     fn begin_under(&mut self, start: &Start) {
+        self.set_start_tools(start.tools.clone());
         self.chat_prompts = start.chat.clone();
         self.profile = (!start.profile.is_empty()).then(|| start.profile.clone());
     }
@@ -549,9 +627,385 @@ impl Agent {
         Ok(PromptInfo::of(&start.assembled))
     }
 
+    // ---- built-in tools in this chat (issue 54) ----
+
+    fn is_builtin(&self, name: &str) -> bool {
+        self.builtin.iter().any(|n| n == name)
+    }
+
+    /// True when the chat may use this tool: an MCP tool is governed by its server, a built-in
+    /// one by the chat's list.
+    pub fn tool_is_on(&self, name: &str) -> bool {
+        !self.is_builtin(name)
+            || self
+                .tools_on
+                .as_ref()
+                .is_none_or(|on| on.iter().any(|n| n == name))
+    }
+
+    fn refuse_off_tool(&self, name: &str) -> Option<String> {
+        (!self.tool_is_on(name)).then(|| {
+            format!(
+                "error: the tool {name} is off in this chat; the owner can turn it on with /tools on {name}"
+            )
+        })
+    }
+
+    /// Rebuilds the definitions sent with every request: the built-in tools that are listed, in
+    /// the program's order, then an MCP server's.
+    fn refresh_specs(&mut self) {
+        let mut specs: Vec<kernel::ToolSpec> = self
+            .tools
+            .iter()
+            .map(|t| t.spec().clone())
+            .filter(|spec| !self.is_builtin(&spec.name) || self.tools_listed.contains(&spec.name))
+            .collect();
+        if let Some(delegate) = &self.delegate_spec
+            && self
+                .tools_listed
+                .iter()
+                .any(|n| n == crate::subagent::DELEGATE)
+        {
+            let at = specs
+                .iter()
+                .position(|s| !self.is_builtin(&s.name))
+                .unwrap_or(specs.len());
+            specs.insert(at, delegate.clone());
+        }
+        self.config.tools = specs;
+    }
+
+    /// Sets which built-in tools a chat starts with (a profile's, or a saved chat's own); only
+    /// those have a definition in the request.
+    fn set_start_tools(&mut self, tools: Option<Vec<String>>) {
+        self.tools_listed = match &tools {
+            None => self.builtin.clone(),
+            Some(on) => self
+                .builtin
+                .iter()
+                .filter(|n| on.contains(n))
+                .cloned()
+                .collect(),
+        };
+        self.tools_on = tools;
+        self.refresh_specs();
+    }
+
+    /// Every built-in tool, whether the chat may use it, and its definition.
+    pub fn builtin_tools(&self) -> Vec<(crate::tool_list::ToolInfo, bool)> {
+        let mut out = Vec::new();
+        for name in &self.builtin {
+            let spec = self
+                .tools
+                .iter()
+                .map(|t| t.spec())
+                .find(|s| &s.name == name)
+                .or(self
+                    .delegate_spec
+                    .as_ref()
+                    .filter(|_| name == crate::subagent::DELEGATE));
+            if let Some(spec) = spec {
+                out.push((crate::tool_list::ToolInfo::of(spec), self.tool_is_on(name)));
+            }
+        }
+        out
+    }
+
+    /// Switches a built-in tool on or off in this chat. On adds its definition to the request.
+    /// Off removes it while the chat has no replies; after that the definition stays (a different
+    /// list makes the router read the chat again) and the calls are refused.
+    pub fn set_tool(&mut self, name: &str, on: bool) -> Result<ListChange, String> {
+        let name = name.trim();
+        if !self.is_builtin(name) {
+            return Err(format!(
+                "there is no built-in tool named '{name}' (see /tools)"
+            ));
+        }
+        if self.tool_is_on(name) == on {
+            return Ok(ListChange {
+                message: format!(
+                    "{name} is already {} in this chat",
+                    if on { "on" } else { "off" }
+                ),
+                warning: None,
+            });
+        }
+        let replies = self.has_replies();
+        let mut now: Vec<String> = match &self.tools_on {
+            None => self.builtin.clone(),
+            Some(list) => list.clone(),
+        };
+        now.retain(|n| n != name);
+        if on {
+            now.push(name.to_owned());
+        }
+        self.tools_on = Some(now);
+        let was_listed = self.tools_listed.iter().any(|n| n == name);
+        let change = if on {
+            if !was_listed {
+                self.tools_listed.push(name.to_owned());
+            }
+            ListChange {
+                message: format!("{name} is on in this chat"),
+                warning: (replies && !was_listed).then(|| MCP_LIST_WARNING.to_owned()),
+            }
+        } else if replies {
+            ListChange {
+                message: format!(
+                    "{name} is off in this chat: its definition stays in the request so the router's cache stays valid, and the model's calls to it are refused. /new drops it."
+                ),
+                warning: None,
+            }
+        } else {
+            self.tools_listed.retain(|n| n != name);
+            ListChange {
+                message: format!("{name} is off in this chat"),
+                warning: None,
+            }
+        };
+        self.refresh_specs();
+        if let Some(stored) = &mut self.stored
+            && let Some(id) = stored.session_id
+        {
+            stored
+                .store
+                .set_session_tools(id, self.tools_on.as_deref())
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(change)
+    }
+
+    /// Makes the tools on now the tools the chat's profile starts with.
+    pub fn save_tools_to_profile(&mut self) -> Result<String, String> {
+        let profile = self
+            .profile
+            .clone()
+            .ok_or("this chat began under no profile")?;
+        let stored = self.stored.as_mut().ok_or(NOT_SAVING)?;
+        stored
+            .store
+            .set_profile_tools(&profile, self.tools_on.as_deref())
+            .map_err(|e| e.to_string())?;
+        Ok(profile)
+    }
+
+    // ---- MCP servers in this chat (issue 53) ----
+
+    /// Lets `/mcp on` start servers.
+    pub fn with_mcp_launcher(mut self, launcher: McpLauncher) -> Self {
+        self.mcp_launcher = Some(launcher);
+        self
+    }
+
+    /// Every saved server and whether it is on in this chat.
+    pub fn mcp_servers(&self) -> Result<Vec<(crate::store_mcp::McpServer, bool)>, String> {
+        let stored = self.stored.as_ref().ok_or(NOT_SAVING)?;
+        let servers = stored.store.list_mcp_servers().map_err(|e| e.to_string())?;
+        Ok(servers
+            .into_iter()
+            .map(|server| {
+                let on = self.mcp_is_on(&server.name);
+                (server, on)
+            })
+            .collect())
+    }
+
+    /// True when the server is on in this chat (one that was turned off after the chat had
+    /// replies is off, though its tools are still listed).
+    pub fn mcp_is_on(&self, name: &str) -> bool {
+        self.mcp_running
+            .iter()
+            .any(|r| r.name == name && !r.blocked)
+    }
+
+    /// The client of a server started in this chat, for `/mcp restart` and the state line.
+    pub fn mcp_client(&self, name: &str) -> Option<std::rc::Rc<crate::mcp::McpClient>> {
+        self.mcp_running
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(name))
+            .map(|r| std::rc::Rc::clone(&r.client))
+    }
+
+    /// True once the model has answered in this chat.
+    pub fn has_replies(&self) -> bool {
+        self.history
+            .iter()
+            .any(|m| matches!(m, Message::Assistant { .. }))
+    }
+
+    /// What went wrong starting servers for a resumed chat; read once.
+    pub fn take_mcp_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.mcp_notes)
+    }
+
+    /// Switches a server on or off in this chat. On starts it and adds its tools. Off stops it and
+    /// removes its tools while the chat has no replies; after that the tools stay listed (a
+    /// different list would make the router read the whole chat again) and the model's calls are
+    /// refused.
+    pub fn set_mcp(&mut self, name: &str, on: bool) -> Result<ListChange, String> {
+        let server = {
+            let stored = self.stored.as_ref().ok_or(NOT_SAVING)?;
+            stored
+                .store
+                .mcp_server(name)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("there is no MCP server named '{}'", name.trim()))?
+        };
+        let name = server.name.clone();
+        let replies = self.has_replies();
+        let running = self.mcp_running.iter().position(|r| r.name == name);
+        let change = match (on, running) {
+            (true, Some(i)) if !self.mcp_running[i].blocked => {
+                return Ok(ListChange {
+                    message: format!("{name} is already on in this chat"),
+                    warning: None,
+                });
+            }
+            (true, Some(i)) => {
+                self.mcp_running[i].blocked = false;
+                ListChange {
+                    message: format!("{name} is on again in this chat"),
+                    warning: None,
+                }
+            }
+            (true, None) => {
+                if !server.enabled {
+                    return Err(format!(
+                        "{name} is disabled: /mcp enable {name} allows it to be switched on"
+                    ));
+                }
+                let launched = self.launch_mcp(&server)?;
+                let (count, tokens) = (launched.count, launched.tokens);
+                let tool_names = launched
+                    .tools
+                    .iter()
+                    .map(|t| t.spec().name.clone())
+                    .collect();
+                for tool in launched.tools {
+                    self.config.tools.push(tool.spec().clone());
+                    self.tools.push(tool);
+                }
+                self.mcp_running.push(RunningMcp {
+                    name: name.clone(),
+                    client: launched.client,
+                    tools: tool_names,
+                    blocked: false,
+                });
+                ListChange {
+                    message: format!(
+                        "{name} is on in this chat: {count} tool{} (about {tokens} tokens in every request)",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    warning: replies.then(|| MCP_LIST_WARNING.to_owned()),
+                }
+            }
+            (false, None) => {
+                return Ok(ListChange {
+                    message: format!("{name} is already off in this chat"),
+                    warning: None,
+                });
+            }
+            (false, Some(i)) if self.mcp_running[i].blocked => {
+                return Ok(ListChange {
+                    message: format!("{name} is already off in this chat"),
+                    warning: None,
+                });
+            }
+            (false, Some(i)) if replies => {
+                self.mcp_running[i].blocked = true;
+                ListChange {
+                    message: format!(
+                        "{name} is off in this chat: its tools stay listed so the router's cache stays valid, and the model's calls to them are refused. /new drops them."
+                    ),
+                    warning: None,
+                }
+            }
+            (false, Some(i)) => {
+                let gone = self.mcp_running.remove(i);
+                self.drop_mcp_tools(&gone.tools);
+                ListChange {
+                    message: format!("{name} is off in this chat and stopped"),
+                    warning: None,
+                }
+            }
+        };
+        self.persist_chat_mcp()?;
+        Ok(change)
+    }
+
+    fn launch_mcp(&self, server: &crate::store_mcp::McpServer) -> Result<McpLaunch, String> {
+        let launcher = self
+            .mcp_launcher
+            .as_ref()
+            .ok_or("this chat cannot start MCP servers")?;
+        let stored = self.stored.as_ref().ok_or(NOT_SAVING)?;
+        let rules = stored
+            .store
+            .mcp_rules(server.id)
+            .map_err(|e| e.to_string())?;
+        launcher(server, &rules).map_err(|why| format!("{} did not start: {why}", server.name))
+    }
+
+    fn drop_mcp_tools(&mut self, names: &[String]) {
+        self.tools.retain(|t| !names.contains(&t.spec().name));
+        self.config.tools.retain(|t| !names.contains(&t.name));
+    }
+
+    /// Stops every server of this chat and removes their tools.
+    fn stop_all_mcp(&mut self) {
+        for gone in std::mem::take(&mut self.mcp_running) {
+            self.drop_mcp_tools(&gone.tools);
+        }
+    }
+
+    /// The servers that are on, by name, for saving.
+    fn mcp_on_names(&self) -> Vec<String> {
+        self.mcp_running
+            .iter()
+            .filter(|r| !r.blocked)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    fn persist_chat_mcp(&mut self) -> Result<(), String> {
+        let names = self.mcp_on_names();
+        if let Some(stored) = &mut self.stored
+            && let Some(id) = stored.session_id
+        {
+            stored
+                .store
+                .set_chat_mcp(id, &names)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Starts the servers a saved chat had on (after [`Agent::stop_all_mcp`]); one that does not
+    /// start is reported in [`Agent::take_mcp_notes`].
+    fn start_saved_mcp(&mut self, session_id: i64) {
+        let Some(names) = self
+            .stored
+            .as_ref()
+            .and_then(|s| s.store.chat_mcp(session_id).ok())
+        else {
+            return;
+        };
+        for name in names {
+            if let Err(why) = self.set_mcp(&name, true) {
+                self.mcp_notes.push(format!("[mcp: {why}]"));
+            }
+        }
+    }
+
     /// Starts a new chat: the history is dropped (the old chat stays saved) and the system prompt
     /// is assembled again from the prompts switched on now. The next message starts a new saved chat.
     pub fn new_chat(&mut self) -> Result<PromptInfo, String> {
+        self.stop_all_mcp();
+        self.new_chat_keeping_mcp()
+    }
+
+    /// [`Agent::new_chat`] that leaves the MCP servers on (`/compact`).
+    fn new_chat_keeping_mcp(&mut self) -> Result<PromptInfo, String> {
         let start = self.fresh_start()?;
         self.history = vec![Message::System(start.assembled.text.clone())];
         self.begin_under(&start);
@@ -871,8 +1325,11 @@ impl Agent {
         let before = self.history.len() - 1;
         let earlier = self.current_session();
         let kept = self.chat_prompts.clone();
-        self.new_chat()?;
+        let kept_tools = (self.tools_on.clone(), self.tools_listed.clone());
+        self.new_chat_keeping_mcp()?;
         self.chat_prompts = kept;
+        (self.tools_on, self.tools_listed) = kept_tools;
+        self.refresh_specs();
         self.history
             .push(Message::User(summary_message(earlier, summary)));
         Ok(CompactReport {
@@ -895,6 +1352,7 @@ impl Agent {
         let kit = crate::subagent::Kit {
             coder,
             always: Vec::new(),
+            allow: None,
         };
         let tools = build(&kit, &Cancel::new());
         let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
@@ -986,7 +1444,7 @@ impl Agent {
                 resumed.info.cwd, stored.context.cwd
             ));
         }
-        let report = ResumeReport {
+        let mut report = ResumeReport {
             id: resumed.info.id,
             updated_at: resumed.info.updated_at,
             message_count: resumed.messages.len(),
@@ -994,6 +1452,7 @@ impl Agent {
             dropped_unfinished_turn: resumed.dropped_unfinished_turn,
         };
         self.restore(resumed);
+        report.differences.extend(self.take_mcp_notes());
         Ok(report)
     }
 
@@ -1198,14 +1657,15 @@ impl Agent {
                     return self.keep_cancelled(&tool_calls[index..], rollback, saved);
                 }
                 observer.tool_call(call);
-                let mut output =
-                    if call.name == crate::subagent::DELEGATE && self.subagent_tools.is_some() {
-                        self.delegate(call)
-                    } else if call.name == "task" && self.has_tool("task") {
-                        self.task(call)
-                    } else {
-                        self.run_tool(call)
-                    };
+                let mut output = if let Some(refusal) = self.refuse_off_tool(&call.name) {
+                    refusal
+                } else if call.name == crate::subagent::DELEGATE && self.subagent_tools.is_some() {
+                    self.delegate(call)
+                } else if call.name == "task" && self.has_tool("task") {
+                    self.task(call)
+                } else {
+                    self.run_tool(call)
+                };
                 if self.cancel.is_cancelled() {
                     // The call did run (or was cut short); its output is part of the transcript.
                     self.history.push(Message::Tool {
@@ -1863,13 +2323,20 @@ impl Agent {
             ));
         };
         // A subagent can change files only when the owner has said file changes need no question.
+        // The profile's own tool list (issue 54) says what it may use: one that lists no file tool
+        // is a reader even in auto.
+        let allows_files = profile.tools.as_ref().is_none_or(|list| {
+            list.iter()
+                .any(|n| crate::subagent::FILE_TOOLS.contains(&n.as_str()))
+        });
         let kit = crate::subagent::Kit {
-            coder: self.approval.mode() == Mode::Auto && !self.approval.planning(),
+            coder: self.approval.mode() == Mode::Auto && !self.approval.planning() && allows_files,
             always: self.approval.always_pairs(),
+            allow: profile.tools.clone(),
         };
         let mut start = stored
             .store
-            .start_of_subagent(&profile.name, kit.coder)
+            .start_of_subagent(&profile.name)
             .map_err(|e| format!("error: cannot start the subagent: {e}"))?;
         // The shapes (and whatever else is marked preload) the owner has said, issue 37.
         let (preloaded, context_left_out) = stored
@@ -1922,6 +2389,8 @@ impl Agent {
     /// The id of the chat being saved into; the chat row is made now when the first message has
     /// not been saved yet, so that a subagent started before it has a parent to point at.
     fn ensure_session(&mut self) -> Result<i64, String> {
+        let on = self.mcp_on_names();
+        let tools = self.tools_on.clone();
         let Some(stored) = &mut self.stored else {
             return Err("error: subagents need the saved-chat database".to_owned());
         };
@@ -1948,6 +2417,14 @@ impl Agent {
         stored
             .store
             .set_chat_prompts(id, &self.chat_prompts)
+            .map_err(|e| e.to_string())?;
+        stored
+            .store
+            .set_chat_mcp(id, &on)
+            .map_err(|e| e.to_string())?;
+        stored
+            .store
+            .set_session_tools(id, tools.as_deref())
             .map_err(|e| e.to_string())?;
         Ok(id)
     }
@@ -2023,6 +2500,16 @@ impl Agent {
     }
 
     fn run_tool(&self, call: &ToolCall) -> String {
+        if let Some(off) = self
+            .mcp_running
+            .iter()
+            .find(|r| r.blocked && r.tools.contains(&call.name))
+        {
+            return format!(
+                "error: the MCP server {} is off in this chat; the owner can turn it on with /mcp on {}",
+                off.name, off.name
+            );
+        }
         match self.tools.iter().find(|t| t.spec().name == call.name) {
             Some(tool) => tool.run(&call.arguments),
             None => format!("error: unknown tool '{}'", call.name),
@@ -4375,5 +4862,98 @@ mod tests {
             ["tdd", "review"]
         );
         assert_eq!(agent.personalities().unwrap().len(), 2);
+    }
+
+    fn listed(agent: &Agent) -> Vec<String> {
+        agent.tool_infos().into_iter().map(|t| t.name).collect()
+    }
+
+    #[test]
+    fn a_built_in_tool_off_before_a_reply_leaves_the_request_and_after_a_reply_it_stays_but_is_refused()
+     {
+        let dir = Scratch::new("agent-tools-off");
+        let (mut agent, _) = stored_agent(
+            &dir,
+            vec![
+                ScriptedProvider::text("hello"),
+                ScriptedProvider::tool_call("c1", "read_file", READ_A),
+                ScriptedProvider::text("done"),
+            ],
+        );
+        assert_eq!(listed(&agent), ["read_file"]);
+        let change = agent.set_tool("read_file", false).unwrap();
+        assert!(change.warning.is_none());
+        assert!(listed(&agent).is_empty() && !agent.tool_is_on("read_file"));
+        agent.set_tool("read_file", true).unwrap();
+        assert_eq!(listed(&agent), ["read_file"]);
+        assert!(agent.set_tool("nope", true).is_err());
+
+        agent.send("hi", &mut NoObserver);
+        let change = agent.set_tool("read_file", false).unwrap();
+        assert!(
+            change.message.contains("stays in the request"),
+            "{change:?}"
+        );
+        assert_eq!(listed(&agent), ["read_file"], "the cache stays valid");
+        agent.send("read it", &mut NoObserver);
+        let refused = agent.history().iter().any(|m| {
+            matches!(m, Message::Tool { content, .. } if content.contains("is off in this chat"))
+        });
+        assert!(refused, "{:?}", agent.history());
+        // On again: it was never taken out of the request, so there is nothing to warn about.
+        let change = agent.set_tool("read_file", true).unwrap();
+        assert!(change.warning.is_none(), "{change:?}");
+    }
+
+    #[test]
+    fn a_new_chat_starts_with_its_profiles_tools_and_a_saved_chat_keeps_its_own() {
+        let dir = Scratch::new("agent-tools-profile");
+        let (mut agent, _) = stored_agent(&dir, vec![ScriptedProvider::text("hello")]);
+        agent
+            .store_mut()
+            .unwrap()
+            .set_profile_tools("default", Some(&[]))
+            .unwrap();
+        agent.new_chat().unwrap();
+        assert!(
+            listed(&agent).is_empty(),
+            "a profile with no tools sends none"
+        );
+
+        agent.set_tool("read_file", true).unwrap();
+        agent.send("hi", &mut NoObserver);
+        let id = agent.current_session().unwrap();
+        assert_eq!(
+            peek(&dir).session_tools(id).unwrap(),
+            Some(vec!["read_file".to_owned()])
+        );
+        agent.new_chat().unwrap();
+        assert!(listed(&agent).is_empty());
+        agent.resume(Some(id)).unwrap();
+        assert_eq!(listed(&agent), ["read_file"]);
+        assert_eq!(agent.save_tools_to_profile().unwrap(), "default");
+        assert_eq!(
+            peek(&dir).profile("default").unwrap().tools,
+            Some(vec!["read_file".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_bare_hi_is_a_few_hundred_bytes_with_no_tools_and_no_system_prompt() {
+        let dir = Scratch::new("agent-bare-hi");
+        let (mut agent, requests) = stored_agent(&dir, vec![ScriptedProvider::text("hello")]);
+        {
+            let store = agent.store_mut().unwrap();
+            crate::store_profiles::seed_bare(store.conn(), true).unwrap();
+            store.select_profile("bare").unwrap();
+        }
+        agent.new_chat().unwrap();
+        agent.send("hi", &mut NoObserver);
+        let sent = requests.borrow();
+        let body = String::from_utf8(sent[0].clone()).unwrap();
+        assert!(!body.contains("\"tools\""), "{body}");
+        assert!(!body.contains("\"system\""), "{body}");
+        // About 4 bytes a token: this is the 100 tokens the owner asked for.
+        assert!(sent[0].len() < 400, "{} bytes: {body}", sent[0].len());
     }
 }

@@ -939,7 +939,7 @@ pub fn tools(
             "<p class=\"dim\">None. <code>/mcp add NAME COMMAND</code> in the chat adds one.</p>",
         );
     } else {
-        body.push_str("<p class=\"dim\">Started with the chat; their tools are named <code>mcp__server__tool</code> and appear in <code>/tools</code> once running. A change made with <code>/mcp</code> applies the next time the program starts. Variable values are never shown.</p>");
+        body.push_str("<p class=\"dim\">Off in a new chat; <code>/mcp on NAME</code> starts one in the chat you are in. Their tools are named <code>mcp__server__tool</code> and appear in <code>/tools</code> once on. Rules and settings apply the next time a server is switched on. Variable values are never shown.</p>");
     }
     for (server, rules) in servers {
         let mut facts = vec![

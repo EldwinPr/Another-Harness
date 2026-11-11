@@ -4,7 +4,7 @@
 //! Reading never asks. Every change is asked every time, in both approval modes and without
 //! "always": a server is a program that runs on the owner's computer each time a chat starts.
 //! Plan mode refuses changes. The tool cannot give a server an environment variable (a key stays
-//! with the owner: `/mcp config`). A change applies the next time the program starts, because
+//! with the owner: `/mcp config`). A change applies the next time the server is switched on, because
 //! the tool list is fixed for a chat (decision 10), and the answer says so.
 
 use std::path::PathBuf;
@@ -20,10 +20,10 @@ use crate::mcp_toolsets::{self, Installed, TOOLSETS};
 use crate::store::Store;
 use crate::store_mcp::{ALL_TOOLS, DEFAULT_TIMEOUT_SECS, McpServer, Rule, rule_of};
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","toolsets","tools","add_toolset","add","rule","enable","disable","remove"],"description":"list: the servers and their rules. toolsets: ready-made servers you can add. tools: start a saved server to list its tools and their rules. add_toolset: add a ready-made one by name. add: a server of your own. rule: ask, free or off for one tool, or * for the tools with no rule of their own. enable, disable, remove: a saved server."},"name":{"type":"string","description":"The server (or, for add_toolset, the toolset); lower-case letters, digits and dash, at most 20"},"command":{"type":"string","description":"add: the program to run, one word"},"args":{"type":"array","items":{"type":"string"},"description":"add: its arguments"},"timeout":{"type":"integer","description":"add: seconds one tool call may take, 1 to 600; default 60"},"tool":{"type":"string","description":"rule: the tool's name as the server calls it, or *"},"rule":{"type":"string","enum":["ask","free","off"],"description":"rule: ask = the owner is asked before each call; free = runs without asking; off = the tool is not given to you at all"},"reason":{"type":"string","description":"Why, shown to the owner"}},"required":["action"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","toolsets","tools","add_toolset","add","rule","enable","disable","remove"],"description":"tools: start a saved server and list its tools. add_toolset: add a ready-made one by name. add: a program of your own. rule: ask, free or off for one tool, or * for the rest."},"name":{"type":"string","description":"Server or toolset name: lower-case letters, digits, dash, at most 20"},"command":{"type":"string","description":"add: the program, one word"},"args":{"type":"array","items":{"type":"string"},"description":"add: its arguments"},"timeout":{"type":"integer","description":"add: seconds per call, 1 to 600, default 60"},"tool":{"type":"string","description":"rule: the server's name for the tool, or *"},"rule":{"type":"string","enum":["ask","free","off"],"description":"rule: ask = owner asked each call; free = no asking; off = hidden from you"},"reason":{"type":"string","description":"Why, shown to the owner"}},"required":["action"]}"#;
 
 /// What the answer says after a change.
-const NEXT_START: &str = "It applies the next time the program starts (the tool list of a chat does not change); tell the owner to restart.";
+const NEXT_START: &str = "It applies the next time the server is switched on in a chat (the tool list of a chat does not change); the owner switches it on with /mcp on NAME.";
 /// How much of a line the question shows.
 const SHOWN_CHARS: usize = 120;
 
@@ -65,7 +65,7 @@ pub fn mcp_config_tool(
     Box::new(McpConfig {
         spec: ToolSpec::new(
             "mcp",
-            "Read or change the owner's MCP servers (programs the chat starts to give you more tools, named mcp__server__tool). Use it when the owner asks to set one up: toolsets lists ready-made ones, add_toolset adds one with sensible rules, add saves another program. Every change asks the owner first and applies the next time the program starts. You cannot set environment variables or keys; the owner does that with /mcp config.",
+            "Read or change the owner's MCP servers, which give you more tools (mcp__server__tool) once the owner switches one on with /mcp on NAME. Use it when the owner asks to set one up: toolsets lists ready-made ones, add_toolset adds one, add saves another program. Every change asks the owner first. You cannot set variables or keys.",
             SCHEMA,
         )
         .expect("the schema constant is valid JSON"),
@@ -488,7 +488,7 @@ mod tests {
             r#"{"action":"add","name":"docs","command":"prog","args":["serve"],"reason":"to read crate docs"}"#,
         );
         assert!(out.starts_with("added docs"), "{out}");
-        assert!(out.contains("next time the program starts"), "{out}");
+        assert!(out.contains("switched on in a chat"), "{out}");
         let asked = yes.asked.borrow();
         assert_eq!(asked.len(), 1);
         assert_eq!(asked[0].1, "prog serve");

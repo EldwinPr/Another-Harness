@@ -90,10 +90,7 @@ fn a_delegation_returns_at_once_and_only_the_answer_comes_back_at_the_next_messa
     let child = json(&h.child_seen.borrow()[0]);
     let system = child["messages"][0]["content"].as_str().unwrap();
     assert!(system.starts_with("You are a subagent."), "{system}");
-    assert!(
-        system.contains("Your job is to plan, not to build."),
-        "{system}"
-    );
+    assert!(system.contains("Plan, do not build."), "{system}");
     assert!(!system.contains("glossary_propose"), "{system}");
     assert!(!system.contains("You are a coding assistant"), "{system}");
     let messages = child["messages"].as_array().unwrap();
@@ -346,15 +343,17 @@ fn in_auto_mode_a_subagent_is_a_coder_and_changes_files_in_manual_mode_it_is_a_r
     assert!(back.contains("(reader)"), "{back}");
     let reader = json(&h.child_seen.borrow()[0]);
     let system = reader["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("you can only look"), "{system}");
+    assert!(
+        system.contains("Without file tools you are a reader"),
+        "{system}"
+    );
     assert!(!dir.path().join("made.txt").exists());
 
     agent.set_approval_mode(Mode::Auto).unwrap();
     let back = run_to_the_end(&mut agent, &h, "builder implement the plan", 2);
     let coder = json(&h.child_seen.borrow()[1]);
     let system = coder["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("you may change files"), "{system}");
-    assert!(system.contains("Your job is to build"), "{system}");
+    assert!(system.contains("Build what the plan"), "{system}");
     assert_eq!(
         std::fs::read_to_string(dir.path().join("made.txt")).unwrap(),
         "built"

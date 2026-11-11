@@ -373,7 +373,7 @@ impl ShellTasks {
 
 // ---- the `task` tool ----
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","output","stop"]},"id":{"type":["string","integer"],"description":"The id shown by list: s1 for a command, a1 for a subagent. For output and stop"},"wait":{"type":"integer","description":"Seconds to wait for the task to finish before reading its output. Default 0, at most 300"}},"required":["action"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","output","stop"]},"id":{"type":["string","integer"],"description":"Id from list (s1, a1). For output and stop"},"wait":{"type":"integer","description":"Seconds to wait before reading its output. Default 0, at most 300"}},"required":["action"]}"#;
 
 /// The longest `task output` waits for a task to finish.
 const MAX_WAIT: Duration = Duration::from_secs(300);
@@ -451,7 +451,7 @@ impl TaskTool {
         Self {
             spec: ToolSpec::new(
                 "task",
-                "Background work: commands started with bash and background true (ids s1, s2) and subagents started with delegate (ids a1, a2). list shows them, output reads the latest output of a command or the progress and answer of a subagent, stop ends one.",
+                "Background work: commands from bash with background true (ids s1, s2) and subagents from delegate (ids a1, a2). list shows them, output reads a command's latest output or a subagent's progress and answer, stop ends one.",
                 SCHEMA,
             )
             .expect("the schema constant is valid JSON"),

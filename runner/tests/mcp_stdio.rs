@@ -290,36 +290,59 @@ fn a_stopped_server_is_started_again_in_place_and_answers_again() {
     assert_ne!(new_server, server);
 }
 
-#[test]
-fn the_menu_command_restarts_a_server_of_this_chat() {
-    use runner::agent::{Agent, ScriptedProvider, StoreContext};
-    use runner::repl::Terminal;
+/// A chat over a temporary database holding one server, "fake", that is not on yet.
+fn chat_with_fake(
+    name: &str,
+    replies: Vec<Result<runner::provider::Reply, Box<runner::provider::ProviderError>>>,
+) -> (runner::agent::Agent, std::path::PathBuf) {
+    use runner::agent::{Agent, McpLaunch, McpLauncher, ScriptedProvider, StoreContext};
     use runner::store::Store;
-    use runner::style::Style;
+    use runner::tools::{Answer, Approver, Ask, Mode, mcp_tools, shared_mode};
     use runner::turn_log::TurnLog;
 
+    struct Yes;
+    impl Approver for Yes {
+        fn approve(&self, _ask: &Ask) -> Answer {
+            Answer::Yes
+        }
+    }
     let dir = std::env::temp_dir().join(format!(
-        "another-harness-test-mcp-restart-{}",
+        "another-harness-test-mcp-{name}-{}",
         std::process::id()
     ));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("harness.db");
-    {
-        let mut store = Store::open(&db).unwrap();
-        store
-            .add_mcp_server("fake", env!("CARGO_BIN_EXE_mcp_fake"), &[], &[], 10)
-            .unwrap();
-    }
-    let store = Store::open(&db).unwrap();
-    let started = runner::mcp::McpServers::start_all(&store, &dir, &Cancel::new());
-    assert_eq!(started.names(), ["fake"]);
-    let term =
-        Terminal::shared_styled(std::io::Cursor::new(Vec::new()), Vec::new(), Style::plain());
-    term.borrow_mut().set_mcp(started.clients());
+    let mut store = Store::open(&dir.join("harness.db")).unwrap();
+    store
+        .add_mcp_server("fake", env!("CARGO_BIN_EXE_mcp_fake"), &[], &[], 10)
+        .unwrap();
+    let approval = shared_mode(Mode::Manual);
+    let approver: std::rc::Rc<dyn Approver> = std::rc::Rc::new(Yes);
+    let cwd = dir.clone();
+    let launcher: McpLauncher = std::rc::Rc::new(move |server, rules| {
+        let (client, defs) = McpClient::start(server, &cwd, Cancel::new())?;
+        let started = runner::mcp::Started {
+            server: server.clone(),
+            rules: rules.to_vec(),
+            client: std::rc::Rc::clone(&client),
+            tools: defs,
+        };
+        let (count, tokens) = started.on_cost();
+        let servers = runner::mcp::McpServers {
+            started: vec![started],
+            notes: Vec::new(),
+        };
+        Ok(McpLaunch {
+            tools: mcp_tools(&servers, &approval, &approver),
+            client,
+            count,
+            tokens,
+        })
+    });
     let log = TurnLog::create(&dir.join("logs")).unwrap();
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         "m",
-        Box::new(ScriptedProvider::new(vec![])),
+        Box::new(ScriptedProvider::new(replies)),
         Vec::new(),
         log,
     )
@@ -329,13 +352,138 @@ fn the_menu_command_restarts_a_server_of_this_chat() {
         StoreContext {
             cwd: dir.display().to_string(),
         },
+    )
+    .with_mcp_launcher(launcher);
+    (agent, dir)
+}
+
+fn tool_names(agent: &runner::agent::Agent) -> Vec<String> {
+    agent.tool_infos().into_iter().map(|t| t.name).collect()
+}
+
+#[test]
+fn a_new_chat_has_no_mcp_tools_and_on_adds_them_and_off_before_a_reply_removes_them() {
+    let (mut agent, dir) = chat_with_fake("on-off", vec![]);
+    assert!(tool_names(&agent).is_empty());
+    assert!(!agent.mcp_is_on("fake"));
+
+    let change = agent.set_mcp("fake", true).unwrap();
+    assert!(
+        change.message.contains("fake is on in this chat"),
+        "{change:?}"
     );
+    assert!(change.warning.is_none(), "no replies yet: nothing cached");
+    assert!(agent.mcp_is_on("fake"));
+    assert!(tool_names(&agent).contains(&"mcp__fake__echo".to_owned()));
+
+    let change = agent.set_mcp("fake", false).unwrap();
+    assert!(change.message.contains("stopped"), "{change:?}");
+    assert!(!agent.mcp_is_on("fake"));
+    assert!(tool_names(&agent).is_empty());
+    assert!(agent.set_mcp("ghost", true).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_disabled_server_cannot_be_switched_on() {
+    let (mut agent, dir) = chat_with_fake("disabled", vec![]);
+    agent
+        .store_mut()
+        .unwrap()
+        .set_mcp_enabled("fake", false)
+        .unwrap();
+    let why = agent.set_mcp("fake", true).unwrap_err();
+    assert!(why.contains("/mcp enable fake"), "{why}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn off_after_a_reply_keeps_the_tools_listed_and_refuses_the_calls_and_on_warns() {
+    use runner::agent::{NoObserver, Outcome, ScriptedProvider};
+    let (mut agent, dir) = chat_with_fake(
+        "after-reply",
+        vec![
+            ScriptedProvider::text("hello"),
+            ScriptedProvider::tool_call("c1", "mcp__fake__echo", r#"{"text":"x"}"#),
+            ScriptedProvider::text("done"),
+        ],
+    );
+    assert!(matches!(
+        agent.send("hi", &mut NoObserver),
+        Outcome::Answer(_)
+    ));
+    assert!(agent.has_replies());
+    // On after a reply changes the request: it warns.
+    let change = agent.set_mcp("fake", true).unwrap();
+    assert!(change.warning.is_some(), "{change:?}");
+    let listed = tool_names(&agent);
+
+    // Off after a reply: the list is unchanged (the cache stays valid) but calls are refused.
+    let change = agent.set_mcp("fake", false).unwrap();
+    assert!(
+        change.message.contains("calls to them are refused"),
+        "{change:?}"
+    );
+    assert!(change.warning.is_none());
+    assert!(!agent.mcp_is_on("fake"));
+    assert_eq!(tool_names(&agent), listed);
+    assert!(matches!(
+        agent.send("use the tool", &mut NoObserver),
+        Outcome::Answer(_)
+    ));
+    let refused = agent.history().iter().any(|m| {
+        matches!(m, kernel::Message::Tool { content, .. } if content.contains("is off in this chat"))
+    });
+    assert!(refused, "{:?}", agent.history());
+
+    // On again just lifts the block: no new process, no warning.
+    let change = agent.set_mcp("fake", true).unwrap();
+    assert!(change.warning.is_none(), "{change:?}");
+    assert!(agent.mcp_is_on("fake"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_chat_stops_the_servers_and_a_resume_starts_the_ones_the_chat_had() {
+    use runner::agent::{NoObserver, ScriptedProvider};
+    let (mut agent, dir) = chat_with_fake("resume", vec![ScriptedProvider::text("hello")]);
+    agent.set_mcp("fake", true).unwrap();
+    agent.send("hi", &mut NoObserver);
+    let id = agent.current_session().expect("the chat was saved");
+
+    agent.new_chat().unwrap();
+    assert!(!agent.mcp_is_on("fake"));
+    assert!(tool_names(&agent).is_empty());
+
+    agent.resume(Some(id)).unwrap();
+    assert!(agent.mcp_is_on("fake"));
+    assert!(tool_names(&agent).contains(&"mcp__fake__echo".to_owned()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_mcp_command_switches_servers_and_lists_their_state() {
+    use runner::repl::Terminal;
+    use runner::style::Style;
+
+    let (mut agent, dir) = chat_with_fake("command", vec![]);
+    let term =
+        Terminal::shared_styled(std::io::Cursor::new(Vec::new()), Vec::new(), Style::plain());
+    runner::mcp_ui::command(&mut agent, &term, "list");
+    runner::mcp_ui::command(&mut agent, &term, "restart fake");
+    runner::mcp_ui::command(&mut agent, &term, "on fake");
     runner::mcp_ui::command(&mut agent, &term, "restart fake");
     runner::mcp_ui::command(&mut agent, &term, "restart ghost");
     runner::mcp_ui::command(&mut agent, &term, "list");
+    runner::mcp_ui::command(&mut agent, &term, "off fake");
     let screen = String::from_utf8(term.borrow().output().clone()).unwrap();
-    drop(started);
     let _ = std::fs::remove_dir_all(&dir);
+    assert!(screen.contains("[ ] fake"), "{screen}");
+    assert!(
+        screen.contains("fake is not running in this chat"),
+        "{screen}"
+    );
+    assert!(screen.contains("fake is on in this chat"), "{screen}");
     assert!(
         screen.contains("fake is running again (5 tools)"),
         "{screen}"
@@ -344,5 +492,9 @@ fn the_menu_command_restarts_a_server_of_this_chat() {
         screen.contains("ghost is not running in this chat"),
         "{screen}"
     );
-    assert!(screen.contains("running in this chat"), "{screen}");
+    assert!(screen.contains("[x] fake"), "{screen}");
+    assert!(
+        screen.contains("fake is off in this chat and stopped"),
+        "{screen}"
+    );
 }

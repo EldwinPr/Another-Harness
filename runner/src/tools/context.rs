@@ -19,7 +19,7 @@ use crate::store::Store;
 use crate::store_context::{KINDS, Saved, check_kind, check_name, check_quote, check_text};
 
 const READ_SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"The name of the entry"}},"required":["name"]}"#;
-const PROPOSE_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["rule","decision","shape","guide"],"description":"rule: how to work here. decision: a choice and why. shape: how an area is thought of and which way the owner leans. guide: a longer how-to."},"name":{"type":"string","description":"A short name: letters, digits, . - _"},"text":{"type":"string","description":"What to remember, in a few sentences"},"quote":{"type":"string","description":"The owner's own words that this comes from, copied as said"},"area":{"type":"string","description":"The business area, for a shape (optional)"}},"required":["kind","name","text","quote"]}"#;
+const PROPOSE_SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["rule","decision","shape","guide"],"description":"rule: how to work here. decision: a choice and why. shape: how an area is thought of. guide: a longer how-to."},"name":{"type":"string","description":"Short name: letters, digits, . - _"},"text":{"type":"string","description":"What to remember, briefly"},"quote":{"type":"string","description":"The owner's words, copied as said"},"area":{"type":"string","description":"Business area, for a shape"}},"required":["kind","name","text","quote"]}"#;
 
 /// How much of a text the one-line question shows.
 const SHOWN_CHARS: usize = 70;
@@ -70,7 +70,7 @@ pub fn dynamic_context_read_tool(
     db: impl Into<PathBuf>,
     project: impl Into<String>,
 ) -> Box<dyn Tool> {
-    let description = "Get what the owner has said about this project: rules, decisions and how its areas are thought of. Give the name of one entry with the `name` argument; the text comes back as stored, including the owner's own words (quote). To see the entry names, call it with an empty name: the error lists them, and a name typed with the wrong case is accepted. Entries saved during this chat are found the same way.";
+    let description = "Get what the owner has said about this project: rules, decisions, how areas are thought of. Give an entry's name with the `name` argument; the text comes back as stored, with the owner's words (quote). An empty name lists the entry names.";
     Box::new(Read::new(db.into(), project.into(), description))
 }
 
@@ -192,7 +192,7 @@ impl Propose {
         Self {
             spec: ToolSpec::new(
                 "context_propose",
-                "Propose to remember something the owner just said about this project: a rule, a decision, or how an area is thought of. Copy their words into quote; without their words nothing is proposed. The owner is asked to confirm; nothing is saved without a yes.",
+                "Propose remembering something the owner just said about this project. Copy their words into quote; without them nothing is proposed. The owner confirms; nothing is saved without a yes.",
                 PROPOSE_SCHEMA,
             )
             .expect("the schema constant is valid JSON"),

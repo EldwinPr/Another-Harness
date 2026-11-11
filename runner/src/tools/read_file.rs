@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::{Tool, truncate};
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path of the file to read, relative to the working directory"},"start":{"type":"integer","description":"The first line to read, counting from 1. Default 1"},"lines":{"type":"integer","description":"How many lines to read from start. Default: all of them, cut to a fixed size"}},"required":["path"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"start":{"type":"integer","description":"First line, from 1. Default 1"},"lines":{"type":"integer","description":"Lines to read from start. Default: all, cut to a fixed size"}},"required":["path"]}"#;
 
 // Rust note: `Deserialize` is the reverse of `Serialize`: it lets serde build
 // this struct from JSON text. Only `path` is required; `start` and `lines` are

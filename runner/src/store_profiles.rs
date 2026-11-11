@@ -15,8 +15,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::store::{Edit, Store, StoreError, now_secs};
 use crate::store_prompts::{
-    Assembled, BASE_NAME, ChatPrompts, PromptType, SUBAGENT_CODER_NAME, SUBAGENT_CODER_PROMPT,
-    SUBAGENT_NAME, SUBAGENT_PROMPT, assemble,
+    Assembled, BASE_NAME, ChatPrompts, PromptType, SUBAGENT_NAME, SUBAGENT_PROMPT, assemble,
 };
 
 /// The `settings` key holding the name of the profile new chats start under.
@@ -43,6 +42,25 @@ pub struct Profile {
     pub prompts: Vec<String>,
     /// The skills that are on when a chat starts, in the library's order.
     pub skills: Vec<String>,
+    /// The built-in tools a chat is given when it starts (issue 54); `None` is every one.
+    pub tools: Option<Vec<String>>,
+}
+
+/// `*` (every tool) or a JSON list of tool names, as `profiles.tools` and `sessions.tools` keep
+/// them. Text that is neither is read as no tool: nothing is sent that the owner did not choose.
+pub fn parse_tools(text: &str) -> Option<Vec<String>> {
+    if text.trim() == "*" {
+        return None;
+    }
+    Some(serde_json::from_str(text).unwrap_or_default())
+}
+
+/// The other way: what is written to the column.
+pub fn tools_text(tools: Option<&[String]>) -> String {
+    match tools {
+        None => "*".to_owned(),
+        Some(list) => serde_json::to_string(list).unwrap_or_else(|_| "[]".to_owned()),
+    }
 }
 
 impl Profile {
@@ -52,12 +70,14 @@ impl Profile {
         let personality = self.personality.as_deref().unwrap_or("");
         let prompts = self.prompts.join("\n");
         let skills = self.skills.join("\n");
+        let tools = tools_text(self.tools.as_deref());
         crate::store::fingerprint(&[
             &self.name,
             &self.description,
             personality,
             &prompts,
             &skills,
+            &tools,
         ])
     }
 }
@@ -70,6 +90,8 @@ pub struct Start {
     pub profile: String,
     /// The skills that are on and the personality chosen.
     pub chat: ChatPrompts,
+    /// The built-in tools the chat is given (issue 54); `None` is every one.
+    pub tools: Option<Vec<String>>,
 }
 
 /// A profile that is created with the program, with the one prompt that makes it what it is. The
@@ -79,20 +101,35 @@ struct Seed {
     profile: &'static str,
     description: &'static str,
     text: &'static str,
+    /// The built-in tools a chat under the profile starts with, as `profiles.tools` keeps them.
+    tools: &'static str,
 }
+
+/// What the two seeded prompts said until schema 31; an unedited copy is replaced by the shorter text.
+pub(crate) const PLANNER_TEXT_V12: &str = "Your job is to plan, not to build. Read what you need, then write a plan: the goal, the files to change, the steps in order, and how each will be checked. Do not create or change files except the plan the user asks for. Say what you are unsure about.";
+pub(crate) const BUILDER_TEXT_V12: &str = "Your job is to build what the plan or the user's request says, in small steps. After each change run the project's own test command. If the request and the code disagree, stop and say how. Do not add anything that was not asked for.";
+pub(crate) const PLANNER_TEXT: &str = "Plan, do not build. Read what you need, then write the plan to a note: the goal, the files to change, the steps in order, how each is checked, and what you are unsure about. Change no other file.";
+pub(crate) const BUILDER_TEXT: &str = "Build what the plan or the request says, in small steps, running the project's tests after each change. If the request and the code disagree, stop and say how. Add nothing that was not asked for.";
+/// The tools of the `planner` profile: it looks and writes a note. A subagent under it has these.
+pub(crate) const PLANNER_TOOLS: &str =
+    r#"["read_file","grep","find","bash","glossary","context","write_note"]"#;
+/// The tools of the `builder` profile: the planner's, and the file tools.
+pub(crate) const BUILDER_TOOLS: &str = r#"["read_file","grep","find","create_file","write_file","edit_file","delete_file","bash","glossary","context","write_note"]"#;
 
 const SEEDS: [Seed; 2] = [
     Seed {
         prompt: "planner",
         profile: "planner",
         description: "plan the work, do not build it",
-        text: "Your job is to plan, not to build. Read what you need, then write a plan: the goal, the files to change, the steps in order, and how each will be checked. Do not create or change files except the plan the user asks for. Say what you are unsure about.",
+        text: PLANNER_TEXT,
+        tools: PLANNER_TOOLS,
     },
     Seed {
         prompt: "builder",
         profile: "builder",
         description: "build what was asked, in small steps",
-        text: "Your job is to build what the plan or the user's request says, in small steps. After each change run the project's own test command. If the request and the code disagree, stop and say how. Do not add anything that was not asked for.",
+        text: BUILDER_TEXT,
+        tools: BUILDER_TOOLS,
     },
 ];
 
@@ -166,6 +203,11 @@ pub(crate) fn seed(conn: &Connection, examples: bool) -> Result<(), StoreError> 
             "INSERT INTO profiles (name, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
             params![seed.profile, seed.description, now],
         )?;
+        // Schema 30 added the column; a seed on a database older than that gets its tools there.
+        let _ = conn.execute(
+            "UPDATE profiles SET tools = ?2 WHERE name = ?1",
+            params![seed.profile, seed.tools],
+        );
         let profile_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO profile_prompts (profile_id, prompt_id) \
@@ -177,6 +219,33 @@ pub(crate) fn seed(conn: &Connection, examples: bool) -> Result<(), StoreError> 
     conn.execute(
         "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
         params![SELECTED_KEY, DEFAULT_NAME, now],
+    )?;
+    Ok(())
+}
+
+/// The profile that starts a chat with nothing but the owner's message (issue 54): no system
+/// prompt and no tool. Created once, unless a profile of that name exists.
+const BARE_NAME: &str = "bare";
+const BARE_DESCRIPTION: &str = "no system prompt and no tools";
+
+/// The migration to schema 30 seeds `bare`. `add` is `!cfg!(test)`, as for the other seeds.
+pub(crate) fn seed_bare(conn: &Connection, add: bool) -> Result<(), StoreError> {
+    if !add {
+        return Ok(());
+    }
+    let taken: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM profiles WHERE name = ?1",
+        [BARE_NAME],
+        |row| row.get(0),
+    )?;
+    if taken > 0 {
+        return Ok(());
+    }
+    let now = now_secs();
+    conn.execute(
+        "INSERT INTO profiles (name, description, tools, created_at, updated_at) \
+         VALUES (?1, ?2, '[]', ?3, ?3)",
+        params![BARE_NAME, BARE_DESCRIPTION, now],
     )?;
     Ok(())
 }
@@ -212,15 +281,26 @@ impl Store {
     /// What a chat started now would get: the system prompt of the selected profile (the built-in
     /// text when it has none), the skills that are on and the personality.
     pub fn start_of_selected_profile(&self) -> Result<Start, StoreError> {
-        let assembled = assemble(&self.list_prompts()?);
+        let mut assembled = assemble(&self.list_prompts()?);
         let name = self.selected_profile()?;
         let profile = self
             .list_profiles()?
             .into_iter()
             .find(|p| p.name.eq_ignore_ascii_case(&name));
+        // A profile the owner made with no system prompt at all gets none: the built-in text is
+        // only for a database that has no profile to say otherwise (issue 54).
+        if assembled.fallback && profile.as_ref().is_some_and(|p| p.prompts.is_empty()) {
+            assembled = Assembled {
+                text: String::new(),
+                names: Vec::new(),
+                fallback: false,
+            };
+        }
+        let tools = profile.as_ref().and_then(|p| p.tools.clone());
         Ok(Start {
             assembled,
             profile: profile.as_ref().map_or(name, |p| p.name.clone()),
+            tools,
             chat: profile
                 .map(|p| ChatPrompts {
                     personality: p.personality,
@@ -232,16 +312,11 @@ impl Store {
     }
 
     /// What a subagent running under profile `name` starts with (issue 33): the `subagent` prompt
-    /// (`subagent-coder` for one that may change files, issue 34; the built-in text when there is
-    /// none by that name) in place of the profile's `base`, then the profile's other system
+    /// (the built-in text when there is none by that name) in place of the profile's `base`, then the profile's other system
     /// prompts in the library's order; the profile's skills and personality. The profile's own
     /// start is not changed.
-    pub fn start_of_subagent(&self, name: &str, coder: bool) -> Result<Start, StoreError> {
-        let (first_name, built_in) = if coder {
-            (SUBAGENT_CODER_NAME, SUBAGENT_CODER_PROMPT)
-        } else {
-            (SUBAGENT_NAME, SUBAGENT_PROMPT)
-        };
+    pub fn start_of_subagent(&self, name: &str) -> Result<Start, StoreError> {
+        let (first_name, built_in) = (SUBAGENT_NAME, SUBAGENT_PROMPT);
         let profile = self.profile(name)?;
         let prompts = self.list_prompts()?;
         let first = prompts
@@ -254,7 +329,6 @@ impl Store {
             if p.prompt_type == PromptType::System
                 && p.name != BASE_NAME
                 && p.name != SUBAGENT_NAME
-                && p.name != SUBAGENT_CODER_NAME
                 && profile.prompts.contains(&p.name)
             {
                 parts.push(p.text.trim().to_owned());
@@ -273,6 +347,7 @@ impl Store {
                 on: profile.skills,
                 once: Vec::new(),
             },
+            tools: profile.tools,
         })
     }
 
@@ -303,8 +378,8 @@ impl Store {
         taken(&tx, new)?;
         let now = now_secs();
         tx.execute(
-            "INSERT INTO profiles (name, description, personality_id, created_at, updated_at) \
-             SELECT ?2, description, personality_id, ?3, ?3 FROM profiles WHERE id = ?1",
+            "INSERT INTO profiles (name, description, personality_id, tools, created_at, updated_at) \
+             SELECT ?2, description, personality_id, tools, ?3, ?3 FROM profiles WHERE id = ?1",
             params![source.id, new, now],
         )?;
         let id = tx.last_insert_rowid();
@@ -388,6 +463,20 @@ impl Store {
         prompts: &[String],
     ) -> Result<(), StoreError> {
         self.set_members(name, "profile_prompts", PromptType::System, prompts)
+    }
+
+    /// Sets the built-in tools a profile starts a chat with (issue 54); `None` is every one.
+    pub fn set_profile_tools(
+        &mut self,
+        name: &str,
+        tools: Option<&[String]>,
+    ) -> Result<(), StoreError> {
+        let profile = self.profile(name)?;
+        self.conn.execute(
+            "UPDATE profiles SET tools = ?2, updated_at = ?3 WHERE id = ?1",
+            params![profile.id, tools_text(tools), now_secs()],
+        )?;
+        Ok(())
     }
 
     /// Sets the skills a profile turns on (names of skills).
@@ -615,7 +704,7 @@ fn profiles_on(conn: &Connection) -> Result<Vec<Profile>, StoreError> {
     };
     let mut statement = conn.prepare(
         "SELECT p.id, p.name, p.description, \
-                (SELECT q.name FROM prompts q WHERE q.id = p.personality_id) \
+                (SELECT q.name FROM prompts q WHERE q.id = p.personality_id), p.tools \
          FROM profiles p ORDER BY p.name COLLATE NOCASE",
     )?;
     let rows = statement.query_map([], |row| {
@@ -624,11 +713,12 @@ fn profiles_on(conn: &Connection) -> Result<Vec<Profile>, StoreError> {
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
     let heads = rows.collect::<Result<Vec<_>, _>>()?;
     let mut out = Vec::with_capacity(heads.len());
-    for (id, name, description, personality) in heads {
+    for (id, name, description, personality, tools) in heads {
         out.push(Profile {
             id,
             name,
@@ -644,6 +734,7 @@ fn profiles_on(conn: &Connection) -> Result<Vec<Profile>, StoreError> {
                  WHERE m.profile_id = ?1 ORDER BY q.position, q.id",
                 id,
             )?,
+            tools: parse_tools(&tools),
         });
     }
     Ok(out)
@@ -927,8 +1018,8 @@ mod tests {
         store.set_prompt_enabled("base", false).unwrap();
         let start = store.start_of_selected_profile().unwrap();
         assert!(
-            start.assembled.fallback,
-            "nothing in the profile: the built-in text"
+            !start.assembled.fallback && start.assembled.text.is_empty(),
+            "nothing in the profile: nothing is sent"
         );
         assert_eq!(store.profile("default").unwrap().prompts, ["base", "extra"]);
     }
@@ -966,7 +1057,7 @@ mod tests {
         assert_eq!(start.chat.personality.as_deref(), Some("pirate"));
         assert!(start.chat.once.is_empty());
         assert!(
-            start.assembled.fallback,
+            !start.assembled.fallback && start.assembled.text.is_empty(),
             "the profile holds no system prompt"
         );
         store.set_profile_personality("work", None).unwrap();
@@ -1133,15 +1224,12 @@ mod tests {
             )
             .unwrap();
 
-        let start = store.start_of_subagent("Planner", false).unwrap();
+        let start = store.start_of_subagent("Planner").unwrap();
         assert_eq!(start.profile, "planner");
         assert_eq!(start.assembled.names, ["subagent", "planner"]);
         let text = &start.assembled.text;
         assert!(text.starts_with("You are a subagent."), "{text}");
-        assert!(
-            text.contains("Your job is to plan, not to build."),
-            "{text}"
-        );
+        assert!(text.contains("Plan, do not build."), "{text}");
         assert!(!text.contains("You are a coding assistant"), "{text}");
         assert_eq!(start.chat.on, ["tdd"]);
         assert_eq!(start.chat.personality.as_deref(), Some("terse"));
@@ -1149,9 +1237,9 @@ mod tests {
         let main = store.profile("planner").unwrap();
         assert_eq!(main.prompts, ["base", "planner"]);
         // A profile of `base` alone gives the subagent prompt alone.
-        let only = store.start_of_subagent("default", false).unwrap();
+        let only = store.start_of_subagent("default").unwrap();
         assert_eq!(only.assembled.names, ["subagent"]);
-        assert!(store.start_of_subagent("nope", false).is_err());
+        assert!(store.start_of_subagent("nope").is_err());
     }
 
     #[test]
@@ -1160,7 +1248,7 @@ mod tests {
         let mut store = open(&dir);
         // Nothing is seeded in tests, so the built-in text stands in.
         assert!(store.prompt("subagent").is_err());
-        let start = store.start_of_subagent("default", false).unwrap();
+        let start = store.start_of_subagent("default").unwrap();
         assert_eq!(start.assembled.text, crate::store_prompts::SUBAGENT_PROMPT);
         // Seeding adds it once, switched off and in no profile; a copy the owner has is kept.
         crate::store_prompts::seed_subagent(store.conn(), true).unwrap();
@@ -1186,26 +1274,20 @@ mod tests {
         crate::store_prompts::seed_subagent(store.conn(), true).unwrap();
         assert_eq!(store.prompt("subagent").unwrap().text, "Look only.");
         assert_eq!(
-            store
-                .start_of_subagent("default", false)
-                .unwrap()
-                .assembled
-                .text,
+            store.start_of_subagent("default").unwrap().assembled.text,
             "Look only."
         );
     }
 
     #[test]
-    fn a_coder_subagent_starts_with_the_coder_prompt_and_both_are_seeded_once() {
+    fn a_builder_subagent_is_the_subagent_prompt_then_the_builder_profile_and_it_is_seeded_once() {
         let dir = Scratch::new("profiles-coder");
         let mut store = open(&dir);
         seed(store.conn(), true).unwrap();
         crate::store_prompts::seed_subagent(store.conn(), true).unwrap();
         crate::store_prompts::seed_subagent(store.conn(), true).unwrap();
-        for name in ["subagent", "subagent-coder"] {
-            let p = store.prompt(name).unwrap();
-            assert!(!p.enabled, "{name}");
-        }
+        assert!(!store.prompt("subagent").unwrap().enabled);
+        assert!(store.prompt("subagent-coder").is_err(), "no coder prompt");
         assert_eq!(
             store
                 .list_prompts()
@@ -1213,35 +1295,30 @@ mod tests {
                 .iter()
                 .filter(|p| p.name.starts_with("subagent"))
                 .count(),
-            2
+            1
         );
-        let start = store.start_of_subagent("builder", true).unwrap();
-        assert_eq!(start.assembled.names, ["subagent-coder", "builder"]);
+        let start = store.start_of_subagent("builder").unwrap();
+        assert_eq!(start.assembled.names, ["subagent", "builder"]);
         assert!(start.assembled.text.starts_with("You are a subagent."));
-        assert!(start.assembled.text.contains("you may change files"));
-        assert!(start.assembled.text.contains("Your job is to build"));
-        // A reader of the same profile gets the other prompt.
-        let reader = store.start_of_subagent("builder", false).unwrap();
-        assert_eq!(reader.assembled.names, ["subagent", "builder"]);
-        assert!(reader.assembled.text.contains("you can only look"));
+        assert!(start.assembled.text.contains("Build what the plan"));
+        // What it may touch is the profile's tool list, not a second prompt.
+        assert!(
+            start
+                .tools
+                .as_ref()
+                .unwrap()
+                .contains(&"edit_file".to_owned())
+        );
+        let planner = store.start_of_subagent("planner").unwrap();
+        assert!(!planner.tools.unwrap().contains(&"edit_file".to_owned()));
         // The owner's own copy is kept.
-        let coder = store.prompt("subagent-coder").unwrap();
+        let mine = store.prompt("subagent").unwrap();
         store
-            .edit_prompt(
-                coder.id,
-                &coder.fingerprint(),
-                "subagent-coder",
-                "mine",
-                "Code it.",
-            )
+            .edit_prompt(mine.id, &mine.fingerprint(), "subagent", "mine", "Code it.")
             .unwrap();
         crate::store_prompts::seed_subagent(store.conn(), true).unwrap();
         assert_eq!(
-            store
-                .start_of_subagent("default", true)
-                .unwrap()
-                .assembled
-                .text,
+            store.start_of_subagent("default").unwrap().assembled.text,
             "Code it."
         );
     }
@@ -1312,5 +1389,83 @@ mod tests {
                 .assembled
                 .fallback
         );
+    }
+
+    #[test]
+    fn bare_is_seeded_once_with_no_tools_and_no_prompt_and_a_profile_keeps_its_tools() {
+        let dir = Scratch::new("profiles-bare");
+        let mut store = open(&dir);
+        seed_bare(store.conn(), true).unwrap();
+        seed_bare(store.conn(), true).unwrap();
+        let bare = store.profile("bare").unwrap();
+        assert_eq!(bare.tools, Some(Vec::new()));
+        assert!(bare.prompts.is_empty());
+        assert!(store.prompt("bare").is_err(), "bare owns no prompt");
+        store.select_profile("bare").unwrap();
+        let start = store.start_of_selected_profile().unwrap();
+        assert!(start.assembled.text.is_empty() && !start.assembled.fallback);
+        assert_eq!(
+            store.profile("default").unwrap().tools,
+            None,
+            "default has every tool"
+        );
+
+        store.select_profile("bare").unwrap();
+        assert_eq!(
+            store.start_of_selected_profile().unwrap().tools,
+            Some(Vec::new())
+        );
+        store
+            .set_profile_tools("bare", Some(&["bash".to_owned()]))
+            .unwrap();
+        store.copy_profile("bare", "bare2").unwrap();
+        assert_eq!(
+            store.profile("bare2").unwrap().tools,
+            Some(vec!["bash".to_owned()])
+        );
+        assert_eq!(parse_tools("*"), None);
+        assert_eq!(
+            parse_tools("garbage"),
+            Some(Vec::new()),
+            "nothing is sent that was not chosen"
+        );
+    }
+
+    #[test]
+    fn schema_31_drops_the_coder_prompt_and_the_bare_prompt_and_sets_the_tools_of_unedited_profiles()
+     {
+        let dir = Scratch::new("profiles-v31");
+        let path = dir.path().join("harness.db");
+        {
+            let mut store = Store::open(&path).unwrap();
+            seed(store.conn(), true).unwrap();
+            store
+                .add_prompt("subagent-coder", "", "Old coder.", None)
+                .unwrap();
+            store
+                .add_prompt("bare", "", "You are a helpful assistant.", None)
+                .unwrap();
+            store.add_profile("bare", "").ok();
+            store
+                .set_profile_prompts("bare", &["bare".to_owned()])
+                .unwrap();
+            store.set_profile_tools("builder", None).unwrap();
+            // The owner edited planner's text: its tools are still the whole set, but it stays.
+            let planner = store.prompt("planner").unwrap();
+            store
+                .edit_prompt(planner.id, &planner.fingerprint(), "planner", "", "Mine.")
+                .unwrap();
+            store.set_profile_tools("planner", None).unwrap();
+            drop(store);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 30).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert!(store.prompt("subagent-coder").is_err());
+        assert!(store.prompt("bare").is_err());
+        assert!(store.profile("bare").unwrap().prompts.is_empty());
+        let builder = store.profile("builder").unwrap().tools.unwrap();
+        assert!(builder.contains(&"edit_file".to_owned()));
+        assert_eq!(store.prompt("planner").unwrap().text, "Mine.");
     }
 }

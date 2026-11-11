@@ -3,7 +3,7 @@
 //!
 //! Part of the store (`impl Store` continues here); the table layout is owned by `docs/erd.md`.
 //! Only the owner adds, changes or removes a server (`/mcp`); the model has no tool for it. A
-//! change is saved at once and applies the next time the program starts. The environment values
+//! change is saved at once and applies the next time the server is switched on in a chat. The environment values
 //! may hold keys: they are stored like a provider's `api_key` and are never printed or logged.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -252,22 +252,53 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM mcp_tool_rules WHERE server_id IN (SELECT id FROM mcp_servers WHERE name = ?1)",
-            [name.trim()],
-        )?;
+        for table in ["mcp_tool_rules", "chat_mcp"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE server_id IN (SELECT id FROM mcp_servers WHERE name = ?1)"),
+                [name.trim()],
+            )?;
+        }
         let changed = tx.execute("DELETE FROM mcp_servers WHERE name = ?1", [name.trim()])?;
         tx.commit()?;
         Ok(changed > 0)
     }
 
-    /// Switches a server on or off for the next start. False when there was none.
+    /// Allows or forbids switching a server on in a chat (issue 53; before that, whether it
+    /// started with the program). False when there was none.
     pub fn set_mcp_enabled(&mut self, name: &str, enabled: bool) -> Result<bool, StoreError> {
         let changed = self.conn.execute(
             "UPDATE mcp_servers SET enabled = ?2, updated_at = ?3 WHERE name = ?1",
             params![name.trim(), i64::from(enabled), now_secs()],
         )?;
         Ok(changed > 0)
+    }
+
+    /// The names of the servers that are on in a saved chat (issue 53), in the order they were
+    /// added.
+    pub fn chat_mcp(&self, session_id: i64) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.name FROM chat_mcp c JOIN mcp_servers s ON s.id = c.server_id \
+             WHERE c.session_id = ?1 ORDER BY s.id",
+        )?;
+        let rows = statement.query_map([session_id], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Saves which servers are on in a chat. A name that matches no server is left out.
+    pub fn set_chat_mcp(&mut self, session_id: i64, names: &[String]) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM chat_mcp WHERE session_id = ?1", [session_id])?;
+        for name in names {
+            tx.execute(
+                "INSERT OR IGNORE INTO chat_mcp (session_id, server_id) \
+                 SELECT ?1, id FROM mcp_servers WHERE name = ?2",
+                params![session_id, name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Sets the rule of one tool, or of every tool with no rule of its own when `tool` is
@@ -434,6 +465,43 @@ mod tests {
         assert!(!store.remove_mcp_server("a").unwrap());
         assert_eq!(store.mcp_rules(a_id).unwrap(), []);
         assert_eq!(store.list_mcp_servers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_servers_on_in_a_chat_are_saved_and_follow_the_server_when_it_is_removed() {
+        use crate::store::{Kind, NewSession};
+        let dir = Scratch::new("chat-mcp");
+        let mut store = Store::open(&dir.path().join("h.db")).unwrap();
+        for name in ["a", "b"] {
+            store.add_mcp_server(name, "prog", &[], &[], 10).unwrap();
+        }
+        let id = store
+            .create_session(&NewSession {
+                kind: Kind::Worker,
+                model: "m",
+                base_url: "http://x/v1",
+                router: &kernel::RouterOptions::default(),
+                system_prompt: "p",
+                cwd: "/w",
+                profile: None,
+                parent_id: None,
+            })
+            .unwrap();
+        assert!(store.chat_mcp(id).unwrap().is_empty());
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        store.set_chat_mcp(id, &names(&["b", "a", "nope"])).unwrap();
+        assert_eq!(store.chat_mcp(id).unwrap(), ["a", "b"]);
+        store.set_chat_mcp(id, &names(&["b"])).unwrap();
+        assert_eq!(store.chat_mcp(id).unwrap(), ["b"]);
+        assert!(store.remove_mcp_server("b").unwrap());
+        assert!(store.chat_mcp(id).unwrap().is_empty());
+        store.set_chat_mcp(id, &names(&["a"])).unwrap();
+        store.delete_session(id).unwrap();
+        let left: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM chat_mcp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]

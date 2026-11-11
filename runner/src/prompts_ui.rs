@@ -22,8 +22,7 @@ use crate::repl::{Shared, say_line};
 use crate::store::{Store, StoreError};
 use crate::store_prompts::{
     BASE_DESCRIPTION, BASE_NAME, BUILTIN_PROMPT, MAX_PROMPT_BYTES, Prompt, PromptType,
-    SUBAGENT_CODER_NAME, SUBAGENT_CODER_PROMPT, SUBAGENT_NAME, SUBAGENT_PROMPT, check_prompt_name,
-    check_prompt_text, short_hash, size_label,
+    SUBAGENT_NAME, SUBAGENT_PROMPT, check_prompt_name, check_prompt_text, short_hash, size_label,
 };
 
 /// Said after every change: the running chat keeps the prompt it started with.
@@ -741,9 +740,7 @@ fn prompt_screen<R: BufRead, W: Write>(
         if p.source_path.is_some() {
             actions.push(("reload from file", "read the file again", Action::Reload));
         }
-        if (p.name == BASE_NAME || p.name == SUBAGENT_NAME || p.name == SUBAGENT_CODER_NAME)
-            && kind == PromptType::System
-        {
+        if (p.name == BASE_NAME || p.name == SUBAGENT_NAME) && kind == PromptType::System {
             actions.push((
                 "restore built-in text",
                 "put the program's own text back",
@@ -847,7 +844,6 @@ fn prompt_screen<R: BufRead, W: Write>(
             Action::Restore => {
                 let own = match name.as_str() {
                     SUBAGENT_NAME => SUBAGENT_PROMPT,
-                    SUBAGENT_CODER_NAME => SUBAGENT_CODER_PROMPT,
                     _ => BUILTIN_PROMPT,
                 };
                 if with_store(agent, term, |s| s.set_prompt_text(&name, own, None)).is_some() {
@@ -1666,19 +1662,6 @@ mod tests {
         assert!(screen(&term).contains("subagent holds the built-in text again"));
     }
 
-    #[test]
-    fn the_coder_subagent_prompt_can_be_put_back_to_the_built_in_text() {
-        let dir = Scratch::new("pu-restore-coder");
-        add(&dir, SUBAGENT_CODER_NAME, "ruined");
-        let typed = [DOWN, ENTER, &downs(6), ENTER, ESC, ESC].concat();
-        let (mut agent, term, _) = rig(&dir, &typed, &[], true);
-        config_menu(&mut agent, &term);
-        assert_eq!(
-            store(&dir).prompt(SUBAGENT_CODER_NAME).unwrap().text,
-            SUBAGENT_CODER_PROMPT
-        );
-    }
-
     // ---- typed commands ----
 
     #[test]
@@ -2101,18 +2084,16 @@ mod tests {
     }
 
     #[test]
-    fn with_nothing_on_a_chat_starts_with_the_built_in_text_and_says_so() {
+    fn a_profile_with_no_prompt_sends_no_system_message_and_says_so() {
         let dir = Scratch::new("pu-fallback");
         store(&dir).set_prompt_enabled("base", false).unwrap();
         let (mut agent, _term, requests) = rig(&dir, "", &["ok"], false);
         let info = agent.new_chat().unwrap();
-        assert!(info.fallback);
-        assert!(
-            info.summary()
-                .contains("the built-in text, the profile has no system prompt")
-        );
+        assert!(!info.fallback && info.names.is_empty());
+        assert!(info.summary().contains("no system prompt"));
         agent.send("hi", &mut NoObserver);
-        assert_eq!(system_of(&requests.borrow()[0]), BUILTIN_PROMPT);
+        let v: serde_json::Value = serde_json::from_slice(&requests.borrow()[0]).unwrap();
+        assert_eq!(v["messages"][0]["role"], "user");
     }
 
     #[test]

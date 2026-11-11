@@ -76,6 +76,8 @@ pub struct Info<'a> {
     pub model: Option<&'a str>,
     pub provider: &'a str,
     pub approve: &'a str,
+    /// The profile the chat began under (issue 54); `None` when it began under none.
+    pub profile: Option<&'a str>,
     /// How many "always" permissions were given in this run.
     pub always: usize,
     /// How many background subagents are running (issue 35); shown only when above zero.
@@ -107,6 +109,10 @@ pub fn info_line(info: &Info, width: Option<usize>) -> String {
         } else {
             format!("approve: {}", info.approve)
         },
+    ]
+    .into_iter()
+    .chain(info.profile.map(|p| format!("profile: {p}")))
+    .chain([
         match &last_tokens {
             None => "last call: none yet".to_owned(),
             Some((prompt, cached, completion)) => {
@@ -125,20 +131,21 @@ pub fn info_line(info: &Info, width: Option<usize>) -> String {
             Some(c) => format!("context ≈ {c}"),
             None => "context: not sent yet".to_owned(),
         },
-    ]
-    .into_iter()
+    ])
     .chain((info.subagents > 0).then(|| format!("subagents: {} running", info.subagents)))
     .chain((info.shells > 0).then(|| format!("commands: {} running", info.shells)))
     .collect::<Vec<_>>()
     .join(" │ ");
 
     // Short: the same facts with short labels and no cached count.
-    let short_numbers = [
-        if info.always > 0 {
-            format!("{} (+{})", info.approve, info.always)
-        } else {
-            info.approve.to_owned()
-        },
+    let short_numbers: Vec<String> = [if info.always > 0 {
+        format!("{} (+{})", info.approve, info.always)
+    } else {
+        info.approve.to_owned()
+    }]
+    .into_iter()
+    .chain(info.profile.map(str::to_owned))
+    .chain([
         match &last_tokens {
             None => "last: none".to_owned(),
             Some((prompt, _, completion)) => format!("last {prompt} in · {completion} out"),
@@ -152,7 +159,8 @@ pub fn info_line(info: &Info, width: Option<usize>) -> String {
             Some(c) => format!("ctx {c}"),
             None => "ctx -".to_owned(),
         },
-    ];
+    ])
+    .collect();
     let short = std::iter::once(who)
         .chain(short_numbers.iter().cloned())
         .collect::<Vec<_>>()
@@ -224,6 +232,7 @@ mod tests {
             model: Some("m"),
             provider: "prov",
             approve: "manual",
+            profile: None,
             always,
             subagents: 0,
             shells: 0,
@@ -257,6 +266,19 @@ mod tests {
         assert!(line.contains("last call: ? in · ? out"), "{line}");
         assert!(line.contains("context: not sent yet"), "{line}");
         assert!(line.contains("chat: 1,234 in · 56 out"), "{line}");
+    }
+
+    #[test]
+    fn the_profile_is_shown_next_to_approve_and_left_out_when_there_is_none() {
+        let usage = ChatUsage::default();
+        let mut i = info(&usage, 0);
+        i.profile = Some("bare");
+        assert_eq!(
+            info_line(&i, None),
+            "m · prov │ approve: manual │ profile: bare │ last call: none yet │ chat: 0 in · 0 out │ context: not sent yet"
+        );
+        let short = info_line(&i, Some(70));
+        assert!(short.contains("manual │ bare │"), "{short}");
     }
 
     #[test]

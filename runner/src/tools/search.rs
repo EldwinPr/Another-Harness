@@ -25,8 +25,8 @@ const SKIPPED: &[&str] = &[".git", "node_modules", "target"];
 /// The longest line `grep` shows: a minified file would otherwise fill the result.
 const MAX_LINE_CHARS: usize = 300;
 
-const GREP_SCHEMA: &str = r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Text to look for. Not a regular expression: it matches as written"},"path":{"type":"string","description":"File or folder to search, relative to the working directory. Default: the whole working directory"},"ignore_case":{"type":"boolean","description":"Match without caring about upper and lower case"}},"required":["pattern"]}"#;
-const FIND_SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"Part of the file name to look for. Default: every file"},"path":{"type":"string","description":"Folder to search in, relative to the working directory. Default: the whole working directory"},"max":{"type":"integer","description":"How many paths to return. Default 200, at most 500"}},"required":[]}"#;
+const GREP_SCHEMA: &str = r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Text to find, as written"},"path":{"type":"string","description":"File or folder, relative to the working directory. Default: all of it"},"ignore_case":{"type":"boolean","description":"Ignore case"}},"required":["pattern"]}"#;
+const FIND_SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"Part of the file name. Default: every file"},"path":{"type":"string","description":"Folder, relative to the working directory. Default: all of it"},"max":{"type":"integer","description":"Paths to return. Default 200, at most 500"}},"required":[]}"#;
 
 #[derive(Deserialize)]
 struct GrepArgs {
@@ -145,7 +145,7 @@ impl Grep {
         Self {
             spec: ToolSpec::new(
                 "grep",
-                "Search the text of the files in the working directory and return the matching lines as path:line: text. A plain text match, not a regular expression. It never asks.",
+                "Search file text in the working directory; returns matching lines as path:line: text. Plain text, not a regular expression. It never asks.",
                 GREP_SCHEMA,
             )
             .expect("the schema constant is valid JSON"),
@@ -237,7 +237,7 @@ impl Find {
         Self {
             spec: ToolSpec::new(
                 "find",
-                "List the files below a folder of the working directory, by part of their name. Links, dot-folders, .git, node_modules and target are skipped. It never asks.",
+                "List files below a folder by part of their name. Links, dot-folders, .git, node_modules and target are skipped. It never asks.",
                 FIND_SCHEMA,
             )
             .expect("the schema constant is valid JSON"),

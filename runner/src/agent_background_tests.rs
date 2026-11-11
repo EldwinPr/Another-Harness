@@ -441,9 +441,9 @@ fn only_three_run_at_once_and_only_one_changes_files() {
     assert!(first.coder);
     let why = agent.start_subagent("builder build more").unwrap_err();
     assert!(why.contains("already running (#4)"), "{why}");
-    // A reader may still start next to it, in the mode the owner chose: in auto it is a coder too.
-    let why = agent.start_subagent("planner look").unwrap_err();
-    assert!(why.contains("already running (#4)"), "{why}");
+    // A planner lists no file tool, so it stays a reader even in auto and starts next to it.
+    let next = agent.start_subagent("planner look").unwrap();
+    assert!(!next.coder);
     h.release();
 }
 

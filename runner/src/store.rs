@@ -22,7 +22,7 @@ use crate::providers::ProviderDef;
 use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, earlier_line};
 
 /// The schema version this program writes. It is kept in SQLite's `user_version`.
-pub const SCHEMA_VERSION: i64 = 28;
+pub const SCHEMA_VERSION: i64 = 31;
 
 /// How long a write waits for another writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -283,6 +283,16 @@ CREATE TABLE IF NOT EXISTS buffer_suggestions (
 // rebuilt only to let `kind` be `gotcha` (SQLite cannot change a CHECK); the migration turns
 // foreign keys off around it, as the SQLite documentation says to, and checks them afterwards.
 // `work_logs` is append-only: nothing in the program updates or deletes a row of it.
+// Issue 53: the MCP servers that are on in a chat, as `chat_prompt_state` does for skills. A
+// server that is deleted is dropped from the chats that had it.
+const SCHEMA_V29: &str = "
+CREATE TABLE IF NOT EXISTS chat_mcp (
+    session_id INTEGER NOT NULL REFERENCES sessions (id),
+    server_id  INTEGER NOT NULL REFERENCES mcp_servers (id) ON DELETE CASCADE,
+    PRIMARY KEY (session_id, server_id)
+) STRICT;
+";
+
 const SCHEMA_V28: &str = "
 CREATE TABLE IF NOT EXISTS gotchas (
     id         INTEGER PRIMARY KEY,
@@ -914,6 +924,7 @@ impl Store {
             };
             for id in ids {
                 tx.execute("DELETE FROM chat_prompt_state WHERE session_id = ?1", [id])?;
+                tx.execute("DELETE FROM chat_mcp WHERE session_id = ?1", [id])?;
                 tx.execute("DELETE FROM calls WHERE session_id = ?1", [id])?;
                 tx.execute("DELETE FROM messages WHERE session_id = ?1", [id])?;
                 if id != session_id {
@@ -926,6 +937,30 @@ impl Store {
             return Err(err(format!("no saved chat with id {session_id}")));
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The built-in tools a saved chat was given (issue 54); `None` is every one, as for the chats
+    /// saved before there was a choice.
+    pub fn session_tools(&self, session_id: i64) -> Result<Option<Vec<String>>, StoreError> {
+        let text: Option<String> = self.conn.query_row(
+            "SELECT tools FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(text.and_then(|t| crate::store_profiles::parse_tools(&t)))
+    }
+
+    /// Saves the built-in tools a chat is given; `None` is every one.
+    pub fn set_session_tools(
+        &mut self,
+        session_id: i64,
+        tools: Option<&[String]>,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE sessions SET tools = ?2 WHERE id = ?1",
+            params![session_id, crate::store_profiles::tools_text(tools)],
+        )?;
         Ok(())
     }
 
@@ -1323,13 +1358,12 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             )
         };
         conn.execute_batch(&format!(
-            "BEGIN; {} {} {} PRAGMA user_version = 16; COMMIT;",
+            "BEGIN; {} {} PRAGMA user_version = 16; COMMIT;",
             rewrite(p::BASE_NAME, p::BUILTIN_PROMPT_V15, p::BUILTIN_PROMPT_V16),
-            rewrite(p::SUBAGENT_NAME, p::SUBAGENT_PROMPT_V15, p::SUBAGENT_PROMPT),
             rewrite(
-                p::SUBAGENT_CODER_NAME,
-                p::SUBAGENT_CODER_PROMPT_V15,
-                p::SUBAGENT_CODER_PROMPT
+                p::SUBAGENT_NAME,
+                p::SUBAGENT_PROMPT_V15,
+                p::SUBAGENT_PROMPT_V16
             ),
         ))?;
     }
@@ -1452,6 +1486,75 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
                 "the upgrade to version 28 left {broken} broken reference(s): restore the .before-28 copy"
             )));
         }
+    }
+    if version < 29 {
+        // Issue 53: which MCP servers are on in a chat.
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V29} PRAGMA user_version = 29; COMMIT;"
+        ))?;
+    }
+    if version < 30 {
+        // Issue 54: the tools a chat is given. A profile lists them (`*` is every built-in tool,
+        // as every profile had before), a saved chat keeps its own (NULL: every one, as the chats
+        // saved before this had). `bare` starts with none.
+        let tx = conn.unchecked_transaction()?;
+        for table in ["profiles", "sessions"] {
+            let has_column: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'tools'"),
+                [],
+                |row| row.get(0),
+            )?;
+            if has_column == 0 {
+                let definition = if table == "profiles" {
+                    "tools TEXT NOT NULL DEFAULT '*'"
+                } else {
+                    "tools TEXT"
+                };
+                tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
+            }
+        }
+        crate::store_profiles::seed_bare(&tx, !cfg!(test))?;
+        tx.execute_batch("PRAGMA user_version = 30;")?;
+        tx.commit()?;
+    }
+    if version < 31 {
+        // Issue 54: shorter prompts, no `subagent-coder` (a coder is `subagent` plus the `builder`
+        // profile), `bare` with no prompt, and the tools of `planner` and `builder`. Only an
+        // unedited prompt or profile changes; `subagent-coder` goes whatever it says.
+        use crate::store_profiles as pr;
+        use crate::store_prompts as p;
+        let q = |text: &str| text.replace('\'', "''");
+        let rewrite = |name: &str, old: &str, new: &str| {
+            format!(
+                "UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+                 WHERE name = '{name}' AND text = '{}';",
+                q(new),
+                q(old)
+            )
+        };
+        let tools = |name: &str, list: &str| {
+            format!(
+                "UPDATE profiles SET tools = '{}' WHERE name = '{name}' AND tools = '*' \
+                 AND EXISTS (SELECT 1 FROM profile_prompts m JOIN prompts q ON q.id = m.prompt_id \
+                             WHERE m.profile_id = profiles.id AND q.name = '{name}');",
+                q(list)
+            )
+        };
+        conn.execute_batch(&format!(
+            "BEGIN; \
+             DELETE FROM profile_prompts WHERE prompt_id IN (SELECT id FROM prompts WHERE name = 'subagent-coder'); \
+             DELETE FROM prompts WHERE name = 'subagent-coder'; \
+             DELETE FROM profile_prompts WHERE prompt_id IN \
+                 (SELECT id FROM prompts WHERE name = 'bare' AND text = 'You are a helpful assistant.'); \
+             DELETE FROM prompts WHERE name = 'bare' AND text = 'You are a helpful assistant.'; \
+             {} {} {} {} {} {} PRAGMA user_version = 31; COMMIT;",
+            rewrite(p::BASE_NAME, p::BUILTIN_PROMPT_V25, p::BUILTIN_PROMPT),
+            rewrite(p::SUBAGENT_NAME, p::SUBAGENT_PROMPT_V16, p::SUBAGENT_PROMPT),
+            rewrite("planner", pr::PLANNER_TEXT_V12, pr::PLANNER_TEXT),
+            rewrite("builder", pr::BUILDER_TEXT_V12, pr::BUILDER_TEXT),
+            tools("planner", pr::PLANNER_TOOLS),
+            tools("builder", pr::BUILDER_TOOLS),
+        ))?;
     }
     Ok(())
 }

@@ -20,7 +20,7 @@ use crate::cancel::Cancel;
 /// How long a command may run before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run with bash -c"},"timeout":{"type":"integer","description":"Seconds before the command is killed. Default 30, at most 300. For a long build, background: true is better"},"background":{"type":"boolean","description":"Start it and return at once (a server, a long build); see the task tool. It has no time limit"}},"required":["command"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run with bash -c"},"timeout":{"type":"integer","description":"Seconds before it is killed. Default 30, at most 300"},"background":{"type":"boolean","description":"Start it and return at once (a server, a long build); see task. No time limit"}},"required":["command"]}"#;
 
 /// The longest a command may ask to run before it is killed.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(300);

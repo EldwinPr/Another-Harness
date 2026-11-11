@@ -31,9 +31,9 @@ pub const MAX_ANSWER_CHARS: usize = 6_000;
 /// Delegations the model may make while answering one user message.
 pub const MAX_PER_MESSAGE: u32 = 4;
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"task":{"type":"string","description":"The whole task, self-contained: the subagent sees nothing of this chat. Say what to find out and what to report."},"profile":{"type":"string","description":"The name of the profile the subagent runs under"}},"required":["task","profile"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"task":{"type":"string","description":"The whole task: the subagent sees nothing of this chat. Say what to find out and report."},"profile":{"type":"string","description":"Profile the subagent runs under"}},"required":["task","profile"]}"#;
 
-const DESCRIPTION: &str = "Hand one task to a subagent that runs in the background: this call returns at once, the user can keep chatting, and the subagent's final answer is added to the chat as a message when the user sends their next message after it has finished. Do not wait for it: tell the user it is running and end your turn. The subagent has a chat of its own, runs under the profile you name, and cannot ask the user. It can read files, run looking commands, look up the glossary and save notes in .Aharness/tmp/. It has none of the MCP tools you have (such as crate documentation lookups), so do not hand it a task that needs them; look those up yourself and put the facts in the task. Its long results are saved there, so a later task can say: read .Aharness/tmp/plan.md. It can also create, edit and delete files when the user's approval mode is auto; in manual mode it is a reader and its result says (reader). Write the task so it stands alone.";
+const DESCRIPTION: &str = "Hand a task to a background subagent: this call returns at once, the user keeps chatting, and its final answer is added to the chat after the user's next message. Do not wait: say it is running and end your turn. It has a chat of its own under the profile you name and cannot ask the user. It reads files, runs looking commands, uses the glossary and saves notes in .Aharness/tmp/ (long results are there: read .Aharness/tmp/plan.md). It can create, edit and delete files only when the approval mode is auto; otherwise it is a reader and its result says (reader). It has none of your MCP tools: look those up yourself and put the facts in the task. Write the task so it stands alone.";
 
 /// The tool's description for the model. Fixed text, so the start of a chat never changes when
 /// the profiles do.
@@ -68,14 +68,21 @@ pub struct Kit {
     /// What the owner had answered "always" to in the chat, as `(identity, label)`: a coder's
     /// `bash` may run those commands too.
     pub always: Vec<(String, String)>,
+    /// The tools the subagent's profile allows (issue 54); `None` is the whole kit.
+    pub allow: Option<Vec<String>>,
 }
 
-/// The tools of a subagent. A reader has `read_file`, a `bash` that only runs looking commands,
-/// `glossary` and `write_note`. A coder also has the four file tools (never asking), and its `bash`
+/// The file tools: a profile that lists none of them leaves a subagent a reader.
+pub const FILE_TOOLS: [&str; 4] = ["create_file", "write_file", "edit_file", "delete_file"];
+
+/// The tools of a subagent. A reader has `read_file`, `grep`, `find`, a `bash` that only runs
+/// looking commands, `glossary` and `write_note`; its profile's tool list (issue 54) takes away
+/// what the profile does not list. A coder also has the four file tools (never asking), and its `bash`
 /// also runs what the owner allowed with "always". Nothing proposes or delegates.
 pub fn tools(cwd: &Path, db: &Path, cancel: &Cancel, kit: &Kit) -> Vec<Box<dyn Tool>> {
     let cwd: PathBuf = cwd.to_path_buf();
     let mut list: Vec<Box<dyn Tool>> = vec![Box::new(ReadFile::new(&cwd))];
+    list.extend(crate::tools::search_tools(&cwd));
     let bash = Bash::new(&cwd, DEFAULT_TIMEOUT, Box::new(NobodyToAsk)).with_cancel(cancel.clone());
     if kit.coder {
         list.extend(file_tools(
@@ -93,6 +100,9 @@ pub fn tools(cwd: &Path, db: &Path, cancel: &Cancel, kit: &Kit) -> Vec<Box<dyn T
     list.push(glossary_lookup_tool(db, cwd.display().to_string()));
     list.extend(context_read_tool(db, cwd.display().to_string()));
     list.push(Box::new(WriteNote::new(&cwd)));
+    if let Some(allow) = &kit.allow {
+        list.retain(|t| allow.contains(&t.spec().name));
+    }
     list
 }
 
@@ -169,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_has_four_tools_and_cannot_change_the_project() {
+    fn a_reader_has_six_tools_and_cannot_change_the_project() {
         let dir = crate::tools::testutil::Scratch::new("subagent-tools");
         let list = tools(
             dir.path(),
@@ -178,8 +188,18 @@ mod tests {
             &Kit::default(),
         );
         let names: Vec<&str> = list.iter().map(|t| t.spec().name.as_str()).collect();
-        assert_eq!(names, ["read_file", "bash", "glossary", "write_note"]);
-        let bash = &list[1];
+        assert_eq!(
+            names,
+            [
+                "read_file",
+                "grep",
+                "find",
+                "bash",
+                "glossary",
+                "write_note"
+            ]
+        );
+        let bash = &list[3];
         let refused = bash.run(r#"{"command":"touch made.txt"}"#);
         assert!(
             refused.starts_with("error: a subagent can only look"),
@@ -193,7 +213,7 @@ mod tests {
         let ran = bash.run(r#"{"command":"cat a.txt"}"#);
         assert!(ran.contains("hello"), "{ran}");
         // The one thing it can write is a note.
-        let saved = list[3].run(r#"{"name":"n.md","content":"x"}"#);
+        let saved = list[5].run(r#"{"name":"n.md","content":"x"}"#);
         assert!(saved.starts_with("saved .Aharness/tmp/n.md"), "{saved}");
     }
 
@@ -203,6 +223,7 @@ mod tests {
         let kit = Kit {
             coder: true,
             always: vec![("bash:touch".to_owned(), "`touch` commands".to_owned())],
+            allow: None,
         };
         let list = tools(dir.path(), &dir.path().join("x.db"), &Cancel::new(), &kit);
         let names: Vec<&str> = list.iter().map(|t| t.spec().name.as_str()).collect();
@@ -210,6 +231,8 @@ mod tests {
             names,
             [
                 "read_file",
+                "grep",
+                "find",
                 "create_file",
                 "write_file",
                 "edit_file",
@@ -238,5 +261,18 @@ mod tests {
         let ok = bash.run(r#"{"command":"mkdir -p out && ls"}"#);
         assert!(ok.contains("src"), "{ok}");
         assert!(dir.path().join("out").is_dir());
+    }
+
+    #[test]
+    fn a_profile_tool_list_takes_tools_away_from_a_coder() {
+        let dir = crate::tools::testutil::Scratch::new("subagent-allow");
+        let kit = Kit {
+            coder: true,
+            always: Vec::new(),
+            allow: Some(vec!["read_file".to_owned(), "grep".to_owned()]),
+        };
+        let list = tools(dir.path(), &dir.path().join("x.db"), &Cancel::new(), &kit);
+        let names: Vec<&str> = list.iter().map(|t| t.spec().name.as_str()).collect();
+        assert_eq!(names, ["read_file", "grep"]);
     }
 }

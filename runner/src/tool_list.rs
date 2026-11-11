@@ -101,6 +101,7 @@ pub fn catalogue(cwd: &Path, db: &Path) -> Catalogue {
         let kit = Kit {
             coder,
             always: Vec::new(),
+            allow: None,
         };
         subagent::tools(cwd, db, &Cancel::new(), &kit)
             .iter()
@@ -165,5 +166,35 @@ mod tests {
         assert_eq!(info.signature(), "edit(all?, path)");
         assert_eq!(info.summary(70), "Change a file");
         assert_eq!(info.summary(5), "Chang...");
+    }
+}
+
+#[cfg(test)]
+mod size_guard {
+    use super::*;
+    use crate::tools::testutil::Scratch;
+
+    /// Every definition in the request is paid for on every call (issue 54): the built-in tools
+    /// were 11,759 bytes before they were shortened. A new or longer definition has to make room.
+    #[test]
+    fn the_built_in_tool_definitions_stay_small() {
+        let dir = Scratch::new("tool-size");
+        let mut chat: Vec<ToolSpec> = crate::tools::chat_tools(
+            dir.path(),
+            &dir.path().join("harness.db"),
+            shared_mode(Mode::Manual),
+            Rc::new(NobodyToAsk),
+            Cancel::new(),
+            crate::tools::ShellTasks::new(),
+        )
+        .iter()
+        .map(|t| t.spec().clone())
+        .collect();
+        chat.push(subagent::delegate_spec());
+        let total: usize = chat
+            .iter()
+            .map(|s| s.description.len() + s.parameters().len())
+            .sum();
+        assert!(total <= 10_300, "the built-in tools are {total} bytes");
     }
 }

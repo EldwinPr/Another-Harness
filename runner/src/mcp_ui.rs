@@ -3,7 +3,8 @@
 //! Typed forms only (they work with or without a terminal):
 //!
 //! ```text
-//! /mcp                                       list the servers and their rules
+//! /mcp                                       a checklist (terminal) or the list: on or off in this chat
+//! /mcp on NAME | off NAME                    switch a server on or off in this chat (issue 53)
 //! /mcp add NAME COMMAND [ARGS] [--env N=v] [--timeout S]
 //! /mcp remove NAME
 //! /mcp enable NAME | disable NAME
@@ -11,9 +12,13 @@
 //! /mcp rule NAME TOOL|* ask|free|off
 //! ```
 //!
-//! Every change is for the next time the program starts: the tools of a chat are fixed when it
-//! starts, so the router's cached prompt is not thrown away midway. The words are split on
-//! spaces; a program or argument with a space in it is not supported here.
+//! A server is on or off per chat, like a skill: a new chat starts with none on (so a bare "hi"
+//! does not carry their tool definitions). Switching one on starts it and adds its tools; in a chat
+//! that already has replies that changes the request, so it warns. Switching one off before any
+//! reply removes its tools; after a reply the tools stay (the router's cache stays valid) and the
+//! model's calls are refused. `enable`/`disable` allow or forbid switching a server on at all. Rules
+//! and the server's settings apply the next time it is switched on. The words are split on spaces;
+//! a program or argument with a space in it is not supported here.
 
 use std::io::{BufRead, Write};
 
@@ -35,9 +40,9 @@ use crate::store_mcp::{
 /// How much of a tool's description a line shows.
 const SUMMARY_CHARS: usize = 70;
 
-const USAGE: &str = "usage: /mcp [config | add NAME COMMAND [ARGS] [--env NAME=value] [--timeout SECONDS] | remove NAME | enable NAME | disable NAME | tools NAME | restart NAME | rule NAME TOOL|* ask|free|off | toolset [add NAME]]";
+const USAGE: &str = "usage: /mcp [on NAME | off NAME | config | add NAME COMMAND [ARGS] [--env NAME=value] [--timeout SECONDS] | remove NAME | enable NAME | disable NAME | tools NAME | restart NAME | rule NAME TOOL|* ask|free|off | toolset [add NAME]]";
 
-const NEXT_START: &str = "applies the next time the program starts";
+const NEXT_START: &str = "applies the next time the server is switched on in a chat";
 
 /// What `/mcp add` was given.
 #[derive(Debug, PartialEq, Eq)]
@@ -90,7 +95,13 @@ pub fn command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, res
         .split_once(char::is_whitespace)
         .map_or((rest, ""), |(word, tail)| (word, tail.trim()));
     match word {
+        "" if term.borrow().menus_enabled() => checklist(agent, term),
         "" | "list" => list(agent, term),
+        "on" | "off" if tail.is_empty() => {
+            say_line(term, &style.yellow(&format!("usage: /mcp {word} NAME")));
+        }
+        "on" => switch(agent, term, tail, true),
+        "off" => switch(agent, term, tail, false),
         "config" if term.borrow().menus_enabled() => config_menu(agent, term),
         "config" => say_line(
             term,
@@ -105,7 +116,7 @@ pub fn command<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, res
         "enable" => set_enabled(agent, term, tail, true),
         "disable" => set_enabled(agent, term, tail, false),
         "tools" => tools(agent, term, tail),
-        "restart" => restart(term, tail),
+        "restart" => restart(agent, term, tail),
         "toolset" | "toolsets" => toolset(agent, term, tail),
         "rule" => rule(agent, term, tail),
         _ => say_line(term, &style.yellow(USAGE)),
@@ -131,9 +142,14 @@ fn list<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
     for server in &servers {
         let rules = with_store(agent, term, |s| s.mcp_rules(server.id)).unwrap_or_default();
         let mut line = format!(
-            "  {}{}  {} {}",
+            "  {} {}{}  {} {}",
+            if agent.mcp_is_on(&server.name) {
+                "[x]"
+            } else {
+                "[ ]"
+            },
             style.bold(&server.name),
-            if server.enabled { "" } else { " (off)" },
+            if server.enabled { "" } else { " (disabled)" },
             server.command,
             server.args.join(" ")
         );
@@ -141,7 +157,7 @@ fn list<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
         text.push_str(&line);
         text.push('\n');
         let mut facts = vec![
-            state_of(term, server),
+            state_of(agent, server),
             format!("timeout {}s", server.timeout_secs),
             format!("other tools: {}", server.default_rule.name()),
         ];
@@ -157,7 +173,7 @@ fn list<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
             ));
         }
     }
-    text.push_str(&style.dim("changes apply the next time the program starts"));
+    text.push_str(&style.dim("/mcp on NAME | off NAME: per chat; a new chat starts with none on"));
     text.push('\n');
     term.borrow_mut().say(&text);
 }
@@ -187,8 +203,8 @@ fn save_server<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, giv
         done(
             term,
             &format!(
-                "added {}: every tool asks first; /mcp tools {} lists them, /mcp rule sets what each may do. This {NEXT_START}.",
-                server.name, server.name
+                "added {}: off in every chat until /mcp on {}; every tool asks first, /mcp tools {} lists them, /mcp rule sets what each may do.",
+                server.name, server.name, server.name
             ),
         );
     }
@@ -196,7 +212,7 @@ fn save_server<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, giv
 
 fn remove<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, name: &str) {
     match with_store(agent, term, |s| s.remove_mcp_server(name)) {
-        Some(true) => done(term, &format!("removed {name}. This {NEXT_START}.")),
+        Some(true) => done(term, &format!("removed {name}.")),
         Some(false) => not_found(term, name),
         None => {}
     }
@@ -207,8 +223,13 @@ fn set_enabled<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, nam
         Some(true) => done(
             term,
             &format!(
-                "{} {name}. This {NEXT_START}.",
-                if on { "enabled" } else { "disabled" }
+                "{} {name}{}",
+                if on { "enabled" } else { "disabled" },
+                if on {
+                    ": /mcp on switches it on in a chat."
+                } else {
+                    ": it cannot be switched on in a chat."
+                }
             ),
         ),
         Some(false) => not_found(term, name),
@@ -271,7 +292,7 @@ fn config_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
             .map(|s| {
                 MenuItem::new(&s.name).with_detail(format!(
                     "{} · {} {} · other tools: {}",
-                    if s.enabled { "on" } else { "off" },
+                    if s.enabled { "allowed" } else { "disabled" },
                     s.command,
                     s.args.join(" "),
                     s.default_rule.name()
@@ -441,6 +462,17 @@ pub fn apply_startup(store: &mut Store, requests: &[McpRequest]) -> Vec<String> 
     notes
 }
 
+/// The servers `--mcp` and `--mcp-add` name, to switch on in the first chat.
+pub fn startup_names(requests: &[McpRequest]) -> Vec<String> {
+    requests
+        .iter()
+        .filter_map(|request| match request {
+            McpRequest::Toolset(name) => mcp_toolsets::find(name).map(|t| t.name.to_owned()),
+            McpRequest::Add(words) => parse_add(words).ok().map(|a| a.name),
+        })
+        .collect()
+}
+
 /// "+ add new": one question at a time, each with an example, so nothing has to be remembered.
 fn add_step_by_step<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
     let style = term.borrow().style();
@@ -531,7 +563,7 @@ fn server_menu<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, nam
         };
         let actions = [
             MenuItem::new(if server.enabled { "disable" } else { "enable" })
-                .with_detail("start it with the chat, or not"),
+                .with_detail("whether a chat may switch it on"),
             MenuItem::new("tool rules")
                 .with_detail("ask, free or off for each tool (starts the server for a moment)"),
             MenuItem::new(format!("other tools: {}", server.default_rule.name()))
@@ -703,28 +735,27 @@ pub fn cost_line(
 }
 
 /// Whether the server is running in this chat, for the list.
-fn state_of<R: BufRead, W: Write>(term: &Shared<R, W>, server: &McpServer) -> String {
-    let client = term.borrow().mcp_client(&server.name);
-    match client {
+fn state_of(agent: &Agent, server: &McpServer) -> String {
+    match agent.mcp_client(&server.name) {
         Some(client) => match client.stopped() {
-            None => "running in this chat".to_owned(),
+            None if agent.mcp_is_on(&server.name) => "on in this chat".to_owned(),
+            None => "off in this chat (tools still listed, calls refused)".to_owned(),
             Some(why) => format!("stopped: {why} (/mcp restart {})", server.name),
         },
-        None if server.enabled => "not started in this chat".to_owned(),
-        None => "not started".to_owned(),
+        None if server.enabled => "off in this chat".to_owned(),
+        None => "disabled".to_owned(),
     }
 }
 
 /// `/mcp restart NAME`: starts a server of this chat again, in place. Its tools are the ones the
 /// model already has; nothing about the tool list changes.
-fn restart<R: BufRead, W: Write>(term: &Shared<R, W>, name: &str) {
+fn restart<R: BufRead, W: Write>(agent: &Agent, term: &Shared<R, W>, name: &str) {
     let style = term.borrow().style();
-    let client = term.borrow().mcp_client(name);
-    let Some(client) = client else {
+    let Some(client) = agent.mcp_client(name) else {
         return say_line(
             term,
             &style.yellow(&format!(
-                "{name} is not running in this chat, so there is nothing to restart; a server added or enabled since the program started begins at the next start"
+                "{name} is not running in this chat, so there is nothing to restart: /mcp on {name} starts it"
             )),
         );
     };
@@ -733,11 +764,79 @@ fn restart<R: BufRead, W: Write>(term: &Shared<R, W>, name: &str) {
         Ok(defs) => done(
             term,
             &format!(
-                "{name} is running again ({} tools). The tools the model has are the ones from the start of this chat.",
+                "{name} is running again ({} tools). The tools the model has are the ones from when it was switched on.",
                 defs.len()
             ),
         ),
         Err(why) => error(term, &format!("{name} did not start again: {why}")),
+    }
+}
+
+/// `/mcp on NAME` and `/mcp off NAME`.
+fn switch<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>, name: &str, on: bool) {
+    let style = term.borrow().style();
+    match agent.set_mcp(name, on) {
+        Err(why) => error(term, &why),
+        Ok(change) => {
+            done(term, &change.message);
+            if let Some(warning) = change.warning {
+                say_line(term, &style.yellow(&format!("warning: {warning}")));
+            }
+        }
+    }
+}
+
+/// `/mcp` in a terminal: Enter switches the highlighted server on or off in this chat.
+fn checklist<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) {
+    let style = term.borrow().style();
+    let mut start = 0;
+    let mut changed = Vec::new();
+    loop {
+        let servers = match agent.mcp_servers() {
+            Ok(servers) => servers,
+            Err(why) => return error(term, &why),
+        };
+        if servers.is_empty() {
+            return say_line(
+                term,
+                &style.yellow(
+                    "no MCP servers: /mcp add NAME COMMAND [ARGS], or /mcp config for a menu",
+                ),
+            );
+        }
+        let rows: Vec<MenuItem> = servers
+            .iter()
+            .map(|(server, on)| {
+                MenuItem::new(format!(
+                    "{} {}",
+                    if *on { "[x]" } else { "[ ]" },
+                    server.name
+                ))
+                .with_detail(state_of(agent, server))
+            })
+            .collect();
+        let chosen = term.borrow_mut().pick_from(
+            "mcp: Enter switches a server on or off in this chat; Esc finishes",
+            &rows,
+            start,
+        );
+        let Some(index) = chosen else {
+            break;
+        };
+        let (server, on) = &servers[index];
+        start = index;
+        match agent.set_mcp(&server.name, !*on) {
+            Err(why) => error(term, &why),
+            Ok(change) => {
+                changed.push(change.message);
+                if let Some(warning) = change.warning {
+                    say_line(term, &style.yellow(&format!("warning: {warning}")));
+                }
+            }
+        }
+    }
+    for line in changed {
+        say_line(term, &style.green(&line));
     }
 }
 
@@ -1042,8 +1141,15 @@ mod tests {
                 "",
             ],
         );
-        assert_eq!(screen.matches("next time the program starts").count(), 5);
-        assert!(screen.contains("docs (off)  rust-docs-mcp"), "{screen}");
+        assert_eq!(
+            screen.matches("switched on in a chat").count(),
+            3,
+            "{screen}"
+        );
+        assert!(
+            screen.contains("[ ] docs (disabled)  rust-docs-mcp"),
+            "{screen}"
+        );
         assert!(
             screen.contains("timeout 30s; other tools: off; variables: API_KEY"),
             "{screen}"
@@ -1087,7 +1193,10 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("usage: /mcp remove NAME"), "{screen}");
-        assert!(screen.contains("usage: /mcp [config | add"), "{screen}");
+        assert!(
+            screen.contains("usage: /mcp [on NAME | off NAME | config | add"),
+            "{screen}"
+        );
         assert!(store(&dir).list_mcp_servers().unwrap().is_empty());
     }
 }

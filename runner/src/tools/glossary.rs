@@ -16,7 +16,7 @@ use crate::store::Store;
 use crate::store_glossary::{PARTIAL_MATCHES, Saved, check_definition, check_term};
 
 const LOOKUP_SCHEMA: &str = r#"{"type":"object","properties":{"term":{"type":"string","description":"The project word to look up"}},"required":["term"]}"#;
-const PROPOSE_SCHEMA: &str = r#"{"type":"object","properties":{"term":{"type":"string","description":"The project word"},"definition":{"type":"string","description":"What it means in this project, in a few sentences"},"reason":{"type":"string","description":"Why you propose this: what you learned or what is wrong with the stored definition"}},"required":["term","definition","reason"]}"#;
+const PROPOSE_SCHEMA: &str = r#"{"type":"object","properties":{"term":{"type":"string","description":"The project word"},"definition":{"type":"string","description":"What it means here, in a few sentences"},"reason":{"type":"string","description":"Why: what you learned or what is wrong with the stored definition"}},"required":["term","definition","reason"]}"#;
 
 /// How much of a text the one-line question shows.
 const SHOWN_CHARS: usize = 70;

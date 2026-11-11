@@ -20,7 +20,7 @@ use crate::store_profiles::{Profile, check_description, check_profile_name};
 use crate::store_prompts::{Prompt, PromptType, check_prompt_name, check_prompt_text};
 
 const LIBRARY_SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","show","add","edit","delete"]},"type":{"type":"string","enum":["skill","personality","prompt"],"description":"prompt is a system prompt"},"name":{"type":"string"},"description":{"type":"string","description":"One line: what it is for"},"text":{"type":"string","description":"The whole text"},"new_name":{"type":"string","description":"edit only: rename"},"reason":{"type":"string","description":"Why, shown to the owner"}},"required":["action","type"]}"#;
-const PROFILE_SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","show","add","edit","delete"]},"name":{"type":"string"},"new_name":{"type":"string","description":"edit only: rename"},"description":{"type":"string"},"prompts":{"type":"array","items":{"type":"string"},"description":"Names of system prompts. edit: replaces the list"},"skills":{"type":"array","items":{"type":"string"},"description":"Names of skills switched on when a chat starts. edit: replaces the list"},"personality":{"type":"string","description":"Name of a personality; empty for none"},"reason":{"type":"string","description":"Why, shown to the owner"}},"required":["action"]}"#;
+const PROFILE_SCHEMA: &str = r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","show","add","edit","delete"]},"name":{"type":"string"},"new_name":{"type":"string","description":"edit only: rename"},"description":{"type":"string"},"prompts":{"type":"array","items":{"type":"string"},"description":"System prompt names; edit replaces the list"},"skills":{"type":"array","items":{"type":"string"},"description":"Skill names on at start; edit replaces the list"},"personality":{"type":"string","description":"Name of a personality; empty for none"},"reason":{"type":"string","description":"Why, shown to the owner"}},"required":["action"]}"#;
 
 /// How much of a text the one-line question shows, and the most of a text `show` gives back.
 const SHOWN_CHARS: usize = 70;
@@ -39,7 +39,7 @@ pub fn library_tools(
         Box::new(Library {
             spec: ToolSpec::new(
                 "library",
-                "Read or change the owner's skills, personalities and system prompts (type prompt). Actions: list, show, add, edit, delete. A new one is saved switched off; you cannot switch anything on. The owner is asked before a change.",
+                "Read or change the owner's skills, personalities and system prompts (type prompt). Actions: list, show, add, edit, delete. A new one is saved switched off. The owner is asked before a change.",
                 LIBRARY_SCHEMA,
             )
             .expect("the schema constant is valid JSON"),
@@ -48,7 +48,7 @@ pub fn library_tools(
         Box::new(Profiles {
             spec: ToolSpec::new(
                 "profile",
-                "Read or change the owner's profiles: the setup a chat starts with (system prompts, skills that are on, a personality). Actions: list, show, add, edit, delete. You cannot select a profile. The owner is asked before a change.",
+                "Read or change the owner's profiles (what a chat starts with: system prompts, skills, a personality). Actions: list, show, add, edit, delete. You cannot select one. The owner is asked before a change.",
                 PROFILE_SCHEMA,
             )
             .expect("the schema constant is valid JSON"),

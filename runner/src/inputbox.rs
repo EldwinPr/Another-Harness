@@ -6,7 +6,7 @@
 //! > what you type
 //!   and it wraps
 //! ────────────────────
-//!  model · provider │ approve: manual │ ...
+//!  model · provider │ approve: manual │ profile: default │ ...
 //! ```
 //!
 //! The rules are as wide as the terminal and the prompt grows taller as the text wraps (rows are not

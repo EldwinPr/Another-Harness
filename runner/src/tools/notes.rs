@@ -18,7 +18,7 @@ pub const MAX_NAME_CHARS: usize = 60;
 /// The most bytes one note may hold.
 pub const MAX_NOTE_BYTES: usize = 100_000;
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"One file name such as plan.md: letters, digits, dot, dash and underscore, at most 60 characters"},"content":{"type":"string","description":"The text of the note"}},"required":["name","content"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"One file name such as plan.md: letters, digits, . - _, at most 60 characters"},"content":{"type":"string","description":"The text of the note"}},"required":["name","content"]}"#;
 
 #[derive(Deserialize)]
 struct Args {

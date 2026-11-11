@@ -97,7 +97,7 @@ fn schema_25_upgrades_through_26_and_27_to_28_keeping_every_table_and_making_one
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 28);
+    assert_eq!(SCHEMA_VERSION, 31);
     assert_eq!(tables(&store.conn), before, "every table is still there");
     assert!(store.context_entry("/p", "style").unwrap().is_some());
     assert!(store.glossary_entry("ledger").unwrap().is_some());
@@ -105,7 +105,7 @@ fn schema_25_upgrades_through_26_and_27_to_28_keeping_every_table_and_making_one
     assert!(store.prompt("terse").is_ok());
     assert!(store.list_pending().unwrap().is_empty());
 
-    let copy = Connection::open(dir.path().join("harness.db.before-28")).unwrap();
+    let copy = Connection::open(dir.path().join("harness.db.before-31")).unwrap();
     let old: i64 = copy
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
@@ -115,7 +115,7 @@ fn schema_25_upgrades_through_26_and_27_to_28_keeping_every_table_and_making_one
     // Opening again changes nothing and makes no second copy.
     drop(store);
     drop(Store::open(&path).unwrap());
-    assert!(!dir.path().join("harness.db.before-28.2").exists());
+    assert!(!dir.path().join("harness.db.before-31.2").exists());
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn schema_26_upgrades_to_28_keeping_the_inbox_and_making_the_before_28_copy() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 31);
     assert_eq!(tables(&store.conn), before);
     assert_eq!(
         (
@@ -156,7 +156,7 @@ fn schema_26_upgrades_to_28_keeping_the_inbox_and_making_the_before_28_copy() {
     );
     assert!(store.list_suggestions(id).unwrap().is_empty());
 
-    let copy = Connection::open(dir.path().join("harness.db.before-28")).unwrap();
+    let copy = Connection::open(dir.path().join("harness.db.before-31")).unwrap();
     let old: i64 = copy
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();

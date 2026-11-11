@@ -18,8 +18,8 @@ use super::{Approver, Mode, SharedMode, Tool};
 /// The most text one `create_file` or `write_file` call may carry.
 pub const MAX_CONTENT_BYTES: usize = 1_000_000;
 
-const CONTENT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path of the file, relative to the working directory"},"content":{"type":"string","description":"The full UTF-8 text of the file"}},"required":["path","content"]}"#;
-const PATH_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path of the file, relative to the working directory"}},"required":["path"]}"#;
+const CONTENT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"content":{"type":"string","description":"The full UTF-8 text of the file"}},"required":["path","content"]}"#;
+const PATH_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"}},"required":["path"]}"#;
 
 #[derive(Deserialize)]
 struct ContentArgs {
@@ -27,7 +27,7 @@ struct ContentArgs {
     content: String,
 }
 
-const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path of the file, relative to the working directory"},"old_string":{"type":"string","description":"The exact text to replace, including spaces and line breaks. Must appear once unless replace_all is true"},"new_string":{"type":"string","description":"The text to put in its place"},"replace_all":{"type":"boolean","description":"Replace every occurrence instead of requiring exactly one"}},"required":["path","old_string","new_string"]}"#;
+const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"old_string":{"type":"string","description":"Exact text to replace, with spaces and line breaks; must appear once unless replace_all"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence"}},"required":["path","old_string","new_string"]}"#;
 
 #[derive(Deserialize)]
 struct EditArgs {
@@ -334,7 +334,7 @@ impl EditFile {
         Self {
             spec: ToolSpec::new(
                 "edit_file",
-                "Change part of an existing UTF-8 text file by replacing exact text. Fails, changing nothing, if old_string is not found, or is found more than once and replace_all is not true. Prefer this to write_file for changes.",
+                "Replace exact text in an existing file. Fails, changing nothing, if old_string is not found, or is found more than once and replace_all is not true. Prefer it to write_file.",
                 EDIT_SCHEMA,
             )
             .expect("the schema constant is valid JSON"),

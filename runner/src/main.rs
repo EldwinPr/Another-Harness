@@ -309,7 +309,7 @@ fn start(
     let cancel = runner::cancel::Cancel::new();
     let shells = runner::tools::ShellTasks::new();
     let approver: Rc<dyn runner::tools::Approver> = Rc::new(TerminalApprover(Rc::clone(&term)));
-    let mut tools: Vec<Box<dyn Tool>> = runner::tools::chat_tools(
+    let tools: Vec<Box<dyn Tool>> = runner::tools::chat_tools(
         &cwd,
         &db_path,
         Rc::clone(&approval),
@@ -317,14 +317,34 @@ fn start(
         cancel.clone(),
         shells.clone(),
     );
-    // The MCP servers the owner added start now, and their tools are fixed for this chat
-    // (issue 44): a change made with /mcp applies the next time the program starts.
-    // `--mcp` and `--mcp-add` save their servers first, so they start in this very chat.
-    let added = runner::mcp_ui::apply_startup(&mut store, &options.mcp);
-    let mut mcp = runner::mcp::McpServers::start_all(&store, &cwd, &cancel);
-    mcp.notes.splice(0..0, added);
-    tools.extend(runner::tools::mcp_tools(&mcp, &approval, &approver));
-    term.borrow_mut().set_mcp(mcp.clients());
+    // MCP servers start when a chat switches one on with /mcp (issue 53), not here. `--mcp` and
+    // `--mcp-add` save their servers first and turn them on in the first chat.
+    let mcp_notes = runner::mcp_ui::apply_startup(&mut store, &options.mcp);
+    let mcp_start = runner::mcp_ui::startup_names(&options.mcp);
+    let launcher: runner::agent::McpLauncher = {
+        let (cwd, cancel) = (cwd.clone(), cancel.clone());
+        let (approval, approver) = (Rc::clone(&approval), Rc::clone(&approver));
+        Rc::new(move |server, rules| {
+            let (client, defs) = runner::mcp::McpClient::start(server, &cwd, cancel.clone())?;
+            let started = runner::mcp::Started {
+                server: server.clone(),
+                rules: rules.to_vec(),
+                client: Rc::clone(&client),
+                tools: defs,
+            };
+            let (count, tokens) = started.on_cost();
+            let servers = runner::mcp::McpServers {
+                started: vec![started],
+                notes: Vec::new(),
+            };
+            Ok(runner::agent::McpLaunch {
+                tools: runner::tools::mcp_tools(&servers, &approval, &approver),
+                client,
+                count,
+                tokens,
+            })
+        })
+    };
     let catalog = Catalog {
         provider_dir: std::env::var(ENV_PROVIDER_DIR)
             .ok()
@@ -363,6 +383,7 @@ fn start(
         None => Agent::new("", Box::new(NoProvider), tools, log),
     }
     .with_catalog(catalog)
+    .with_mcp_launcher(launcher)
     .with_approval(approval)
     .with_cancel(cancel)
     .with_shells(shells)
@@ -374,9 +395,15 @@ fn start(
     agent.load_approval_mode();
 
     let mut notes = String::new();
-    for note in &mcp.notes {
+    for note in &mcp_notes {
         notes.push_str(note);
         notes.push('\n');
+    }
+    for name in &mcp_start {
+        match agent.set_mcp(name, true) {
+            Ok(change) => notes.push_str(&format!("[mcp: {}]\n", change.message)),
+            Err(why) => notes.push_str(&format!("[mcp: {why}]\n")),
+        }
     }
     // Provider files are copied into the database once, so the menus can edit them.
     match agent.import_provider_files() {
@@ -464,21 +491,15 @@ fn start(
     if !agent.chat_prompts().on.is_empty() {
         banner.push_str(&row("skills:", &agent.chat_prompts().on.join(", ")));
     }
-    if !mcp.started.is_empty() {
-        let line = mcp
-            .started
-            .iter()
-            .map(|s| {
-                let (tools, tokens) = s.on_cost();
-                format!(
-                    "{} ({tools} tools, ~{} tokens a call)",
-                    s.server.name,
-                    runner::web_usage::compact(i64::try_from(tokens).unwrap_or(i64::MAX))
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        banner.push_str(&row("mcp:", &line));
+    let mcp_on: Vec<String> = agent
+        .mcp_servers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(server, _)| server.name)
+        .collect();
+    if !mcp_on.is_empty() {
+        banner.push_str(&row("mcp:", &mcp_on.join(", ")));
     }
     banner.push_str(&row("database:", &db_path.display().to_string()));
     banner.push_str(&row("log:", &agent.log_path().display().to_string()));
