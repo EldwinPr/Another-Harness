@@ -224,6 +224,38 @@ pub struct Options {
     pub eval_decider: Option<DeciderSpec>,
     /// MCP servers to add before the chat starts (issue 44), in the order given.
     pub mcp: Vec<McpRequest>,
+    /// Run one subagent with no terminal UI, print its answer and its chat id, and exit (issue 55).
+    pub headless: bool,
+    /// With `--headless`: the profile to run under (the selected profile when not given).
+    pub profile: Option<String>,
+    /// With `--headless`: continue this earlier subagent chat instead of starting one.
+    pub continue_id: Option<i64>,
+    /// With `--headless`: print one JSON object instead of the answer and `session: N`.
+    pub json: bool,
+    /// With `--headless`: the subagent may change files (approval mode auto for this run).
+    pub write: bool,
+    /// With `--headless`: the words that are not options, joined, are the task.
+    pub task: Vec<String>,
+    /// Write a copy of the database to this file and exit (issue 57).
+    pub export: Option<String>,
+    /// With `--export`: keep the provider API keys and MCP environment values in the copy.
+    pub with_keys: bool,
+    /// Bring this database file in, as a separate space (`--as`) or merged (`--merge`), and exit.
+    pub import: Option<String>,
+    /// With `--import`: keep it as a separate database called this, opened with `--space`.
+    pub import_as: Option<String>,
+    /// With `--import`: add what it has and this database lacks.
+    pub merge: bool,
+    /// Save a copy of the database, empty it and exit.
+    pub wipe: bool,
+    /// With `--wipe`: the word that confirms it, for a run with no terminal.
+    pub confirm: Option<String>,
+    /// With `--wipe`: also delete the turn logs.
+    pub with_logs: bool,
+    /// Open this space (a database from `--import --as`) instead of the main database.
+    pub space: Option<String>,
+    /// List the spaces and exit.
+    pub spaces: bool,
 }
 
 /// One `--mcp` or `--mcp-add` on the command line.
@@ -237,7 +269,7 @@ pub enum McpRequest {
 }
 
 /// The options that end the words of `--mcp-add`.
-const OWN_OPTIONS: [&str; 13] = [
+const OWN_OPTIONS: [&str; 28] = [
     "--resume",
     "--serve",
     "--mcp",
@@ -251,6 +283,21 @@ const OWN_OPTIONS: [&str; 13] = [
     "--detach",
     "--mcp-stop",
     "--auto-accept",
+    "--headless",
+    "--profile",
+    "--continue",
+    "--json",
+    "--write",
+    "--export",
+    "--with-keys",
+    "--import",
+    "--as",
+    "--merge",
+    "--wipe",
+    "--confirm",
+    "--with-logs",
+    "--space",
+    "--spaces",
 ];
 
 /// The port `--serve` uses when none is given.
@@ -283,6 +330,60 @@ impl Options {
                 "--mcp-serve" => options.mcp_serve = true,
                 "--http" => options.http = true,
                 "--auto-accept" => options.auto_accept = true,
+                "--headless" => options.headless = true,
+                "--with-keys" => options.with_keys = true,
+                "--merge" => options.merge = true,
+                "--wipe" => options.wipe = true,
+                "--with-logs" => options.with_logs = true,
+                "--spaces" => options.spaces = true,
+                "--export" | "--import" | "--as" | "--confirm" | "--space" => {
+                    let value = args
+                        .next_if(|next| !next.is_empty() && !next.starts_with("--"))
+                        .ok_or_else(|| {
+                            format!(
+                                "{arg} needs {}",
+                                match arg.as_str() {
+                                    "--export" => "the file to write",
+                                    "--import" => "the database file to bring in",
+                                    "--as" => "a name for the space",
+                                    "--confirm" => "the word that confirms the wipe",
+                                    _ => "the name of a space",
+                                }
+                            )
+                        })?;
+                    match arg.as_str() {
+                        "--export" => options.export = Some(value),
+                        "--import" => options.import = Some(value),
+                        "--as" => options.import_as = Some(value),
+                        "--confirm" => options.confirm = Some(value),
+                        _ => options.space = Some(value),
+                    }
+                }
+                "--json" => options.json = true,
+                "--write" => options.write = true,
+                "--profile" => {
+                    options.profile = Some(
+                        args.next_if(|next| !next.starts_with("--"))
+                            .ok_or("--profile needs the name of a profile")?,
+                    );
+                }
+                "--continue" => {
+                    let number = args
+                        .next_if(|next| {
+                            !next.is_empty() && next.chars().all(|c| c.is_ascii_digit())
+                        })
+                        .ok_or("--continue needs the number of a subagent chat (the session id)")?;
+                    options.continue_id = Some(
+                        number
+                            .parse::<i64>()
+                            .ok()
+                            .filter(|id| *id > 0)
+                            .ok_or_else(|| format!("'{number}' is not a chat number"))?,
+                    );
+                }
+                word if options.headless && !word.starts_with('-') => {
+                    options.task.push(word.to_owned());
+                }
                 "-d" | "--detach" => options.detach = true,
                 "--mcp-stop" => options.mcp_stop = true,
                 "--port" => {
@@ -340,12 +441,97 @@ impl Options {
                 }
                 other => {
                     return Err(format!(
-                        "unknown option '{other}': the options are --resume, --serve [port], --mcp NAME, --mcp-add NAME COMMAND [ARGS] and --mcp-serve [--read-only | --direct | --decider SPEC] [--http | -d] [--port N], --mcp-stop and --eval-decider SPEC"
+                        "unknown option '{other}': the options are --resume, --serve [port], --headless [--profile NAME] [--continue ID] [--json] [--write] TASK, --export FILE [--with-keys], --import FILE (--as NAME | --merge), --wipe [--confirm WORD] [--with-logs], --space NAME, --spaces, --mcp NAME, --mcp-add NAME COMMAND [ARGS] and --mcp-serve [--read-only | --direct | --decider SPEC] [--http | -d] [--port N], --mcp-stop and --eval-decider SPEC"
                     ));
                 }
             }
         }
-        if options.mcp_stop {
+        let data_modes = [
+            options.export.is_some(),
+            options.import.is_some(),
+            options.wipe,
+            options.spaces,
+        ];
+        if data_modes.iter().filter(|on| **on).count() > 1 {
+            return Err(
+                "--export, --import, --wipe and --spaces each do one thing and exit: give one"
+                    .to_owned(),
+            );
+        }
+        if data_modes.iter().any(|on| *on)
+            && (options.resume
+                || options.serve.is_some()
+                || options.mcp_serve
+                || options.mcp_stop
+                || options.headless
+                || options.eval_decider.is_some()
+                || !options.mcp.is_empty())
+        {
+            return Err(
+                "--export, --import, --wipe and --spaces take only their own options and --space"
+                    .to_owned(),
+            );
+        }
+        if options.with_keys && options.export.is_none() {
+            return Err("--with-keys only goes with --export".to_owned());
+        }
+        if (options.confirm.is_some() || options.with_logs) && !options.wipe {
+            return Err("--confirm and --with-logs only go with --wipe".to_owned());
+        }
+        if (options.import_as.is_some() || options.merge) && options.import.is_none() {
+            return Err("--as and --merge only go with --import".to_owned());
+        }
+        if options.import.is_some() {
+            match (options.import_as.is_some(), options.merge) {
+                (false, false) => {
+                    return Err(
+                        "--import needs --as NAME (keep it as a separate space) or --merge (add it to this database)"
+                            .to_owned(),
+                    );
+                }
+                (true, true) => {
+                    return Err("--import takes --as NAME or --merge, not both".to_owned());
+                }
+                _ => {}
+            }
+            if options.import_as.is_some() && options.space.is_some() {
+                return Err(
+                    "--import --as makes a new space: --space chooses which database to open, so it does not go with it"
+                        .to_owned(),
+                );
+            }
+        }
+        if !options.headless
+            && (options.profile.is_some()
+                || options.continue_id.is_some()
+                || options.json
+                || options.write)
+        {
+            return Err(
+                "--profile, --continue, --json and --write only go with --headless".to_owned(),
+            );
+        }
+        if options.headless {
+            if options.resume
+                || options.serve.is_some()
+                || options.mcp_serve
+                || options.http
+                || options.detach
+                || options.port.is_some()
+                || options.direct
+                || options.read_only
+                || options.decider.is_some()
+                || options.eval_decider.is_some()
+                || options.mcp_stop
+                || options.auto_accept
+                || !options.mcp.is_empty()
+            {
+                return Err(
+                    "--headless runs one subagent and exits: it takes only --profile, --continue, --json, --write and the task"
+                        .to_owned(),
+                );
+            }
+        } else if options.mcp_stop {
             if options.resume
                 || options.serve.is_some()
                 || options.mcp_serve
@@ -641,6 +827,96 @@ mod tests {
     fn resume_is_the_one_option() {
         assert!(args(&["--resume"]).unwrap().resume);
         assert!(args(&["--resume", "--resume"]).unwrap().resume);
+    }
+
+    #[test]
+    fn headless_takes_a_task_a_profile_a_chat_to_continue_and_two_switches() {
+        let o = args(&[
+            "--headless",
+            "--profile",
+            "planner",
+            "--continue",
+            "12",
+            "--json",
+            "--write",
+            "find",
+            "the",
+            "x",
+        ])
+        .unwrap();
+        assert!(o.headless && o.json && o.write);
+        assert_eq!(o.profile.as_deref(), Some("planner"));
+        assert_eq!(o.continue_id, Some(12));
+        assert_eq!(o.task.join(" "), "find the x");
+        // The task may be left to standard input.
+        assert!(args(&["--headless"]).unwrap().task.is_empty());
+    }
+
+    #[test]
+    fn the_headless_switches_need_headless_and_headless_takes_nothing_else() {
+        for list in [
+            &["--profile", "planner"][..],
+            &["--continue", "3"],
+            &["--json"],
+            &["--write"],
+        ] {
+            let why = args(list).unwrap_err();
+            assert!(why.contains("only go with --headless"), "{why}");
+        }
+        assert!(args(&["--headless", "--resume", "x"]).is_err());
+        assert!(args(&["--headless", "--serve", "x"]).is_err());
+        assert!(args(&["--headless", "--mcp", "rust-docs", "x"]).is_err());
+        assert!(args(&["--headless", "--continue", "abc", "x"]).is_err());
+        assert!(args(&["--headless", "--continue", "0", "x"]).is_err());
+        // Without --headless a bare word is still an unknown option.
+        assert!(args(&["task"]).is_err());
+    }
+
+    #[test]
+    fn the_data_commands_read_their_files_and_names() {
+        let o = args(&["--export", "out.db", "--with-keys", "--space", "work"]).unwrap();
+        assert_eq!(o.export.as_deref(), Some("out.db"));
+        assert!(o.with_keys);
+        assert_eq!(o.space.as_deref(), Some("work"));
+        let o = args(&["--import", "a.db", "--as", "old"]).unwrap();
+        assert_eq!(
+            (o.import.as_deref(), o.import_as.as_deref()),
+            (Some("a.db"), Some("old"))
+        );
+        let o = args(&["--import", "a.db", "--merge", "--space", "work"]).unwrap();
+        assert!(o.merge && o.space.as_deref() == Some("work"));
+        let o = args(&["--wipe", "--confirm", "harness", "--with-logs"]).unwrap();
+        assert!(o.wipe && o.with_logs && o.confirm.as_deref() == Some("harness"));
+        assert!(args(&["--spaces"]).unwrap().spaces);
+        // A space can be named for a chat or a headless run too.
+        assert_eq!(
+            args(&["--space", "work"]).unwrap().space.as_deref(),
+            Some("work")
+        );
+        assert!(args(&["--headless", "--space", "work", "go"]).is_ok());
+    }
+
+    #[test]
+    fn the_data_commands_refuse_what_does_not_belong() {
+        for list in [
+            &["--export"][..],
+            &["--import"],
+            &["--space"],
+            &["--import", "a.db"],
+            &["--import", "a.db", "--as", "x", "--merge"],
+            &["--import", "a.db", "--as", "x", "--space", "y"],
+            &["--as", "x"],
+            &["--merge"],
+            &["--with-keys"],
+            &["--confirm", "x"],
+            &["--with-logs"],
+            &["--export", "o", "--wipe"],
+            &["--wipe", "--resume"],
+            &["--export", "o", "--headless", "t"],
+            &["--spaces", "--serve"],
+        ] {
+            assert!(args(list).is_err(), "{list:?} should be refused");
+        }
     }
 
     #[test]

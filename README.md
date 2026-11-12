@@ -44,6 +44,23 @@ All of it is stored, named and ordered in SQLite. You manage it from the chat, f
 /web                                            edit all of it in a browser
 ```
 
+A subagent can also run from the command line, with no screen: `aharness --headless --profile
+reviewer "check the diff in src/db"` prints its answer and then `session: N`. Continue it later
+with `aharness --headless --continue N "and the tests?"`. It only reads unless you add `--write`;
+`--json` prints one JSON object for scripts, and the task may come on standard input. These chats
+do not show in `/sessions` or `--resume`.
+
+Your data is one SQLite file, and it can be moved. `aharness --export backup.db` writes a copy
+(provider API keys and MCP environment values are left out unless you add `--with-keys`; chat text
+is copied as it is). `aharness --import backup.db --as old` keeps a file as a separate **space**
+that `--space old` opens in place of the main database (`--spaces` lists them), and
+`--import backup.db --merge` adds what the file has and the open database lacks, never replacing
+anything (a copy of the database is saved first; the inbox and settings are not merged).
+`aharness --wipe` shows what it will remove, saves a copy, asks you to type the database's name, and
+starts again from the defaults; `--with-logs` also deletes the turn logs.
+The web page (`--serve`) has a **Data** page that does the same for the database it shows: export into the
+data folder's `exports/`, import by file path (as a space or merged), and wipe by typing the database's name.
+
 The model can manage the library too. The `library` and `profile` tools list, show, add, edit and
 delete skills, personalities, prompts and profiles. Every change asks you first, shows the edit, and
 a new item is saved **switched off** so it cannot silently change the next chat. After a refusal the

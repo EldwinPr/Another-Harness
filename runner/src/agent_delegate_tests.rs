@@ -164,10 +164,11 @@ fn a_subagent_cannot_change_anything_in_manual_mode() {
 }
 
 #[test]
-fn a_subagent_that_uses_all_its_calls_is_reported_as_stopped() {
-    let dir = Scratch::new("delegate-cap");
+fn a_subagent_has_no_cap_on_its_model_calls() {
+    // More than the old limit of 15: it ends when it answers, not when it runs out of calls.
+    let dir = Scratch::new("delegate-nocap");
     let mut replies = Vec::new();
-    for n in 0..crate::subagent::MAX_CALLS {
+    for n in 0..20 {
         std::fs::write(dir.path().join(format!("a{n}.txt")), "x").unwrap();
         replies.push(ScriptedProvider::tool_call(
             &format!("c{n}"),
@@ -175,14 +176,12 @@ fn a_subagent_that_uses_all_its_calls_is_reported_as_stopped() {
             &format!(r#"{{"path":"a{n}.txt"}}"#),
         ));
     }
+    replies.push(ScriptedProvider::text("read them all"));
     let (mut agent, h) = setup(&dir, vec![], replies);
-    let back = run_to_the_end(&mut agent, &h, "planner read", 16);
+    let back = run_to_the_end(&mut agent, &h, "planner read", 21);
+    assert!(back.starts_with("read them all\n"), "{back}");
     assert!(
-        back.starts_with("error: subagent stopped: it used all 15 of its calls"),
-        "{back}"
-    );
-    assert!(
-        back.contains("[subagent planner (reader): 15 calls, "),
+        back.contains("[subagent planner (reader): 21 calls, "),
         "{back}"
     );
 }
@@ -517,4 +516,145 @@ fn the_model_can_list_read_and_stop_a_subagent_with_task() {
     agent.send("and?", &mut NoObserver);
     let delivered = json(&h.main_seen.borrow()[2])["messages"].to_string();
     assert!(!delivered.contains("never delivered"), "{delivered}");
+}
+
+// ---- headless runs and continuing a subagent (issue 55) ----
+
+#[test]
+fn a_headless_run_has_no_parent_is_marked_and_is_left_out_of_the_chat_lists() {
+    let dir = Scratch::new("headless-run");
+    let (mut agent, h) = setup(
+        &dir,
+        vec![],
+        vec![ScriptedProvider::text("It is decided in a.txt:1.")],
+    );
+    h.release();
+    let result = agent
+        .run_headless(Some("planner"), "find where x is decided", None)
+        .unwrap();
+    assert!(!result.failed(), "{}", result.text);
+    // The answer alone, and the footer apart from it.
+    assert_eq!(result.answer, "It is decided in a.txt:1.");
+    assert!(
+        result.text.contains("[subagent planner (reader)"),
+        "{}",
+        result.text
+    );
+    let id = result.session.expect("the run has a chat");
+    assert_eq!(count(&dir, "SELECT COUNT(*) FROM sessions"), 1);
+    assert_eq!(
+        count(
+            &dir,
+            &format!(
+                "SELECT COUNT(*) FROM sessions WHERE id = {id} AND headless = 1 AND parent_id IS NULL"
+            )
+        ),
+        1
+    );
+    let store = Store::open(&dir.path().join("harness.db")).unwrap();
+    assert!(store.list_sessions(Kind::Worker, 10).unwrap().is_empty());
+    assert!(store.latest_session(Kind::Worker).unwrap().is_none());
+    // It read only: the subagent was offered the tools that look.
+    let seen = json(&h.child_seen.borrow()[0]);
+    assert!(!tool_names(&seen).iter().any(|t| t == "create_file"));
+}
+
+#[test]
+fn a_headless_run_continues_with_its_own_chat_prompt_and_profile() {
+    let dir = Scratch::new("headless-continue");
+    let (mut agent, h) = setup(
+        &dir,
+        vec![],
+        vec![
+            ScriptedProvider::text("first answer"),
+            ScriptedProvider::text("second answer"),
+        ],
+    );
+    h.release_n(2);
+    let first = agent.run_headless(Some("planner"), "find x", None).unwrap();
+    let id = first.session.unwrap();
+    // No profile named: the saved one is used.
+    let second = agent.run_headless(None, "and y?", Some(id)).unwrap();
+    assert_eq!(second.answer, "second answer");
+    assert_eq!(second.session, Some(id));
+    assert_eq!(count(&dir, "SELECT COUNT(*) FROM sessions"), 1);
+
+    let request = json(&h.child_seen.borrow()[1]);
+    let messages = request["messages"].as_array().unwrap();
+    let said: Vec<&str> = messages
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert!(said[0].starts_with("You are a subagent."), "{}", said[0]);
+    assert!(said[0].contains("Plan, do not build."), "{}", said[0]);
+    assert_eq!(&said[1..], ["find x", "first answer", "and y?"]);
+}
+
+#[test]
+fn a_headless_run_cannot_continue_an_ordinary_chat_or_a_chat_that_is_not_there() {
+    let dir = Scratch::new("headless-refuse");
+    let (mut agent, h) = setup(&dir, vec![], vec![]);
+    // An ordinary chat of the owner's.
+    let store = Store::open(&dir.path().join("harness.db")).unwrap();
+    drop(store);
+    let mut ordinary = Store::open(&dir.path().join("harness.db")).unwrap();
+    let id = ordinary
+        .create_session(&NewSession {
+            kind: Kind::Worker,
+            model: "m",
+            base_url: "http://x/v1",
+            router: &RouterOptions::default(),
+            system_prompt: "p",
+            cwd: "/",
+            profile: None,
+            parent_id: None,
+        })
+        .unwrap();
+    h.release();
+    let why = agent.run_headless(None, "x", Some(id)).unwrap_err();
+    assert!(why.contains("cannot be continued"), "{why}");
+    let why = agent.run_headless(None, "x", Some(9999)).unwrap_err();
+    assert!(why.contains("no subagent chat 9999"), "{why}");
+}
+
+#[test]
+fn delegate_continues_a_subagent_of_this_chat_and_refuses_any_other() {
+    let dir = Scratch::new("delegate-continue");
+    let (mut agent, h) = setup(
+        &dir,
+        vec![],
+        vec![ScriptedProvider::text("one"), ScriptedProvider::text("two")],
+    );
+    let first = run_to_the_end(&mut agent, &h, "planner find x", 1);
+    assert!(first.starts_with("one\n"), "{first}");
+    let child = count(&dir, "SELECT id FROM sessions WHERE parent_id IS NOT NULL");
+    let parent = count(&dir, "SELECT id FROM sessions WHERE parent_id IS NULL");
+
+    // The main chat's own id is not a subagent, and neither is one that does not exist.
+    let why = agent.launch("planner", "x", Some(parent)).err().unwrap();
+    assert!(why.contains("not a subagent of this chat"), "{why}");
+    assert!(agent.launch("planner", "x", Some(9999)).is_err());
+
+    // Without a profile it keeps the one it had.
+    let run = agent.launch("", "and y?", Some(child)).unwrap();
+    h.release();
+    wait_for(&agent, run.n, Status::Done);
+    assert_eq!(run.profile, "planner");
+    assert_eq!(count(&dir, "SELECT COUNT(*) FROM sessions"), 2);
+    let request = json(&h.child_seen.borrow()[1]);
+    let said: Vec<String> = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(&said[1..], ["find x", "one", "and y?"]);
+}
+
+#[test]
+fn delegate_takes_a_session_id_in_place_of_a_profile() {
+    let args = crate::subagent::parse(r#"{"task":"more","session_id":7}"#).unwrap();
+    assert_eq!((args.session_id, args.profile.as_str()), (Some(7), ""));
+    let why = crate::subagent::parse(r#"{"task":"more"}"#).err().unwrap();
+    assert!(why.contains("no profile"), "{why}");
 }

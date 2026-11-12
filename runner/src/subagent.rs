@@ -24,14 +24,12 @@ use crate::tools::{
 /// The tool's name.
 pub const DELEGATE: &str = "delegate";
 
-/// Model calls a subagent may make for one task.
-pub const MAX_CALLS: u32 = 15;
 /// Characters of a subagent's answer that reach the main chat.
 pub const MAX_ANSWER_CHARS: usize = 6_000;
 /// Delegations the model may make while answering one user message.
 pub const MAX_PER_MESSAGE: u32 = 4;
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"task":{"type":"string","description":"The whole task: the subagent sees nothing of this chat. Say what to find out and report."},"profile":{"type":"string","description":"Profile the subagent runs under"}},"required":["task","profile"]}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"task":{"type":"string","description":"The whole task: the subagent sees nothing of this chat. Say what to find out and report."},"profile":{"type":"string","description":"Profile the subagent runs under"},"session_id":{"type":"integer","description":"Continue this earlier subagent (the chat number at the end of its answer) instead of starting one; task is then your follow-up"}},"required":["task"]}"#;
 
 const DESCRIPTION: &str = "Hand a task to a background subagent: this call returns at once, the user keeps chatting, and its final answer is added to the chat after the user's next message. Do not wait: say it is running and end your turn. It has a chat of its own under the profile you name and cannot ask the user. It reads files, runs looking commands, uses the glossary and saves notes in .Aharness/tmp/ (long results are there: read .Aharness/tmp/plan.md). It can create, edit and delete files only when the approval mode is auto; otherwise it is a reader and its result says (reader). It has none of your MCP tools: look those up yourself and put the facts in the task. Write the task so it stands alone.";
 
@@ -44,7 +42,11 @@ pub fn delegate_spec() -> ToolSpec {
 #[derive(Deserialize)]
 pub struct Args {
     pub task: String,
+    #[serde(default)]
     pub profile: String,
+    /// An earlier subagent chat of this chat to continue (issue 55).
+    #[serde(default)]
+    pub session_id: Option<i64>,
 }
 
 /// Reads the arguments of a `delegate` call.
@@ -54,7 +56,7 @@ pub fn parse(arguments: &str) -> Result<Args, String> {
     if args.task.trim().is_empty() {
         return Err("error: the task is empty".to_owned());
     }
-    if args.profile.trim().is_empty() {
+    if args.profile.trim().is_empty() && args.session_id.is_none() {
         return Err("error: no profile given".to_owned());
     }
     Ok(args)

@@ -2731,17 +2731,13 @@ pub fn run<R: BufRead, W: Write>(agent: &mut Agent, term: &Shared<R, W>) -> io::
             "/new" if rest.is_empty() => {
                 let cleared = !agent.chat_prompts().is_empty();
                 match agent.new_chat() {
-                    Ok(info) => say_line(
+                    Ok(_) => say_line(
                         term,
-                        &style.green(&format!(
-                            "new chat; system prompt: {}{}",
-                            info.summary(),
-                            if cleared {
-                                "; personality and skills cleared"
-                            } else {
-                                ""
-                            }
-                        )),
+                        &style.green(if cleared {
+                            "new chat; personality and skills cleared"
+                        } else {
+                            "new chat"
+                        }),
                     ),
                     Err(why) => say_line(term, &style.red(&format!("[error: {why}]"))),
                 }

@@ -257,6 +257,8 @@ pub struct Agent {
     keeps_cancel: bool,
     /// The chat that delegated to this one, when this agent is a subagent.
     parent_id: Option<i64>,
+    /// This agent is a `--headless` run (issue 55): its chat is marked, and no chat lists it.
+    headless: bool,
     /// Starts an MCP server when `/mcp on` asks (issue 53); `None` means the chat has no servers.
     mcp_launcher: Option<McpLauncher>,
     /// The MCP servers started in this chat.
@@ -381,6 +383,7 @@ impl Agent {
             auto_wakes: 0,
             keeps_cancel: false,
             parent_id: None,
+            headless: false,
             mcp_launcher: None,
             mcp_running: Vec::new(),
             mcp_notes: Vec::new(),
@@ -471,6 +474,13 @@ impl Agent {
                 }),
             None => Ok(()),
         }
+    }
+
+    /// Sets the mode for this run only, saving nothing, and leaves plan mode (issue 55: a headless
+    /// run does not take over the mode the owner left in the database).
+    pub fn set_run_approval(&mut self, mode: Mode) {
+        self.approval.set_mode(mode);
+        self.approval.set_planning(false);
     }
 
     /// At start-up: the saved mode, or `manual` when none is saved or the saved text is unknown.
@@ -2222,7 +2232,7 @@ impl Agent {
                 "error: at most {MAX_PER_MESSAGE} delegations per message; do the rest yourself"
             );
         }
-        match self.launch(&args.profile, &args.task) {
+        match self.launch(&args.profile, &args.task, args.session_id) {
             Ok(run) => {
                 self.delegations += 1;
                 let kind = if run.coder { "coder" } else { "reader" };
@@ -2274,9 +2284,14 @@ impl Agent {
 
     /// Starts a subagent on a thread of its own (issues 33, 35); the jobs refuse a start that is
     /// not allowed (too many running, a second one that changes files).
-    fn launch(&mut self, profile: &str, task: &str) -> Result<StartedRun, String> {
+    fn launch(
+        &mut self,
+        profile: &str,
+        task: &str,
+        resume: Option<i64>,
+    ) -> Result<StartedRun, String> {
         let cancel = Cancel::new();
-        let spec = self.child_spec(profile, task, cancel.clone())?;
+        let spec = self.child_spec(profile, task, cancel.clone(), resume, false)?;
         let (coder, name, parent) = (spec.kit.coder, spec.profile.clone(), spec.parent_id);
         let n = self
             .jobs
@@ -2293,11 +2308,16 @@ impl Agent {
     /// Everything a subagent needs to run, as plain data, so that it can run on this thread or
     /// on another (issues 33 and 35). Checks the profile; says what is wrong in the words the model
     /// or the owner will see.
+    ///
+    /// `resume` continues that subagent chat instead of starting one (issue 55): it must be a
+    /// subagent of this chat, or a headless run. `headless` is a run with no parent chat.
     fn child_spec(
         &mut self,
         profile: &str,
         task: &str,
         cancel: Cancel,
+        resume: Option<i64>,
+        headless: bool,
     ) -> Result<ChildSpec, String> {
         let Some(build) = self.subagent_tools.clone() else {
             return Err("error: this chat cannot start subagents".to_owned());
@@ -2307,6 +2327,33 @@ impl Agent {
                 "error: subagents need the saved-chat database, and this chat has none".to_owned(),
             );
         };
+        let link = match resume {
+            None => None,
+            Some(id) => {
+                let link = stored
+                    .store
+                    .session_link(id)
+                    .map_err(|e| format!("error: cannot read chat {id}: {e}"))?
+                    .ok_or_else(|| format!("error: there is no subagent chat {id}"))?;
+                let mine =
+                    !headless && link.parent_id.is_some() && link.parent_id == stored.session_id;
+                if !(mine || link.headless) {
+                    return Err(format!(
+                        "error: chat {id} is not a subagent of this chat and not a headless run, so it cannot be continued"
+                    ));
+                }
+                Some(link)
+            }
+        };
+        // A continued subagent keeps the profile it ran under unless another is named.
+        let profile = match (
+            profile.trim(),
+            link.as_ref().and_then(|l| l.profile.as_deref()),
+        ) {
+            ("", Some(saved)) => saved.to_owned(),
+            (named, _) => named.to_owned(),
+        };
+        let profile = profile.as_str();
         let profiles = stored
             .store
             .list_profiles()
@@ -2366,7 +2413,11 @@ impl Agent {
             .unwrap_or(Path::new("."))
             .to_owned();
         let cwd = stored.context.cwd.clone();
-        let parent_id = self.ensure_session()?;
+        let parent_id = if headless {
+            None
+        } else {
+            Some(self.ensure_session()?)
+        };
         Ok(ChildSpec {
             profile: profile.name.clone(),
             task: task.to_owned(),
@@ -2381,7 +2432,9 @@ impl Agent {
             db,
             cwd,
             log_dir,
-            parent_id: Some(parent_id),
+            parent_id,
+            resume,
+            headless,
             cancel,
         })
     }
@@ -2414,6 +2467,12 @@ impl Agent {
             })
             .map_err(|e| e.to_string())?;
         stored.session_id = Some(id);
+        if self.headless {
+            stored
+                .store
+                .set_session_headless(id)
+                .map_err(|e| e.to_string())?;
+        }
         stored
             .store
             .set_chat_prompts(id, &self.chat_prompts)
@@ -2459,7 +2518,36 @@ impl Agent {
         if task.is_empty() {
             return Err("usage: /subagent [profile] <task>".to_owned());
         }
-        self.launch(&profile, task)
+        self.launch(&profile, task, None)
+    }
+
+    /// `--headless` (issue 55): runs one subagent to its answer on this thread, with no parent chat,
+    /// and returns the result with the id of its chat. `profile` is the one to run under (the
+    /// selected profile when `None`; the saved one when continuing); `resume` continues that
+    /// headless or earlier subagent chat. It reads only, unless the approval mode is auto.
+    pub fn run_headless(
+        &mut self,
+        profile: Option<&str>,
+        task: &str,
+        resume: Option<i64>,
+    ) -> Result<ChildResult, String> {
+        if !self.ready() {
+            return Err(CHOOSE_A_PROVIDER.to_owned());
+        }
+        if task.trim().is_empty() {
+            return Err("the task is empty".to_owned());
+        }
+        let profile = match (profile, resume) {
+            (Some(name), _) => name.to_owned(),
+            (None, Some(_)) => String::new(),
+            (None, None) => self
+                .selected_profile()
+                .unwrap_or_else(|| "default".to_owned()),
+        };
+        let spec = self
+            .child_spec(&profile, task, Cancel::new(), resume, true)
+            .map_err(|why| why.trim_start_matches("error: ").to_owned())?;
+        Ok(run_child(spec, &mut NoObserver))
     }
 
     /// The runs of this program run, oldest first.
@@ -2542,23 +2630,37 @@ pub(crate) struct ChildSpec {
     cwd: String,
     log_dir: std::path::PathBuf,
     pub parent_id: Option<i64>,
+    /// The subagent chat to continue (issue 55); `None` starts a new one.
+    resume: Option<i64>,
+    /// A `--headless` run: no parent chat, and its chat is marked.
+    headless: bool,
     cancel: Cancel,
 }
 
 /// How a subagent ended.
+#[derive(Debug)]
 pub struct ChildResult {
     /// What the delegating side gets: the answer and a footer, or an error and a footer.
     pub text: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// The answer alone (or the error), without the footer.
+    pub answer: String,
+    /// Model calls it made.
+    pub calls: u32,
+    /// The subagent's chat, to continue it later.
+    pub session: Option<i64>,
 }
 
 impl ChildResult {
     fn error(text: String) -> Self {
         Self {
+            answer: text.clone(),
             text,
             prompt_tokens: 0,
             completion_tokens: 0,
+            calls: 0,
+            session: None,
         }
     }
 
@@ -2571,7 +2673,7 @@ impl ChildResult {
 /// Runs one subagent to its end, on whatever thread calls this: builds its own agent from `spec`
 /// (its own database connection, turn log and tools), sends the task, and words the result.
 pub(crate) fn run_child(spec: ChildSpec, observer: &mut dyn Observer) -> ChildResult {
-    use crate::subagent::{self, MAX_CALLS};
+    use crate::subagent;
     // Stopped before it began (its own chat would clear the cancel when its message starts).
     if spec.cancel.is_cancelled() {
         return ChildResult::error("error: subagent stopped: cancelled".to_owned());
@@ -2591,12 +2693,18 @@ pub(crate) fn run_child(spec: ChildSpec, observer: &mut dyn Observer) -> ChildRe
         .with_router(spec.router)
         .with_target(spec.target.name, spec.target.base_url)
         .with_cancel(spec.cancel)
-        .with_max_calls(MAX_CALLS)
         .with_store(store, StoreContext { cwd: spec.cwd });
     child.parent_id = spec.parent_id;
+    child.headless = spec.headless;
     child.keeps_cancel = true;
     child.history[0] = Message::System(spec.start.assembled.text.clone());
     child.begin_under(&spec.start);
+    // A continued subagent takes back its own chat: its prompt, tools and everything said so far.
+    if let Some(id) = spec.resume
+        && let Err(why) = child.resume(Some(id))
+    {
+        return ChildResult::error(format!("error: cannot continue chat {id}: {why}"));
+    }
 
     let outcome = child.send(&spec.task, observer);
     let calls = child
@@ -2642,10 +2750,18 @@ pub(crate) fn run_child(spec: ChildSpec, observer: &mut dyn Observer) -> ChildRe
         Outcome::Failed(why) => stopped(why),
         Outcome::Cancelled => stopped("cancelled".to_owned()),
     };
+    let answer = text
+        .strip_suffix(footer.as_str())
+        .unwrap_or(&text)
+        .trim_end()
+        .to_owned();
     ChildResult {
+        answer,
         text,
         prompt_tokens: child.usage.prompt_total,
         completion_tokens: child.usage.completion_total,
+        calls,
+        session: child.current_session(),
     }
 }
 

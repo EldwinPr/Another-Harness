@@ -587,21 +587,9 @@ mod tests {
         run(&mut agent, &term).unwrap();
         let out = screen(&term);
         // The first /new had nothing to clear, the second did.
+        assert!(out.contains("new chat\n"), "{out}");
         assert!(
-            out.contains(&format!(
-                "new chat; system prompt: 1 on (base); {}, about {} tokens (estimate)\n",
-                crate::store_prompts::size_label(
-                    crate::store_prompts::BUILTIN_PROMPT.chars().count()
-                ),
-                crate::store_prompts::BUILTIN_PROMPT
-                    .chars()
-                    .count()
-                    .div_ceil(4)
-            )),
-            "{out}"
-        );
-        assert!(
-            out.contains("(estimate); personality and skills cleared"),
+            out.contains("new chat; personality and skills cleared"),
             "{out}"
         );
         assert!(agent.chat_prompts().is_empty());

@@ -22,7 +22,7 @@ use crate::providers::ProviderDef;
 use crate::store_prompts::{ACTIVE_MARK, SUMMARY_MARK, earlier_line};
 
 /// The schema version this program writes. It is kept in SQLite's `user_version`.
-pub const SCHEMA_VERSION: i64 = 31;
+pub const SCHEMA_VERSION: i64 = 33;
 
 /// How long a write waits for another writer before giving up.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -539,6 +539,14 @@ pub struct SaveCall<'a> {
     pub result: &'a Result<Reply, Box<ProviderError>>,
 }
 
+/// How a saved chat is tied to others (issue 55).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLink {
+    pub parent_id: Option<i64>,
+    pub headless: bool,
+    pub profile: Option<String>,
+}
+
 /// A saved chat, without its messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
@@ -964,6 +972,34 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a chat as made by `--headless` (issue 55): the chat lists and `--resume` leave it out.
+    pub fn set_session_headless(&mut self, session_id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE sessions SET headless = 1 WHERE id = ?1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    /// How a saved chat is tied to others (issue 55): its parent chat, whether it was a headless
+    /// run, and its profile. `None` when there is no such chat.
+    pub fn session_link(&self, session_id: i64) -> Result<Option<SessionLink>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT parent_id, headless, profile FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| {
+                    Ok(SessionLink {
+                        parent_id: row.get(0)?,
+                        headless: row.get::<_, i64>(1)? != 0,
+                        profile: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// The most recently used chat of this kind that has at least one usable message.
     pub fn latest_session(&self, kind: Kind) -> Result<Option<SessionInfo>, StoreError> {
         Ok(self
@@ -972,7 +1008,7 @@ impl Store {
                 "SELECT s.id, s.model, s.base_url, s.router_options, p.text, s.cwd, \
                         s.created_at, s.updated_at, s.profile \
                  FROM sessions s JOIN system_prompts p ON p.id = s.system_prompt_id \
-                 WHERE s.kind = ?1 AND s.parent_id IS NULL \
+                 WHERE s.kind = ?1 AND s.parent_id IS NULL AND s.headless = 0 \
                    AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id AND m.status = 'ok') \
                  ORDER BY s.updated_at DESC, s.id DESC LIMIT 1",
                 [kind.as_str()],
@@ -1000,7 +1036,7 @@ impl Store {
                         AND substr(m.text, 1, length(?4)) = ?4), \
                     s.profile \
              FROM sessions s \
-             WHERE s.kind = ?1 AND s.parent_id IS NULL \
+             WHERE s.kind = ?1 AND s.parent_id IS NULL AND s.headless = 0 \
                AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id AND m.status = 'ok') \
              ORDER BY s.updated_at DESC, s.id DESC LIMIT ?2",
         )?;
@@ -1554,6 +1590,35 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             rewrite("builder", pr::BUILDER_TEXT_V12, pr::BUILDER_TEXT),
             tools("planner", pr::PLANNER_TOOLS),
             tools("builder", pr::BUILDER_TOOLS),
+        ))?;
+    }
+    if version < 32 {
+        // Issue 55: a chat made by `--headless` is marked, so the chat lists leave it out.
+        let tx = conn.unchecked_transaction()?;
+        let has_column: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'headless'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_column == 0 {
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN headless INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        tx.execute_batch("PRAGMA user_version = 32;")?;
+        tx.commit()?;
+    }
+    if version < 33 {
+        // A subagent no longer has a cap on its model calls, so its prompt no longer says it has
+        // one. Only an unedited prompt changes.
+        use crate::store_prompts as p;
+        let q = |text: &str| text.replace('\'', "''");
+        conn.execute_batch(&format!(
+            "BEGIN; UPDATE prompts SET text = '{}', updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+             WHERE name = '{}' AND text = '{}'; PRAGMA user_version = 33; COMMIT;",
+            q(p::SUBAGENT_PROMPT),
+            p::SUBAGENT_NAME,
+            q(p::SUBAGENT_PROMPT_V31)
         ))?;
     }
     Ok(())

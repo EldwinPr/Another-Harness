@@ -2025,10 +2025,7 @@ mod tests {
         let (mut agent, term, requests) = rig(&dir, typed, &["one", "two"], false);
         run(&mut agent, &term).unwrap();
         let out = screen(&term);
-        assert!(
-            out.contains("new chat; system prompt: 2 on (base, extra)"),
-            "{out}"
-        );
+        assert!(out.contains("new chat"), "{out}");
         let requests = requests.borrow();
         assert_eq!(
             system_of(&requests[0]),

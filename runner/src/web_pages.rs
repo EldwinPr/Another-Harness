@@ -147,7 +147,7 @@ impl ProfileDraft {
 }
 
 /// The words a `?ok=` can carry, and the notice each one shows. Anything else shows nothing.
-const NOTICES: [(&str, &str); 9] = [
+const NOTICES: [(&str, &str); 12] = [
     ("added", "Added."),
     ("saved", "Saved."),
     ("deleted", "Deleted."),
@@ -157,6 +157,15 @@ const NOTICES: [(&str, &str); 9] = [
     ("used", "New chats now start under it."),
     ("copied", "Copied."),
     ("rejected", "Rejected."),
+    ("exported", "Exported: the copy is listed under Exports."),
+    (
+        "imported",
+        "Kept as a space: open it by starting the program with --space NAME.",
+    ),
+    (
+        "wiped",
+        "Wiped. The database as it was is saved: see Backups.",
+    ),
 ];
 
 /// The text of a notice word, if it is one.
@@ -208,7 +217,7 @@ legend{color:var(--dim);padding:0 .3rem}.badge{border:1px solid var(--accent);co
 @media (prefers-color-scheme:dark){.diff .add{color:#7ee2a0}.diff .del{color:#ff8a7a}}\
 .erd .edge:hover .line{stroke-width:3;stroke:var(--accent);opacity:1}.card{background:var(--card);border:1px solid var(--line);border-radius:6px;margin:.6rem 0;padding:.5rem .75rem}.card p{margin:.2rem 0}";
 
-const PAGES: [(&str, &str); 12] = [
+const PAGES: [(&str, &str); 13] = [
     ("/", "Home"),
     ("/profiles", "Profiles"),
     ("/prompts", "Prompts"),
@@ -220,6 +229,7 @@ const PAGES: [(&str, &str); 12] = [
     ("/tools", "Tools"),
     ("/usage", "Usage"),
     ("/database", "Database"),
+    ("/data", "Data"),
     ("/help", "Help"),
 ];
 

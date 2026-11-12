@@ -110,6 +110,183 @@ fn detach(
     Ok(())
 }
 
+/// The database the run opens: the main one, or the space `--space` names (issue 57).
+fn database_for(
+    log_dir: &std::path::Path,
+    options: &Options,
+) -> Result<std::path::PathBuf, String> {
+    match &options.space {
+        None => Ok(log_dir.join(DB_FILE)),
+        Some(name) => {
+            runner::transfer::check_space_name(name)?;
+            let path = runner::transfer::space_path(log_dir, name);
+            if path.is_file() {
+                Ok(path)
+            } else {
+                Err(format!(
+                    "there is no space called {name}; --spaces lists them"
+                ))
+            }
+        }
+    }
+}
+
+/// `--spaces`, `--export`, `--import` and `--wipe` (issue 57). `None` when none was given.
+fn data_command(options: &Options, log_dir: &std::path::Path) -> Option<ExitCode> {
+    use runner::transfer;
+    let wants =
+        options.spaces || options.export.is_some() || options.import.is_some() || options.wipe;
+    if !wants {
+        return None;
+    }
+    let fail = |why: String| {
+        eprintln!("error: {why}");
+        ExitCode::FAILURE
+    };
+    if options.spaces {
+        let names = transfer::list_spaces(log_dir);
+        if names.is_empty() {
+            println!("no spaces; --import FILE --as NAME makes one");
+        }
+        for name in names {
+            println!("{name}");
+        }
+        return Some(ExitCode::SUCCESS);
+    }
+    if let Some(name) = &options.import_as {
+        let file = options.import.as_deref().unwrap_or_default();
+        return Some(
+            match transfer::import_as_space(std::path::Path::new(file), log_dir, name) {
+                Ok(path) => {
+                    println!("space {name} is ready at {}", path.display());
+                    println!(
+                        "open it with --space {name} (chat, --headless, --serve, --mcp-serve, --wipe, --export ...)"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(why) => fail(why),
+            },
+        );
+    }
+    let db = match database_for(log_dir, options) {
+        Ok(db) => db,
+        Err(why) => return Some(fail(why)),
+    };
+    if let Some(to) = &options.export {
+        return Some(
+            match transfer::export(&db, std::path::Path::new(to), options.with_keys) {
+                Ok(report) => {
+                    println!(
+                        "wrote {to}: {} chats, {} providers",
+                        report.chats, report.providers
+                    );
+                    if report.keys_removed {
+                        println!(
+                            "API keys and MCP environment values were left out (--with-keys keeps them)"
+                        );
+                    } else {
+                        println!("the file holds your API keys: keep it private");
+                    }
+                    println!("chat text is copied as it is; the turn logs are not included");
+                    ExitCode::SUCCESS
+                }
+                Err(why) => fail(why),
+            },
+        );
+    }
+    if let Some(file) = &options.import {
+        // `--merge`: the validation guarantees it when there is no `--as`.
+        return Some(match transfer::merge(&db, std::path::Path::new(file)) {
+            Ok(report) => {
+                println!("merged {file} into {}", db.display());
+                for line in report.lines() {
+                    println!("{line}");
+                }
+                if let Some(backup) = &report.backup {
+                    println!("the database as it was is saved at {}", backup.display());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(why) => fail(why),
+        });
+    }
+    Some(wipe_command(options, log_dir, &db))
+}
+
+/// `--wipe`: says what will go, asks for the database's name, saves a copy and empties it.
+fn wipe_command(options: &Options, log_dir: &std::path::Path, db: &std::path::Path) -> ExitCode {
+    use runner::transfer;
+    let word = options
+        .space
+        .clone()
+        .unwrap_or_else(|| transfer::MAIN_NAME.to_owned());
+    let plan = match transfer::wipe_plan(db) {
+        Ok(plan) => plan,
+        Err(why) => {
+            eprintln!("error: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let logs = transfer::count_turn_logs(log_dir);
+    println!("this empties {}:", db.display());
+    for line in plan.lines() {
+        println!("{line}");
+    }
+    if options.with_logs {
+        println!(
+            "  {logs} turn logs in {} are deleted too",
+            log_dir.display()
+        );
+    } else if logs > 0 {
+        println!(
+            "  the {logs} turn logs in {} stay (they hold every request as sent); --with-logs deletes them",
+            log_dir.display()
+        );
+    }
+    println!(
+        "a copy is saved first, next to the database, and a new database starts with the defaults"
+    );
+    let typed = match &options.confirm {
+        Some(word) => word.clone(),
+        None if io::stdin().is_terminal() => {
+            use std::io::Write;
+            print!("type {word} to go ahead: ");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            if io::stdin().read_line(&mut line).is_err() {
+                eprintln!("error: cannot read the answer");
+                return ExitCode::FAILURE;
+            }
+            line.trim().to_owned()
+        }
+        None => {
+            eprintln!("error: no terminal to ask on: add --confirm {word} to go ahead");
+            return ExitCode::FAILURE;
+        }
+    };
+    if typed != word {
+        eprintln!("not wiped: '{typed}' is not '{word}'");
+        return ExitCode::FAILURE;
+    }
+    match transfer::wipe(db) {
+        Ok(backup) => {
+            println!(
+                "wiped; the database as it was is saved at {}",
+                backup.display()
+            );
+            if options.with_logs {
+                let removed = transfer::remove_turn_logs(log_dir);
+                println!("deleted {removed} turn logs");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("error: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let options = match Options::from_args(std::env::args().skip(1)) {
         Ok(options) => options,
@@ -130,21 +307,28 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `--export`, `--import`, `--wipe` and `--spaces` do one thing to a database file and exit
+    // (issue 57); none of them needs a provider.
+    if let Some(code) = data_command(&options, &log_dir) {
+        return code;
+    }
     // `--eval-decider` runs the labelled cases through a decider and prints how it did (issue 48).
     // It reads the saved providers and writes nothing, not even to the database.
     if let Some(spec) = &options.eval_decider {
-        let outcome = decider_for(&log_dir.join(DB_FILE), spec).and_then(|decider| {
-            let decider = decider.ok_or("there is no decider to measure")?;
-            let report = runner::decider_cases::run(decider.as_ref(), &mut io::stdout().lock())
-                .map_err(|e| format!("cannot print the report: {e}"))?;
-            // A run in which calls failed judged less than it says: the exit code tells a script.
-            match report.summary().failures {
-                0 => Ok(()),
-                failed => Err(format!(
-                    "{failed} of the calls failed, so this run is incomplete"
-                )),
-            }
-        });
+        let outcome = database_for(&log_dir, &options)
+            .and_then(|db| decider_for(&db, spec))
+            .and_then(|decider| {
+                let decider = decider.ok_or("there is no decider to measure")?;
+                let report = runner::decider_cases::run(decider.as_ref(), &mut io::stdout().lock())
+                    .map_err(|e| format!("cannot print the report: {e}"))?;
+                // A run in which calls failed judged less than it says: the exit code tells a script.
+                match report.summary().failures {
+                    0 => Ok(()),
+                    failed => Err(format!(
+                        "{failed} of the calls failed, so this run is incomplete"
+                    )),
+                }
+            });
         return match outcome {
             Ok(()) => ExitCode::SUCCESS,
             Err(why) => {
@@ -182,7 +366,13 @@ fn main() -> ExitCode {
         } else {
             runner::mcp_serve::Mode::Buffer
         };
-        let db_path = log_dir.join(DB_FILE);
+        let db_path = match database_for(&log_dir, &options) {
+            Ok(path) => path,
+            Err(why) => {
+                eprintln!("error: {why}");
+                return ExitCode::FAILURE;
+            }
+        };
         // A decider that cannot be built (an unknown provider, no key) stops the start here.
         let decider = match options
             .decider
@@ -241,7 +431,13 @@ fn main() -> ExitCode {
     }
     // `--serve` shows the lists in a browser and starts no chat (issue 28).
     if let Some(port) = options.serve {
-        let db_path = log_dir.join(DB_FILE);
+        let db_path = match database_for(&log_dir, &options) {
+            Ok(path) => path,
+            Err(why) => {
+                eprintln!("error: {why}");
+                return ExitCode::FAILURE;
+            }
+        };
         let project = std::env::current_dir()
             .map(|dir| dir.display().to_string())
             .unwrap_or_default();
@@ -281,8 +477,14 @@ fn start(
 ) -> Result<(), String> {
     // The tools work in the directory the program was started in.
     let cwd = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
+    // A headless task may come on standard input; read it before the terminal holds the lock.
+    let headless_task = if options.headless {
+        Some(headless_task(options)?)
+    } else {
+        None
+    };
     let log = TurnLog::create(&log_dir).map_err(|e| format!("cannot create the log: {e}"))?;
-    let db_path = log_dir.join(DB_FILE);
+    let db_path = database_for(&log_dir, options)?;
     let mut store =
         Store::open(&db_path).map_err(|e| format!("cannot open {}: {e}", db_path.display()))?;
 
@@ -420,6 +622,12 @@ fn start(
         notes.push_str(&format!("{note}\n"));
     }
 
+    // `--headless` runs one subagent with no screen and no prompt, prints its answer and its chat
+    // id, and exits (issue 55).
+    if let Some(task) = &headless_task {
+        return headless(&mut agent, options, task, &notes);
+    }
+
     // `--resume` continues the most recent saved chat; with none saved, start a new one.
     let mut was_resumed = false;
     let chat_line = if options.resume {
@@ -516,4 +724,62 @@ fn start(
         repl::show_history(&term, agent.history());
     }
     repl::run(&mut agent, &term).map_err(|e| e.to_string())
+}
+
+/// The task of a `--headless` run: the words on the command line, or standard input when there
+/// are none and input is piped.
+fn headless_task(options: &Options) -> Result<String, String> {
+    use std::io::Read;
+    let mut task = options.task.join(" ");
+    if task.trim().is_empty() && !io::stdin().is_terminal() {
+        io::stdin()
+            .read_to_string(&mut task)
+            .map_err(|e| format!("cannot read the task from standard input: {e}"))?;
+    }
+    if task.trim().is_empty() {
+        return Err(
+            "--headless needs a task: aharness --headless [--profile NAME] [--continue ID] \"the task\"".to_owned(),
+        );
+    }
+    Ok(task)
+}
+
+/// `--headless` (issue 55): one subagent, run to its answer. The answer goes to standard output,
+/// then `session: N` (or one JSON object with `--json`); notes and errors go to standard error. It
+/// reads only unless `--write` is given: the approval mode the owner left in the database does not
+/// count here. It ends the process with 1 when the subagent did not finish, so a script can tell.
+fn headless(agent: &mut Agent, options: &Options, task: &str, notes: &str) -> Result<(), String> {
+    use std::io::Write;
+    if !notes.trim().is_empty() {
+        eprintln!("{}", notes.trim_end());
+    }
+    agent.set_run_approval(if options.write {
+        Mode::Auto
+    } else {
+        Mode::Manual
+    });
+    let result = agent.run_headless(options.profile.as_deref(), task, options.continue_id)?;
+    let failed = result.failed();
+    if options.json {
+        let json = serde_json::json!({
+            "session_id": result.session,
+            "ok": !failed,
+            "answer": result.answer,
+            "calls": result.calls,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+        });
+        println!("{json}");
+    } else {
+        println!("{}", result.answer);
+        match result.session {
+            Some(id) => println!("session: {id}"),
+            None => println!("session: none"),
+        }
+    }
+    let _ = io::stdout().flush();
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
 }

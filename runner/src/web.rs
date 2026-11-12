@@ -10,9 +10,11 @@
 //!   run's random token (put in every form of its pages) and an `Origin` that is this server;
 //!   a write is answered with a redirect, so a reload never repeats it;
 //! - the request is read for at most 5 seconds, 8 KB of head and 1 MB of body;
-//! - the database is opened for each request, without creating or migrating anything, and only
-//!   prompts and glossary entries are read or written ([`load`], `web_write`), so provider keys
-//!   and chats are out of reach of the pages;
+//! - the database is opened for each request, without creating or migrating anything, and the
+//!   pages read and write prompts, glossary entries and the like ([`load`], `web_write`); no page
+//!   shows a provider key or a chat. The one page that acts on the whole file is Data
+//!   (`web_data`: export, import and merge, wipe), whose forms say what they do and pass the same
+//!   checks;
 //! - the pages are plain HTML with every stored text escaped, a restrictive
 //!   `Content-Security-Policy` and no JavaScript.
 //!
@@ -46,8 +48,9 @@ const MAX_FIELDS: usize = 400;
 /// How often the thread looks at its stop flag when nobody is connecting.
 const POLL: Duration = Duration::from_millis(50);
 
-const READ_ROUTES: [&str; 22] = [
+const READ_ROUTES: [&str; 23] = [
     "/",
+    "/data",
     "/profiles",
     "/profile/edit",
     "/profile/delete",
@@ -70,7 +73,10 @@ const READ_ROUTES: [&str; 22] = [
     "/prompt/edit",
     "/prompt/delete",
 ];
-const WRITE_ROUTES: [&str; 18] = [
+const WRITE_ROUTES: [&str; 21] = [
+    "/data/export",
+    "/data/import",
+    "/data/wipe",
     "/profile/add",
     "/profile/edit",
     "/profile/delete",
@@ -99,6 +105,8 @@ pub struct Ctx<'a> {
     /// first (with the shared entries).
     pub project: &'a str,
     pub token: &'a str,
+    /// The database file this server shows (the Data page works on the whole file).
+    pub db: &'a Path,
     pub read: &'a dyn Fn() -> Result<Data, String>,
     pub write: &'a dyn Fn() -> Result<Store, String>,
     /// A read-only connection, for the pages that look at the whole database file (Database, Usage).
@@ -254,6 +262,7 @@ impl Server {
                 port: self.port,
                 project: &self.project,
                 token: &self.token,
+                db: &self.db,
                 read: &read,
                 write: &write,
                 open: &open,
@@ -589,6 +598,7 @@ fn get(h: &Head<'_>, ctx: &Ctx<'_>) -> Reply {
             Some(p) => Reply::page(200, web_pages::profile_delete(p, &view)),
             None => missing(),
         },
+        "/data" => crate::web_data::get(ctx, &ok),
         "/database" => with_db(ctx, |store| {
             let schema = crate::web_schema::load(&store.conn).map_err(|e| e.to_string())?;
             Ok(Reply::page(200, web_pages::database(&schema)))
@@ -775,6 +785,9 @@ fn post(h: &Head<'_>, body: &[u8], ctx: &Ctx<'_>) -> Reply {
             "This form is out of date, or not from this server. Open the page again and retry.",
         );
     }
+    if h.path.starts_with("/data/") {
+        return crate::web_data::post(h.path, &form, ctx);
+    }
     crate::web_write::post(h.path, &form, ctx)
 }
 
@@ -875,6 +888,7 @@ mod tests {
             project: "",
             port: PORT,
             token: TOKEN,
+            db,
             read: &read,
             write: &write,
             open: &open,
@@ -889,6 +903,7 @@ mod tests {
             project: "",
             port: PORT,
             token: TOKEN,
+            db: std::path::Path::new(""),
             read: &no_data,
             write: &write,
             open: &no_open,
@@ -1406,6 +1421,7 @@ mod tests {
             project: "",
             port: PORT,
             token: TOKEN,
+            db: std::path::Path::new(""),
             read: &no_data,
             write: &write,
             open: &no_open,
@@ -1426,6 +1442,7 @@ mod tests {
             project: "",
             port: PORT,
             token: TOKEN,
+            db: std::path::Path::new(""),
             read: &read,
             write: &write,
             open: &no_open,
@@ -2000,6 +2017,7 @@ mod tests {
             project: "",
             port: PORT,
             token: TOKEN,
+            db: std::path::Path::new(""),
             read: &read,
             write: &write,
             open: &no_open,
@@ -3319,6 +3337,7 @@ mod tests {
             project: "",
             port: PORT,
             token: TOKEN,
+            db: std::path::Path::new(""),
             read: &read,
             write: &write,
             open: &no_open,
